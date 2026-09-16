@@ -29,6 +29,10 @@ public struct CapabilityID: Hashable, Sendable, Codable, CustomStringConvertible
   public static let contentRead = CapabilityID("content.read")
   public static let contentSummarize = CapabilityID("content.summarize")
 
+  /// 앞 단계가 읽은 글을 **기기 모델이** 줄인다. 코어가 싣는 툴이다
+  /// (`SummarizeTool`) — PCC로 원문을 올려 줄이면 비용과 프라이버시를 둘 다 잃는다.
+  public static let textSummarize = CapabilityID("text.summarize")
+
   public static let recordingStart = CapabilityID("recording.start")
   public static let recordingStop = CapabilityID("recording.stop")
   public static let recordingRead = CapabilityID("recording.read")

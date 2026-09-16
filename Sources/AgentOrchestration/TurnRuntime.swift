@@ -985,6 +985,10 @@ public final class TurnRuntime {
     case .eventID: return capability.domain == "calendar"
     case .reminderID: return capability.domain == "reminders"
     case .url: return capability == .webSearch
+    // 줄일 원문은 **읽은 것**에서 온다. 어느 영역이든 읽기 수령증이면 재료가 된다.
+    case .sourceText: return capability.executionClass == .readOnly
+    // 본문은 **만든 글**에서만 온다. 읽은 원문을 그대로 보내지 않는다.
+    case .body: return capability == .textSummarize
     }
   }
 
@@ -1068,6 +1072,23 @@ public final class TurnRuntime {
         {
           return .text(candidate)
         }
+      case .sourceText:
+        // 읽은 줄들의 본문을 잇는다. 본문이 없는 줄(일정·미리 알림)은 제목과
+        // 부제가 재료다 — 빈 글을 요약 툴에 넘기면 그 툴은 지어낸다.
+        let material = rows.compactMap { row -> String? in
+          let body = row.body.trimmingCharacters(in: .whitespacesAndNewlines)
+          if !body.isEmpty { return body }
+          let head = [row.title, row.subtitle].filter { !$0.isEmpty }.joined(separator: " — ")
+          return head.isEmpty ? nil : head
+        }
+        guard !material.isEmpty else { continue }
+        return .text(material.joined(separator: "\n\n"))
+      case .body:
+        guard receipt.capability == .textSummarize,
+          let text = receipt.details[SummarizeTool.textDetailKey]?.textValue,
+          !text.isEmpty
+        else { continue }
+        return .text(text)
       }
     }
     return nil

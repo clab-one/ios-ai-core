@@ -153,6 +153,17 @@ public enum ResolvableArgument: String, Sendable, CaseIterable {
   /// 읽을 주소. `web.search`의 결과에서만 온다 — 검색 뒤 읽기가 감독 되돌이의
   /// 가장 흔한 두 단계이고, 그 주소를 모델이 채우게 하면 지어낸다.
   case url
+  /// 줄일 원문. **앞 단계가 읽은 것**에서 온다.
+  ///
+  /// 이 자리가 있어야 `web.read → text.summarize → mail.send`가 성립한다. 원문을
+  /// 모델이 채우는 자리로 두면 PCC 문맥에 페이지 전문이 실리고(비용), 그 글이
+  /// 기기를 떠난다(프라이버시) — 줄이는 일은 기기 모델이 한다.
+  case sourceText
+  /// 보낼 본문. **앞 단계가 만든 글**에서만 온다(`text.summarize`의 산출).
+  ///
+  /// 읽은 원문을 그대로 본문에 싣지 않는다. 사용자가 "요약해서 보내"라고 했을 때
+  /// 보내야 하는 것은 요약이고, 원문 전체를 보내는 것은 다른 일이다.
+  case body
 
   public static func isResolvable(_ key: String) -> Bool {
     ResolvableArgument(rawValue: key) != nil

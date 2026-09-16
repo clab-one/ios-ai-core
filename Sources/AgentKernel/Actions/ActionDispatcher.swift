@@ -1,15 +1,28 @@
 import Foundation
 import OSLog
 
-/// 능력 하나를 실제로 수행하는 손.
+/// 능력 하나를 실제로 수행하는 **툴**.
 ///
-/// 구현은 **기존 JustSend 서비스와 Apple 프레임워크를 부른다.** 같은 일을 다시
-/// 구현한 새 서비스를 만들지 않는다 — 그렇게 하면 정본 저장 경로가 둘이 된다.
+/// 구현은 이미 있는 서비스와 Apple 프레임워크를 부른다. 같은 일을 다시 구현한
+/// 새 서비스를 만들지 않는다 — 그렇게 하면 정본 저장 경로가 둘이 된다.
+///
+/// 실행 위치는 툴이 정한다: 로컬 프레임워크(캘린더·연락처), 네트워크(메일·채팅·웹),
+/// 기기 모델(`OnDeviceTextModel`). 오케스트레이터는 **무엇을 부를지**만 정한다.
 public protocol CapabilityHandler: Sendable {
   var capabilities: Set<CapabilityID> { get }
+  /// 이 툴이 받는 인자의 계약. 등록할 때 코어가 함께 싣는다.
+  ///
+  /// 툴이 자기 스키마를 들고 오면 호스트는 계약 표를 따로 관리하지 않는다.
+  /// 비워 두면 호스트가 `CapabilityContract.register`로 직접 등록해야 하고,
+  /// 등록되지 않은 능력은 **손이 있어도 실행되지 않는다.**
+  var contracts: [CapabilityContract] { get }
   /// 인자를 검사하고 실행한다. 뜻이 둘 이상이면 **실행하지 않고**
   /// `ActionError.ambiguous`를 던진다.
   func perform(_ request: ActionRequest) async throws -> ActionReceipt
+}
+
+extension CapabilityHandler {
+  public var contracts: [CapabilityContract] { [] }
 }
 
 /// 실행 직전, 대상이 그 사이 바뀌지 않았는지 다시 보는 손.
@@ -71,10 +84,15 @@ public actor ActionDispatcher {
     self.currentAccountID = currentAccountID
   }
 
+  /// 툴을 등록한다. **툴이 들고 온 계약도 함께 싣는다.**
+  ///
+  /// 손과 계약이 따로 등록되면 한쪽만 등록된 상태가 만들어지고, 그 능력은 손이
+  /// 있는데 언제나 거절되거나(계약 없음) 계약만 있고 부를 수 없다(손 없음).
   public func register(_ handler: any CapabilityHandler) {
     if let provider = handler as? any ConnectorReadinessProviding {
       connectorReadinessProvider = provider
     }
+    CapabilityContract.register(handler.contracts)
     for capability in handler.capabilities {
       handlers[capability] = handler
     }

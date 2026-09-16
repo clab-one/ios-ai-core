@@ -1,4 +1,3 @@
-import AgentKernel
 import Foundation
 
 /// 기기 모델 앞의 줄에서 **어느 목적으로 기다리는가.**

@@ -28,6 +28,11 @@ public struct BoundReference: Sendable {
     case .reminderID: return consumer.domain == "reminders"
     case .itemID: return ["memory", "artifact", "content", "recording", "share"].contains(consumer.domain)
     case .url: return consumer.domain == "web" || consumer.domain == "content"
+    // 줄일 원문은 요약 툴만 받는다.
+    case .sourceText: return consumer == .textSummarize
+    // 만든 글은 **보내는 능력**만 받는다. 저장(`memory.save`)은 사용자가 말한
+    // 글을 저장하는 자리이지, 앞 단계의 요약을 몰래 기록으로 만드는 자리가 아니다.
+    case .body: return consumer.domain == "mail" || consumer.domain == "chat"
     }
   }
 }
