@@ -31,12 +31,15 @@ public struct CompiledConversationContext: Sendable {
 /// 밀어내고, 그러면 답이 근거 없이 쓰인다.
 public struct ConversationContextCompiler: Sendable {
   /// 문맥에 싣는 최근 차례 수. 대화가 길어질수록 앞차례의 가치는 빠르게
-  /// 떨어지고, 필요하면 검색이 그것을 다시 꺼낸다.
-  public static let recentTurnLimit = 6
+  /// 떨어지고, 필요하면 기억 검색이 그것을 다시 꺼낸다.
+  ///
+  /// 여섯 줄 400자였다. 그 값은 계획 호출마다 최대 2,400자를 태웠고 그 비용을
+  /// 모든 차례가 냈다 — PCC가 오케스트레이터인 구조에서 이 자리는 **예산**이다.
+  public static let recentTurnLimit = 3
   /// 한 차례 줄의 글자 상한.
-  public static let recentTurnCharacterLimit = 400
+  public static let recentTurnCharacterLimit = 200
   /// 문맥에 싣는 근거 조각 수의 상한. 압축기가 이미 줄였고 이것은 마지막 방벽이다.
-  public static let evidenceLimit = ToolResultReducer.totalLimit
+  public static let evidenceLimit = 8
 
   /// 모델에게 보내는 시각 한 줄. **오프셋과 지역을 함께 적는다.**
   ///
@@ -104,12 +107,20 @@ public struct ConversationContextCompiler: Sendable {
       lines.append("<<<end>>>")
     }
 
-    if !coverage.isEmpty {
-      let records = coverage.map { record in
-        "\(record.capability.rawValue): state=\(record.state.rawValue) found=\(record.discoveredCount) read=\(record.readCount) exhausted=\(record.paginationExhausted) truncated=\(record.truncated) reason=\(record.reason?.rawValue ?? "none")"
+    // **덜 읽은 곳만 말한다.** 예전에는 모든 관찰의 진단(found/read/exhausted/
+    // truncated/reason)을 최대 4,000자까지 실었다. 그 값으로 모델이 바꾸는 판단은
+    // "덜 읽었으니 더 읽어라" 하나이고, 그 하나는 한 줄이면 된다 — 나머지는
+    // 계획 호출마다 태우는 비용이었다.
+    let incomplete = coverage.filter { $0.state != .complete || $0.truncated }
+    if !incomplete.isEmpty {
+      let records = incomplete.map { record in
+        "\(record.capability.rawValue): \(record.state.rawValue) read=\(record.readCount)/\(record.discoveredCount)"
       }
-      lines.append(UntrustedText(origin: "justsend:coverage", records.joined(separator: "\n"))
-        .forModelContext(limit: 4_000))
+      lines.append(
+        UntrustedText(
+          origin: "\(AgentHost.identity.citationScheme):coverage",
+          records.joined(separator: "\n")
+        ).forModelContext(limit: 300))
     }
 
     // **표시한 결과의 고정점.** `"그 메일"`이 무엇인지는 모델이 기억하는 것이

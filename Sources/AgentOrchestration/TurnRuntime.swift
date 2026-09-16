@@ -410,20 +410,48 @@ public final class TurnRuntime {
 
   // MARK: 감독 되돌이
 
-  /// `observe → decide → execute → observe → …`(§11).
+  /// `plan(PCC 1회) → execute → assemble`.
   ///
-  /// 되돌이의 종료 조건은 **명시적이다**(§22): 감독자가 끝났다고 말했다, 더 낼
-  /// 단계가 없다, 예산이 끝났다, 되돌이 상한에 닿았다, 사용자 입력이 필요하다,
-  /// 승인이 필요하다, 복구할 수 없는 실패가 났다, 안전 거절이 났다.
+  /// **계획은 한 번이다.** PCC는 필요한 작업 전부를 순서대로 담은 JSON 하나를
+  /// 던지고, 그다음부터는 코어가 혼자 돈다 — 앞 단계의 수령증에서 다음 단계의
+  /// 자리를 채우고(`resolve`), 되돌릴 수 없는 실행 앞에서 승인을 받고, 끝나면
+  /// 결과를 조립한다.
+  ///
+  /// 되돌이마다 PCC에 다시 묻던 구조(`reviewing`)는 없앴다. 그 구조는 한 차례에
+  /// PCC를 2~6번 태웠고, 그 비용으로 얻는 것은 "충분한가"라는 되물음 하나였다.
+  /// 값이 모자라면 **계획 단계에서** 물어야 한다(`ActionPlan.needs`) — 실행
+  /// 중간에 알아내는 것이 아니라.
+  ///
+  /// 종료 조건은 명시적이다: 낼 단계가 없다, 실행 deadline, 실패 상한, 사용자
+  /// 입력이 필요하다, 승인이 필요하다, 안전 거절.
   private func advance(_ initial: TurnState) async {
     var state = initial
 
+    // 1) 계획. 승인에서 돌아온 길은 이미 계획을 들고 있으므로 다시 묻지 않는다.
+    if state.steps.isEmpty, state.iteration == 0 {
+      switch await decide(&state) {
+      case .work(let steps):
+        state.steps = steps
+        state.stepOrigin = .modelPlan
+      case .complete:
+        return await finalizeAndPresent(state)
+      case .needsUser(let key):
+        // PCC가 모자란 값을 말했다. **묻고 닫는다** — 사용자의 답은 다음 차례이고,
+        // 그 차례의 계획은 답을 문맥으로 받아 완성된 JSON을 낸다.
+        await finish(state, phase: .awaitingUser, needs: key)
+        return
+      case .stop(let reason):
+        await finish(state, phase: .failed, reason: reason)
+        return
+      }
+    }
+
+    // 2) 순차 실행. 여기서 PCC를 부르지 않는다.
     while true {
       guard eligible(state) else {
         await finish(state, phase: .failed, reason: "cancelled")
         return
       }
-      // 1) 앞 되돌이가 남긴 단계부터 끝낸다. 승인에서 돌아온 길도 여기로 온다.
       if !state.steps.isEmpty {
         switch await drain(&state) {
         case .suspended:
@@ -437,8 +465,10 @@ public final class TurnRuntime {
         }
       }
 
-      // 2) 의미 불변식. **손에 들려 준 대상은 반드시 읽힌다**(§24) — 모델이
-      //    엉뚱한 성공 계획을 냈다고 이 요구가 사라지지 않는다.
+      // 3) 의미 불변식. **손에 들려 준 대상은 반드시 읽힌다**(§24) — 모델이
+      //    엉뚱한 성공 계획을 냈다고 이 요구가 사라지지 않는다. 이 단계들은
+      //    규칙이 만드는 계획이 아니라 **빠뜨린 읽기를 메우는 보정**이고, 모델을
+      //    다시 부르지 않는다.
       //
       //    먼저 방금 건넨 기록이다. 사진을 넣고 `"이게 뭐야?"`라고 물으면 답은
       //    그 사진을 읽어야 나온다 — 보관함 검색으로 비켜 갈 자리를 만들지 않는다.
@@ -458,12 +488,11 @@ public final class TurnRuntime {
         continue
       }
 
-      //    그리고 **찾았으면 읽는다.** 내 기록 검색이 돌려주는 줄은 제목과 부제만
-      //    들고 본문을 들지 않는다(`JustSendLocalCapabilities.runSearch`). 그 줄로
-      //    답을 쓰면 답은 문서의 내용이 아니라 그 기록에 붙어 있던 자동 요약을
-      //    되읽은 문장이 된다 - 졸업증명서를 두고 `"어느학교 졸업이지?"`라고
-      //    물었을 때 앱은 문서 맨 위의 문서확인번호를 말했다(실기 재현
-      //    2026-09-15 03:12, `1 step done`: 찾기만 하고 읽지 않았다).
+      //    그리고 **찾았으면 읽는다.** 기록 검색이 돌려주는 줄은 제목과 부제만
+      //    들고 본문을 들지 않는다. 그 줄로 답을 쓰면 답은 문서의 내용이 아니라
+      //    그 기록에 붙어 있던 자동 요약을 되읽은 문장이 된다 — 졸업증명서를 두고
+      //    `"어느학교 졸업이지?"`라고 물었을 때 앱은 문서 맨 위의 문서확인번호를
+      //    말했다(실기 재현 2026-09-15 03:12, `1 step done`: 찾기만 하고 읽지 않았다).
       if let injected = Self.recordReadStep(state) {
         state.recordReadApplied = true
         state.steps = [injected]
@@ -471,7 +500,6 @@ public final class TurnRuntime {
         continue
       }
 
-      // 새 결과가 생기는 동안 조사 창을 연장한다. 정체와 실행 deadline은 별개다.
       guard ContinuousClock.now < state.executionDeadline else {
         state.telemetry.fallbackReason = "deadline"
         state.incomplete = true
@@ -482,33 +510,8 @@ public final class TurnRuntime {
         state.incomplete = true
         break
       }
-      guard state.iteration - state.lastProgressIteration < TurnLimits.maxIdleSupervisorIterations else {
-        state.telemetry.fallbackReason = "limit:iterations"
-        state.incomplete = true
-        break
-      }
-
-      // 5) 감독자에게 묻는다.
-      switch await decide(&state) {
-      case .work(let steps):
-        state.steps = steps
-        state.stepOrigin = .modelPlan
-      case .complete:
-        return await finalizeAndPresent(state)
-      case .needsUser(let key):
-        await finish(state, phase: .awaitingUser, needs: key)
-        return
-      case .stop(let reason):
-        // 근거를 이미 모았으면 그것으로 답한다 — 감독이 멈춘 것이 회수한 것을
-        // 지우지 않는다.
-        if state.ledger.hasReceipts {
-          state.telemetry.fallbackReason = reason
-          state.incomplete = true
-          return await finalizeAndPresent(state)
-        }
-        await finish(state, phase: .failed, reason: reason)
-        return
-      }
+      // 낼 단계가 없고 메울 읽기도 없다. 조립으로 간다.
+      break
     }
 
     await finalizeAndPresent(state)

@@ -29,11 +29,20 @@ let package = Package(
       // (`app/project.yml`의 SWIFT_VERSION 5.9).
       swiftSettings: [.swiftLanguageMode(.v5)]
     ),
-    // 차례 한 번의 기계: 단계·범위·계획 스키마·검증·결정론 라우팅·근거 축약.
-    // 모델을 부르는 자리는 프로토콜이고, 어느 모델인지는 앱이 정한다.
+    // 차례 한 번의 기계: 단계·범위·계획 스키마·검증·근거 축약·조립.
+    // PCC를 부르는 자리는 프로토콜이고, 시험은 그 문으로 대역을 세운다.
     .target(
       name: "AgentOrchestration",
       dependencies: ["AgentKernel"],
+      swiftSettings: [.swiftLanguageMode(.v5)]
+    ),
+    // **앱 없이 도는가.** 시뮬레이터에는 PCC도 기기 모델도 없으므로, 계획과 답의
+    // 자리에는 대역을 세우고 툴은 가짜를 등록한다 — 증명하는 것은 모델의 품질이
+    // 아니라 **조립**이다: 앞 단계의 산출이 다음 단계의 인자가 되는가, 값이
+    // 모자랄 때 먼저 묻는가, 되돌릴 수 없는 실행 앞에서 멈추는가.
+    .testTarget(
+      name: "AgentOrchestrationTests",
+      dependencies: ["AgentOrchestration"],
       swiftSettings: [.swiftLanguageMode(.v5)]
     ),
   ]
