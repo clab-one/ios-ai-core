@@ -124,6 +124,11 @@ public struct ToolResultReducer: Sendable {
       let rows = CapabilitySourceRow.rows(in: receipt.details)
       guard !rows.isEmpty else { continue }
       readSources.append(ReadSource(capability: receipt.capability, count: rows.count))
+      // **손잡이는 근거가 아니다.** 참조와 회수 건수에는 남기고(주소를 고르는 일과
+      // 화면의 출처 목록은 이 줄에서 나온다) 근거 후보에서만 빠진다 — 상한이
+      // 걸린 자리를 검색 결과가 차지하면 정작 읽은 페이지가 밀린다.
+      let carriesEvidence =
+        CapabilityContract.contract(for: receipt.capability)?.rows != .handle
 
       var kept = 0
       for row in rows {
@@ -141,7 +146,7 @@ public struct ToolResultReducer: Sendable {
               title: row.title.isEmpty ? row.subtitle : row.title,
               subtitle: Self.subtitle(row), sourceReference: source))
         }
-        guard kept < Self.perSourceLimit else { continue }
+        guard carriesEvidence, kept < Self.perSourceLimit else { continue }
         kept += 1
         candidates.append(
           (row: row, capability: receipt.capability, score: Self.score(row, terms: terms), source: source))

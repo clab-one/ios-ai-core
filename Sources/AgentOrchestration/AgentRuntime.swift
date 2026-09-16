@@ -29,6 +29,15 @@ public struct AgentRuntimeConfiguration: Sendable {
   /// 멈춘다 — 원문을 그대로 보내는 대체 경로를 만들지 않는다.
   public var onDeviceModel: (any OnDeviceTextModel)?
 
+  /// 열쇠 없는 웹 검색. 주면 코어가 `web.search` 툴을 등록한다.
+  ///
+  /// **이 자리를 비워 두는 것이 기본이다.** 검색은 사용자의 문장을 공개 웹으로
+  /// 내보내는 유일한 능력이고, 그 유출은 앱이 명시로 켜야 한다 — 코어가 기본으로
+  /// 켜면 어떤 앱은 자기가 웹에 질의한다는 사실을 모른 채 배포된다.
+  ///
+  /// 켠 앱에는 `.standard`가 보통 답이다(`WebSearchBroker.standard`).
+  public var webSearch: WebSearchBroker?
+
   /// 상태 문구. 낱말과 언어는 호스트의 것이다(`TurnCopy.Key.all`).
   public var copy: TurnCopy
 
@@ -61,6 +70,7 @@ public struct AgentRuntimeConfiguration: Sendable {
     tools: [any CapabilityHandler] = [],
     memoryIndex: (any SemanticMemoryIndex)? = nil,
     onDeviceModel: (any OnDeviceTextModel)? = nil,
+    webSearch: WebSearchBroker? = nil,
     copy: TurnCopy = .keysAsText,
     turnRuns: (any TurnRunStore)? = nil,
     actionLedger: (any ActionLedger)? = nil,
@@ -74,6 +84,7 @@ public struct AgentRuntimeConfiguration: Sendable {
     self.tools = tools
     self.memoryIndex = memoryIndex
     self.onDeviceModel = onDeviceModel
+    self.webSearch = webSearch
     self.copy = copy
     self.turnRuns = turnRuns
     self.actionLedger = actionLedger
@@ -142,6 +153,9 @@ public final class AgentRuntime {
     }
     if let model = configuration.onDeviceModel {
       await dispatcher.register(SummarizeTool(model: model))
+    }
+    if let broker = configuration.webSearch {
+      await dispatcher.register(WebSearchTool(broker: broker))
     }
     for tool in configuration.tools {
       await dispatcher.register(tool)

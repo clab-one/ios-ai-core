@@ -214,28 +214,69 @@ final class WebSearchTests: XCTestCase {
     XCTAssertFalse(prompt.contains("result__a"), "SERP HTML이 PCC 문맥에 실렸다")
     XCTAssertFalse(prompt.contains("result__snippet"), "SERP HTML이 PCC 문맥에 실렸다")
     XCTAssertFalse(prompt.contains(page), "페이지 전문이 PCC 문맥에 실렸다")
+    // **공급자가 쓴 한 줄도 근거가 아니다.** 우리가 읽은 것은 페이지이고, 스니펫은
+    // 그 주소로 가는 손잡이에 붙은 설명이다 — 그것이 근거로 서면 읽지 않은 문장이
+    // 사용자에게 사실로 제시된다.
+    //
+    // 읽지 **않은** 둘째 줄을 본다. 첫 줄은 같은 주소를 읽은 수령증이 지문을
+    // 차지해 중복으로 빠지므로(`ToolResultReducer`), 그 줄만 보는 시험은 경계가
+    // 열려 있어도 통과한다.
+    XCTAssertFalse(
+      prompt.contains("server-side foundation models"),
+      "읽지 않은 검색 결과의 스니펫이 PCC 근거로 들어갔다")
+    XCTAssertFalse(
+      prompt.contains("Secure and private AI processing"),
+      "검색엔진 스니펫이 PCC 근거로 들어갔다")
     XCTAssertLessThanOrEqual(
       prompt.count, PCCContextBudget.standard.totalCharacters, "문맥이 예산을 넘었다")
   }
 
   // MARK: 5) "최신"의 기준은 오늘
 
-  func testDayRangeFormatsTheWindow() {
-    let seoul = TimeZone(identifier: "Asia/Seoul") ?? .gmt
-    let window = WebSearchWindow(
-      after: Self.now.addingTimeInterval(-7 * 24 * 3_600), before: Self.now,
-      timeZone: seoul)
-    XCTAssertEqual(window.dayRange, "2026-09-10..2026-09-17")
+  /// **공급자는 날짜 구간을 받지 않는다.**
+  ///
+  /// 이 창구의 `df`가 아는 값은 `d`·`w`·`m`·`y` 넷뿐이다. `2026-09-10..2026-09-17`을
+  /// 보내면 그 값은 필터로 성립하지 않고, 우리는 걸렀다고 믿은 채 안 걸린 목록을
+  /// 받는다 — 요청에 글자가 실렸는지만 보는 시험은 그 차이를 보지 못한다.
+  ///
+  /// 고르는 값은 **창을 덮는 가장 작은 것**이다. 좁게 고르면 창 안의 글이 응답에서
+  /// 빠지고, 그 손실은 기기에서 되돌릴 수 없다.
+  func testWindowBecomesTheProvidersCoarseFilter() async throws {
+    let spans: [(days: Double, filter: String?)] = [
+      (1, "d"), (5, "w"), (7, "w"), (20, "m"), (31, "m"), (90, "y"), (365, "y"),
+      // 해를 넘는 창에 `y`를 보내면 공급자가 창 안의 오래된 글을 지운다.
+      (900, nil),
+    ]
+    for span in spans {
+      let captured = CapturingTransport(html: Self.htmlFixture)
+      let tool = WebSearchTool(
+        broker: WebSearchBroker(engines: [
+          DuckDuckGoHTMLSearch(transport: captured.transport)
+        ]))
+      _ = try await tool.perform(
+        ActionRequest(
+          capability: .webSearch,
+          arguments: [
+            "query": .text("pcc"),
+            "after": .timestamp(Self.now.addingTimeInterval(-span.days * 24 * 3_600)),
+          ],
+          origin: .modelPlan, accountID: "acct", requestedAt: Self.now))
 
-    let open = WebSearchWindow(after: nil, before: Self.now, timeZone: seoul)
-    XCTAssertEqual(open.dayRange, "..2026-09-17", "아래 끝이 없는 창이 닫힌 구간으로 갔다")
+      let body = try XCTUnwrap(captured.body)
+      if let filter = span.filter {
+        XCTAssertTrue(body.contains("df=\(filter)"), "\(span.days)일 창: \(body)")
+      } else {
+        XCTAssertFalse(body.contains("df="), "\(span.days)일 창에 필터가 실렸다: \(body)")
+      }
+    }
   }
 
-  /// **위 끝은 오늘이고, 그 오늘은 기기 시계에서 온다.**
+  /// **굵은 값은 오늘에서 센다.**
   ///
-  /// 모델이 아는 날짜는 자기 학습 시점이다. 그 값이 창의 위 끝이 되면 몇 달 전이
-  /// "최신"이 되고, 오늘 나온 글은 창 밖으로 밀린다.
-  func testWindowEndsTodayEvenWhenThePlanSaysLater() async throws {
+  /// `"지난 주"`는 창의 위 끝에서 세는 값이 아니라 지금에서 세는 값이다. 모델이 말한
+  /// 미래가 오늘의 자리에 서면 창은 407일이 되고, 그 창에는 보낼 굵은 값이 없다 —
+  /// 필터가 사라진다.
+  func testCoarseFilterCountsFromTodayNotFromThePlansDate() async throws {
     let captured = CapturingTransport(html: Self.htmlFixture)
     let tool = WebSearchTool(
       broker: WebSearchBroker(engines: [
@@ -253,10 +294,48 @@ final class WebSearchTests: XCTestCase {
         origin: .modelPlan, accountID: "acct", requestedAt: Self.now))
 
     let body = try XCTUnwrap(captured.body)
-    let today = WebSearchWindow(after: nil, before: Self.now, timeZone: .current).dayRange
-    XCTAssertTrue(body.contains("df=" ), "날짜 창이 요청에 실리지 않았다")
-    XCTAssertTrue(body.hasSuffix(today), "위 끝이 오늘이 아니다: \(body)")
-    XCTAssertFalse(body.contains("2027-"), "모델이 말한 미래가 창의 위 끝으로 섰다")
+    XCTAssertTrue(body.contains("df=w"), "오늘이 아니라 계획의 날짜에서 셌다: \(body)")
+  }
+
+  /// **창의 정확한 경계는 기기가 세운다.**
+  ///
+  /// 공급자에게 보낸 값은 `"지난 주"`이고 그 응답에는 창 밖의 글이 섞여 있다. 그것을
+  /// 그대로 넘기면 `"최신"`을 물은 차례가 7년 전 글을 첫 줄로 받고, **첫 줄이 열린다.**
+  ///
+  /// 날짜를 모르는 줄은 남는다 — 모르는 것과 창 밖인 것은 다른 사실이다.
+  func testResultsOutsideTheWindowAreDroppedOnDevice() async throws {
+    let engine = DuckDuckGoHTMLSearch(transport: Self.transport(Self.datedFixture))
+    let broker = WebSearchBroker(engines: [engine])
+    let window = WebSearchWindow(
+      after: Self.now.addingTimeInterval(-7 * 24 * 3_600), before: Self.now,
+      asOf: Self.now, timeZone: TimeZone(identifier: "Asia/Seoul") ?? .gmt)
+
+    let filtered = try await broker.search(query: "pcc", limit: 5, window: window)
+    XCTAssertEqual(
+      filtered.map(\.url),
+      ["https://example.com/fresh", "https://example.com/undated"],
+      "창 밖의 글이 남았거나 날짜를 모르는 글을 버렸다")
+
+    let unfiltered = try await broker.search(query: "pcc", limit: 5)
+    XCTAssertEqual(unfiltered.count, 3, "창이 없는데 걸렀다")
+  }
+
+  /// **200에 실려 온 차단은 결과 0건이 아니다.**
+  ///
+  /// 상태 코드만 보면 이 응답은 정상이고 결과는 0건이다. 그 0건이 관찰된 사실로
+  /// 화면에 올라가면 막힌 차례가 `"찾지 못했어요"`가 되고, 사용자는 다시 물어볼
+  /// 이유를 알 수 없다.
+  func testChallengeInsideATwoHundredIsNotAnEmptyResult() async throws {
+    let broker = WebSearchBroker(engines: [
+      DuckDuckGoHTMLSearch(transport: Self.transport(Self.challengeFixture)),
+      DuckDuckGoLiteSearch(transport: Self.transport(Self.challengeFixture)),
+    ])
+    do {
+      let results = try await broker.search(query: "pcc", limit: 5)
+      XCTFail("차단을 결과 \(results.count)건으로 읽었다")
+    } catch let error as WebSearchError {
+      XCTAssertEqual(error, .challenged)
+    }
   }
 
   /// 날짜를 말하지 않은 차례에는 **필터를 보내지 않는다.** 빈 값을 보내면 공급자가
@@ -386,6 +465,32 @@ final class WebSearchTests: XCTestCase {
         </td>
       </tr>
     </table>
+    """
+
+  /// 날짜가 적힌 결과 목록. 앞머리에 날짜를 두고 가운뎃점으로 끊는 것이 이 창구의
+  /// 관례다. 셋째 줄에는 날짜가 없다 — **흔한 경우이고, 그것은 "모른다"다.**
+  private static let datedFixture = """
+    <div class="result">
+      <a class="result__a" href="https://example.com/fresh">Fresh</a>
+      <a class="result__snippet" href="https://example.com/fresh">Sep 12, 2026 · Something that happened this week.</a>
+    </div>
+    <div class="result">
+      <a class="result__a" href="https://example.com/stale">Stale</a>
+      <a class="result__snippet" href="https://example.com/stale">Jan 3, 2019 · Something from seven years ago.</a>
+    </div>
+    <div class="result">
+      <a class="result__a" href="https://example.com/undated">Undated</a>
+      <a class="result__snippet" href="https://example.com/undated">No date in this snippet at all.</a>
+    </div>
+    """
+
+  /// 사람인지 묻는 페이지. **상태 코드는 200이다**(실측 2026-09-17).
+  private static let challengeFixture = """
+    <!DOCTYPE html>
+    <html><head><script src="/dist/anomaly.js"></script></head>
+    <body><div class="anomaly-modal__mask"></div>
+    <div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>
+    </body></html>
     """
 }
 

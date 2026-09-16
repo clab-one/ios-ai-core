@@ -36,6 +36,19 @@ public struct CapabilityContract: Sendable, Hashable {
     }
   }
 
+  /// 이 능력이 돌려주는 줄이 **무엇인가.**
+  ///
+  /// 줄 하나가 곧 근거가 되는 능력이 대부분이다(메일 한 통·메시지 한 줄·페이지
+  /// 하나). 그러나 검색 결과 목록은 다르다 — 그것은 답의 재료가 아니라 **다음
+  /// 단계로 가는 손잡이**다. 공급자가 쓴 요약 한 줄이 답의 근거로 올라가면, 우리가
+  /// 읽지도 않은 문장이 사용자에게 사실로 제시된다.
+  public enum RowKind: String, Sendable, Hashable {
+    /// 사용자 질문에 답할 재료. 근거가 된다.
+    case evidence
+    /// 다음 단계의 손잡이(주소·식별자). **근거가 되지 않는다.**
+    case handle
+  }
+
   public struct Argument: Sendable, Hashable {
     public let key: String
     public let kind: ValueKind
@@ -51,13 +64,18 @@ public struct CapabilityContract: Sendable, Hashable {
   public let required: [Argument]
   /// 있으면 쓰고, 없으면 어댑터의 기본값이 쓰인다.
   public let optional: [Argument]
+  /// 이 능력의 줄이 근거인가 손잡이인가. 적지 않으면 근거다 — 툴 대부분이 그렇고,
+  /// 손잡이는 선언해야 성립한다.
+  public let rows: RowKind
 
   public init(
-    _ capability: CapabilityID, required: [Argument] = [], optional: [Argument] = []
+    _ capability: CapabilityID, required: [Argument] = [], optional: [Argument] = [],
+    rows: RowKind = .evidence
   ) {
     self.capability = capability
     self.required = required
     self.optional = optional
+    self.rows = rows
   }
 
   /// 계약 위반. 이유를 자리 이름으로 든다 — 화면이 "무엇이 모자란지"를 말할 수
@@ -254,10 +272,15 @@ extension CapabilityContract {
     // MARK: 웹
     // 날짜 자리는 메일 검색과 **같은 낱말**을 쓴다. `"최신"`을 물은 차례가 이 자리로
     // 좁혀지고, 그 창의 위 끝은 툴이 기기 시계에서 박는다(`WebSearchTool.window`).
+    //
+    // 줄은 **손잡이다.** 검색이 돌려주는 것은 주소 후보이고, 답의 근거는 그 주소를
+    // 읽은 다음 단계에서 나온다 — 공급자가 쓴 스니펫이 근거로 올라가면 우리가 읽지
+    // 않은 문장이 사용자에게 사실로 제시된다.
     CapabilityContract(
       .webSearch, required: [Argument("query")],
       optional: searchPaging + [Argument("site")]
-        + [Argument("after", .timestamp), Argument("before", .timestamp)]),
+        + [Argument("after", .timestamp), Argument("before", .timestamp)],
+      rows: .handle),
     // 주소는 **사용자나 앞 단계의 검색 결과**에서만 온다. 모델이 주소를 지어낼
     // 자리를 만들지 않는다 — 지어낸 주소는 존재하지 않는 페이지이거나, 더 나쁘게는
     // 남의 사설망 주소다(`ContentFetchHostPolicy`).

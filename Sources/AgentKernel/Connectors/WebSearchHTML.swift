@@ -27,6 +27,17 @@ public enum WebSearchHTTP {
     }
   }
 
+  /// 200에 실려 오는 **사람인지 묻는 페이지.**
+  ///
+  /// 상태 코드만 보면 이 응답은 "정상 응답에 결과 0건"이다. 그 판정이 위험한
+  /// 이유는 0건이 **관찰된 사실로** 화면에 올라가기 때문이다 — 막힌 차례가
+  /// "찾지 못했어요"가 되고, 사용자는 다시 물어볼 이유를 알 수 없다.
+  ///
+  /// 실측 2026-09-17: 같은 차단이 202로도 오고 200으로도 온다.
+  static func isChallenge(_ html: String) -> Bool {
+    html.contains("anomaly-modal") || html.contains("anomaly.js")
+  }
+
   /// 폼 본문 요청. 질의는 **URL이 아니라 본문에** 실린다 — 주소는 로그와 프록시에
   /// 남고, 검색어는 사용자 글이다.
   static func form(_ endpoint: String, fields: [(String, String)]) throws -> URLRequest {
@@ -42,11 +53,33 @@ public enum WebSearchHTTP {
     return request
   }
 
-  /// 두 엔진이 같은 폼 자리를 쓴다(`q`, `df`). 창이 없으면 `df`를 **보내지 않는다** —
-  /// 빈 값을 보내면 공급자가 그것을 필터로 읽는다.
+  /// 두 엔진이 같은 폼 자리를 쓴다(`q`, `df`). 창이 없거나 굵은 값으로 덮이지
+  /// 않으면 `df`를 **보내지 않는다** — 빈 값을 보내면 공급자가 그것을 필터로 읽는다.
   static func fields(query: String, window: WebSearchWindow?) -> [(String, String)] {
-    guard let window else { return [("q", query)] }
-    return [("q", query), ("df", window.dayRange)]
+    guard let recency = recency(window) else { return [("q", query)] }
+    return [("q", query), ("df", recency)]
+  }
+
+  /// 창을 **공급자가 읽는 굵은 값으로.**
+  ///
+  /// 이 창구의 `df`가 받는 값은 넷뿐이다: `d`·`w`·`m`·`y`(지난 하루·주·달·해).
+  /// `2026-09-10..2026-09-17` 같은 절대 구간은 이 문에서 필터로 성립하지 않는다.
+  ///
+  /// 그래서 **창을 덮는 가장 작은 값**을 고른다 — 덮어야 하는 이유는 좁게 고르면
+  /// 창 안의 글이 응답에서 빠지고, 그 손실은 기기에서 되돌릴 수 없기 때문이다.
+  /// 남는 넓이는 기기가 자른다(`WebSearchBroker.inWindow`).
+  ///
+  /// 아래 끝이 열린 창은 굵은 값이 없다. 해를 넘는 창도 없다 — 그 창에 `y`를
+  /// 보내면 창 안의 오래된 글을 공급자가 지운다.
+  static func recency(_ window: WebSearchWindow?) -> String? {
+    guard let days = window?.daysSinceStart, days >= 0 else { return nil }
+    switch days {
+    case 0...1: return "d"
+    case 2...7: return "w"
+    case 8...31: return "m"
+    case 32...366: return "y"
+    default: return nil
+    }
   }
 
   /// 예약되지 않은 글자만 남기고 전부 인코딩한다.
@@ -89,8 +122,10 @@ public struct DuckDuckGoHTMLSearch: WebSearchEngine {
     guard let html = String(data: data, encoding: .utf8) else {
       throw WebSearchError.malformedResponse
     }
+    guard !WebSearchHTTP.isChallenge(html) else { throw WebSearchError.challenged }
     return SERPScraper.results(
-      in: html, linkClass: "result__a", snippetClass: "result__snippet", limit: limit)
+      in: html, linkClass: "result__a", snippetClass: "result__snippet", limit: limit,
+      timeZone: window?.timeZone ?? .current)
   }
 }
 
@@ -116,8 +151,10 @@ public struct DuckDuckGoLiteSearch: WebSearchEngine {
     guard let html = String(data: data, encoding: .utf8) else {
       throw WebSearchError.malformedResponse
     }
+    guard !WebSearchHTTP.isChallenge(html) else { throw WebSearchError.challenged }
     return SERPScraper.results(
-      in: html, linkClass: "result-link", snippetClass: "result-snippet", limit: limit)
+      in: html, linkClass: "result-link", snippetClass: "result-snippet", limit: limit,
+      timeZone: window?.timeZone ?? .current)
   }
 }
 
@@ -140,7 +177,8 @@ enum SERPScraper {
   }
 
   static func results(
-    in html: String, linkClass: String, snippetClass: String, limit: Int
+    in html: String, linkClass: String, snippetClass: String, limit: Int,
+    timeZone: TimeZone = .current
   ) -> [WebSearchResult] {
     var staged: [(title: String, url: String, snippet: String)] = []
     var capture: Capture?
@@ -191,7 +229,9 @@ enum SERPScraper {
     }
 
     return staged.map {
-      WebSearchResult(title: $0.title, url: $0.url, snippet: $0.snippet)
+      WebSearchResult(
+        title: $0.title, url: $0.url, snippet: $0.snippet,
+        published: publicationDate(in: $0.snippet, timeZone: timeZone))
     }
   }
 
@@ -217,6 +257,30 @@ enum SERPScraper {
       host != "duckduckgo.com", !host.hasSuffix(".duckduckgo.com")
     else { return nil }
     return url.absoluteString
+  }
+
+  /// 스니펫 앞머리의 **발행 날짜.**
+  ///
+  /// 이 창구는 날짜 구간을 필터로 받지 않으므로(`WebSearchHTTP.recency`) 창의
+  /// 정확한 경계는 결과에 적힌 이 날짜로만 세울 수 있다. 자리는 스니펫 맨 앞이고
+  /// 뒤에 가운뎃점이 온다 — `"Sep 17, 2026 · 본문…"`.
+  ///
+  /// **앞머리만 본다.** 본문 어디서든 날짜를 찾으면 인용된 연도가 발행일이 되고,
+  /// 그 값으로 거른 결과는 조용히 틀린다. 읽지 못하면 `nil`이고, `nil`은 "모른다"다.
+  private static func publicationDate(in snippet: String, timeZone: TimeZone) -> Date? {
+    let head = snippet.split(separator: "·", maxSplits: 1).first.map(String.init) ?? snippet
+    let candidate = head.trimmingCharacters(in: .whitespacesAndNewlines)
+    // 날짜 하나가 차지하는 길이. 이 위는 날짜가 아니라 문장이다.
+    guard !candidate.isEmpty, candidate.count <= 18 else { return nil }
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = timeZone
+    for format in ["MMM d, yyyy", "MMMM d, yyyy", "d MMM yyyy", "yyyy-MM-dd"] {
+      formatter.dateFormat = format
+      if let date = formatter.date(from: candidate) { return date }
+    }
+    return nil
   }
 
   /// 공백을 접는다. 표 레이아웃의 스니펫은 줄바꿈과 들여쓰기를 그대로 들고 온다.
