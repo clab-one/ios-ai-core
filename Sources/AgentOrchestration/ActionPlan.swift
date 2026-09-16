@@ -295,7 +295,7 @@ public enum ActionPlanValidator {
     case .memorySearch, .artifactFind, .mailSearch, .chatSearch, .remindersSearch:
       if !text.isEmpty { arguments["query"] = .text(text) }
     case .memorySave:
-      if !text.isEmpty { arguments["text"] = .text(text) }
+      if !text.isEmpty { arguments["body"] = .text(text) }
     case .memoryRead, .artifactRead, .contentRead, .contentSummarize, .recordingRead:
       // 식별자는 `target`이 정석이지만 모델은 파일 이름·기록 제목을 `text`에
       // 담기도 한다. 둘 다 받는다 — 받지 않으면 계약이 `itemID` 없음으로 거절하고,
@@ -341,7 +341,7 @@ public enum ActionPlanValidator {
       if !target.isEmpty { arguments["channelID"] = .text(target) }
     case .chatSend, .chatReply:
       if !target.isEmpty { arguments["channelID"] = .text(target) }
-      if !text.isEmpty { arguments["text"] = .text(text) }
+      if !text.isEmpty { arguments["body"] = .text(text) }
     case .sharePublish, .shareRevoke:
       if !target.isEmpty { arguments["itemID"] = .text(target) }
     case .webRead, .webFetch, .contentIngest:

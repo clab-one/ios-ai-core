@@ -94,8 +94,11 @@ public struct MemoryTool: CapabilityHandler {
           CapabilityContract.Argument("cursor"),
         ]),
       CapabilityContract(.memoryRead, required: [CapabilityContract.Argument("itemID")]),
+      // 저장할 글의 자리는 **메일·채팅과 같은 낱말**이다(`body`). `"찾아서 메모로
+      // 저장해줘"`의 글은 계획 시점에 없다 — 읽고 줄인 뒤에 생기고, 그 값이 이
+      // 자리로 흐르는 길이 `ResolvableArgument.body`다.
       CapabilityContract(
-        .memorySave, required: [CapabilityContract.Argument("text")],
+        .memorySave, required: [CapabilityContract.Argument("body")],
         optional: [CapabilityContract.Argument("title")]),
     ]
   }
@@ -193,11 +196,11 @@ public struct MemoryTool: CapabilityHandler {
   /// 않고 첫 수령증을 돌려받는다 — 조회 요청에 모델이 저장을 덧붙여도 기록은
   /// 하나다.
   private func save(_ request: ActionRequest) async throws -> ActionReceipt {
-    guard let text = request.arguments["text"]?.textValue, !text.isEmpty else {
-      throw ActionError.invalidArguments(reason: "text")
+    guard let body = request.arguments["body"]?.textValue, !body.isEmpty else {
+      throw ActionError.invalidArguments(reason: "body")
     }
     let id = try await index.save(
-      text: text, title: request.arguments["title"]?.textValue)
+      text: body, title: request.arguments["title"]?.textValue)
     return ActionReceipt(
       requestID: request.id,
       capability: request.capability,

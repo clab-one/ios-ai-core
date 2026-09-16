@@ -261,12 +261,15 @@ extension CapabilityContract {
     CapabilityContract(
       .chatRead, required: [Argument("channelID")],
       optional: searchPaging + providerChoice + [Argument("threadTS")]),
+    // 쓸 글의 자리는 **메일과 같은 낱말**이다(`body`). 이름이 갈리면 앞 단계가 만든
+    // 글이 이 자리로 흐르지 못한다 — `ResolvableArgument.body`가 자리 이름으로
+    // 찾기 때문이다. 그 시절 `"요약해서 슬랙에 보내줘"`는 본문을 되물었다.
     CapabilityContract(
-      .chatSend, required: [Argument("channelID"), Argument("text")],
+      .chatSend, required: [Argument("channelID"), Argument("body")],
       optional: providerChoice),
     CapabilityContract(
       .chatReply,
-      required: [Argument("channelID"), Argument("threadTS"), Argument("text")],
+      required: [Argument("channelID"), Argument("threadTS"), Argument("body")],
       optional: providerChoice),
 
     // MARK: 웹

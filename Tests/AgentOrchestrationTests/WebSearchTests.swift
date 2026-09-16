@@ -77,8 +77,8 @@ final class WebSearchTests: XCTestCase {
 
   func testBrokerMovesToTheNextEngineWhenChallenged() async throws {
     let broker = WebSearchBroker(engines: [
-      StubEngine(name: "first", outcome: .failure(WebSearchError.challenged)),
-      StubEngine(name: "second", outcome: .success([Self.result])),
+      StubSearchEngine(name: "first", outcome: .failure(WebSearchError.challenged)),
+      StubSearchEngine(name: "second", outcome: .success([Self.result])),
     ])
     let results = try await broker.search(query: "pcc", limit: 5)
     XCTAssertEqual(results, [Self.result])
@@ -88,15 +88,16 @@ final class WebSearchTests: XCTestCase {
   /// 답하지 못한 차례가 "찾지 못했어요"라고 거짓을 말한다.
   func testBrokerSeparatesEmptyResultsFromNoAnswer() async throws {
     let answered = WebSearchBroker(engines: [
-      StubEngine(name: "first", outcome: .success([])),
-      StubEngine(name: "second", outcome: .success([])),
+      StubSearchEngine(name: "first", outcome: .success([])),
+      StubSearchEngine(name: "second", outcome: .success([])),
     ])
     let empty = try await answered.search(query: "pcc", limit: 5)
     XCTAssertEqual(empty, [])
 
     let silent = WebSearchBroker(engines: [
-      StubEngine(name: "first", outcome: .failure(WebSearchError.challenged)),
-      StubEngine(name: "second", outcome: .failure(WebSearchError.rejected(status: 503))),
+      StubSearchEngine(name: "first", outcome: .failure(WebSearchError.challenged)),
+      StubSearchEngine(
+        name: "second", outcome: .failure(WebSearchError.rejected(status: 503))),
     ])
     do {
       _ = try await silent.search(query: "pcc", limit: 5)
@@ -479,17 +480,6 @@ final class WebSearchTests: XCTestCase {
 }
 
 // MARK: - 대역
-
-private struct StubEngine: WebSearchEngine {
-  let name: String
-  let outcome: Result<[WebSearchResult], any Error>
-
-  func search(
-    query: String, limit: Int, window: WebSearchWindow?
-  ) async throws -> [WebSearchResult] {
-    try outcome.get()
-  }
-}
 
 /// 요청을 적어 두는 왕복. **무엇을 보냈는가**가 관찰 지점이다.
 private final class CapturingTransport: @unchecked Sendable {

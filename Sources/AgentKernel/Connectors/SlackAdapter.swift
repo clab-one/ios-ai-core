@@ -235,10 +235,12 @@ public struct SlackAdapter: ConnectorAdapter {
     guard let channel = request.arguments["channelID"]?.textValue, !channel.isEmpty else {
       throw ActionError.ambiguous(reason: "channelID")
     }
-    guard let text = request.arguments["text"]?.textValue, !text.isEmpty else {
-      throw ActionError.invalidArguments(reason: "text")
+    guard let body = request.arguments["body"]?.textValue, !body.isEmpty else {
+      throw ActionError.invalidArguments(reason: "body")
     }
-    var payload: [String: Any] = ["channel": channel, "text": text]
+    // 공급자의 낱말은 `text`다. 계약의 낱말(`body`)을 여기서 옮긴다 — 계약은
+    // 공급자를 모르고, 공급자는 계약을 모른다.
+    var payload: [String: Any] = ["channel": channel, "text": body]
     if request.capability == .chatReply {
       guard let thread = request.arguments["threadTS"]?.textValue, !thread.isEmpty else {
         throw ActionError.ambiguous(reason: "threadTS")

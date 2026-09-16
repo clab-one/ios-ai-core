@@ -30,9 +30,17 @@ public struct BoundReference: Sendable {
     case .url: return consumer.domain == "web" || consumer.domain == "content"
     // 줄일 원문은 요약 툴만 받는다.
     case .sourceText: return consumer == .textSummarize
-    // 만든 글은 **보내는 능력**만 받는다. 저장(`memory.save`)은 사용자가 말한
-    // 글을 저장하는 자리이지, 앞 단계의 요약을 몰래 기록으로 만드는 자리가 아니다.
-    case .body: return consumer.domain == "mail" || consumer.domain == "chat"
+    // 만든 글은 **보내는 능력과 저장**이 받는다.
+    //
+    // 저장을 뺐던 이유는 "앞 단계의 요약을 몰래 기록으로 만들지 않는다"였다. 그
+    // 전제가 틀렸다: 저장 단계는 계획에 있어야 돌고, 계획은 사용자의 문장에서
+    // 나온다 — `"찾아서 메모로 저장해줘"`가 그 문장이다. 막아 둔 동안 그 차례는
+    // 읽고 줄인 뒤에 `"무엇을 저장할까요?"`를 물었다(G08).
+    //
+    // 저장할 글은 계획 시점에 **존재하지 않는다.** 그래서 모델이 미리 쓰게 하면
+    // 읽지도 않은 내용이 기록이 된다.
+    case .body:
+      return ["mail", "chat", "memory"].contains(consumer.domain)
     }
   }
 }

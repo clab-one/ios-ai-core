@@ -252,6 +252,37 @@ final class PCCContextBoundaryTests: XCTestCase {
     XCTAssertFalse(context.prompt.contains(Self.secretMessageID), "보낸 메일의 id가 실렸다")
   }
 
+  // MARK: 범위가 곧 비용이다
+
+  /// **차례마다 능력을 전부 보여 주지 않는다.**
+  ///
+  /// 쓰지 않을 툴의 이름과 설명이 매 계획 호출에 실린다. 그 비용은 기능 시험에
+  /// 잡히지 않는다 — 스물여덟 개를 보여 줘도 계획은 맞게 나오고, 값만 커진다.
+  func testNarrowScopeCostsLessThanEverything() throws {
+    func planningContext(_ registered: [CapabilityID]) throws -> String {
+      try compiler.compile(
+        profile: .supervising(
+          phase: .planning, target: .privateCloud,
+          scope: CapabilityScope.compile(registered: Set(registered)), iteration: 0),
+        userMessage: "애플 PCC 최신 변경사항 알려줘",
+        now: Self.now, calendar: Self.calendar
+      ).prompt
+    }
+
+    let narrow = try planningContext([.webSearch, .webRead, .textSummarize])
+    let everything = try planningContext(GoldenScenario.known)
+    print("📐 scope: narrow=\(narrow.count) everything=\(everything.count)")
+
+    XCTAssertLessThan(
+      narrow.count, everything.count, "범위를 좁혀도 계획 문맥이 줄지 않는다")
+    // 좁힌 범위의 문맥에는 **범위 밖 이름이 없다.**
+    for capability in [CapabilityID.mailSend, .chatSend, .calendarCreate] {
+      XCTAssertFalse(
+        narrow.contains(capability.rawValue),
+        "범위 밖 능력이 계획 문맥에 섰다 — \(capability.rawValue)")
+    }
+  }
+
   // MARK: 조립
 
   private static let secrets = [
