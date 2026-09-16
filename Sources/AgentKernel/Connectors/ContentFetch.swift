@@ -17,10 +17,16 @@ import Foundation
 ///   사설 주소를 가리키는 순간 이 문은 아무 일도 하지 않은 것이 된다
 ///
 /// ## 막지 못하는 것 — 적어 둔다
-/// 공개 이름이 사설 주소로 **해석되는** 경우(DNS rebinding)는 이 자리에서 막을 수
-/// 없다. 이름이 아니라 소켓이 실제로 연결한 주소를 봐야 하고, 그 훅은 `URLSession`에
-/// 없다. 막으려면 우리가 이름을 직접 해석해 주소로 요청하고 `Host` 헤더를 세우는
-/// 경로가 필요하다 — 그 경로는 TLS 검증과 HTTP/2 재사용을 우리가 다시 맞춰야 한다.
+/// 이름은 문자열로만 본다. 그래서 **이름이 사설 주소로 해석되는 경우는 통과한다.**
+/// 두 가지가 섞여 있다:
+///
+/// 1. 처음부터 사설을 가리키는 이름(`evil.example → A 192.168.0.1`). 이쪽은 요청
+///    전에 이름을 직접 해석해(`getaddrinfo`) 돌아온 **모든** 주소를 이 표로 걸면
+///    막을 수 있다 — 하나라도 사설이면 거절이다.
+/// 2. 해석과 연결 사이에 답이 바뀌는 경우(DNS rebinding·TOCTOU). 이쪽은 해석을
+///    우리가 해도 남는다. 소켓이 실제로 연결한 주소를 봐야 하고 그 훅이
+///    `URLSession`에 없다 — 막으려면 주소로 직접 요청하고 `Host` 헤더를 세우는
+///    경로가 필요하고, 그때 TLS 검증과 HTTP/2 재사용을 우리가 다시 맞춘다.
 public struct ContentFetchHostPolicy: Sendable {
   public init() {}
 
@@ -83,18 +89,44 @@ public struct ContentFetchHostPolicy: Sendable {
     }
   }
 
+  /// **주소로 바꿔 놓고 본다.** 글자 앞머리로 판정하면 같은 주소의 다른 표기가
+  /// 전부 새 구멍이다 — `::1`은 막고 `0:0:0:0:0:0:0:1`은 통과하는 식이다.
+  /// `inet_pton`은 16바이트를 돌려주므로 접두사를 숫자로 잴 수 있다.
   static func isPrivateIPv6(_ host: String) -> Bool {
     // 존 인덱스(`fe80::1%en0`)는 떼고 본다.
-    let address = String(host.split(separator: "%", maxSplits: 1).first ?? "").lowercased()
-    if address == "::1" || address == "::" { return true }
-    if address.hasPrefix("::ffff:") {
-      let mapped = String(address.dropFirst("::ffff:".count))
-      // 읽히지 않는 매핑 주소는 거절한다 — 모르는 주소로 요청을 내지 않는다.
-      return Self.octets(mapped).map(Self.isPrivate) ?? true
+    let address = String(host.split(separator: "%", maxSplits: 1).first ?? "")
+    var bytes = [UInt8](repeating: 0, count: 16)
+    guard address.withCString({ inet_pton(AF_INET6, $0, &bytes) }) == 1 else {
+      // 읽히지 않는 표기는 거절한다 — 모르는 주소로 요청을 내지 않는다.
+      return true
     }
-    if address.hasPrefix("fc") || address.hasPrefix("fd") { return true }  // fc00::/7
-    if ["fe8", "fe9", "fea", "feb"].contains(where: address.hasPrefix) { return true }  // fe80::/10
-    return false
+    // `::`(미지정)과 `::1`(루프백).
+    if bytes[0..<15].allSatisfy({ $0 == 0 }) { return true }
+    // IPv4를 품은 표기들. 품은 주소를 v4 표로 다시 잰다 — `::ffff:192.168.0.1`과
+    // NAT64의 `64:ff9b::192.168.0.1`이 여기로 온다.
+    if let embedded = Self.embeddedIPv4(bytes) { return Self.isPrivate(embedded) }
+    switch (bytes[0], bytes[1]) {
+    case (0xff, _): return true  // ff00::/8 멀티캐스트
+    case (0xfc, _), (0xfd, _): return true  // fc00::/7 유니크 로컬
+    case (0xfe, let second) where second & 0xc0 == 0x80: return true  // fe80::/10 링크로컬
+    case (0xfe, let second) where second & 0xc0 == 0xc0: return true  // fec0::/10 사이트로컬
+    default: return false
+    }
+  }
+
+  /// IPv4가 실려 있으면 그 네 바이트. 매핑(`::ffff:`)·호환(`::`)·NAT64(`64:ff9b::`).
+  static func embeddedIPv4(_ bytes: [UInt8]) -> [UInt8]? {
+    let tail = Array(bytes[12..<16])
+    if bytes[0..<10].allSatisfy({ $0 == 0 }), bytes[10] == 0xff, bytes[11] == 0xff {
+      return tail
+    }
+    if bytes[0..<12].allSatisfy({ $0 == 0 }) { return tail }
+    if bytes[0] == 0x00, bytes[1] == 0x64, bytes[2] == 0xff, bytes[3] == 0x9b,
+      bytes[4..<12].allSatisfy({ $0 == 0 })
+    {
+      return tail
+    }
+    return nil
   }
 }
 
@@ -138,14 +170,14 @@ public enum ContentFetchError: Error, Sendable, Equatable {
 ///
 /// 글자로 이미 옮긴 값을 들지 않는 이유는 인코딩이다. 응답 헤더의 charset을 버리고
 /// UTF-8로 단정하면 EUC-KR 페이지가 물음표 벽이 되고, 그 벽에서 모델이 사실을 뽑는다.
-public struct FetchedDocument: Sendable, Equatable {
+package struct FetchedDocument: Sendable, Equatable {
   /// 리다이렉트를 따라간 **최종 주소.**
-  public let url: URL
-  public let mimeType: String
-  public let encoding: String.Encoding
-  public let bytes: Data
+  package let url: URL
+  package let mimeType: String
+  package let encoding: String.Encoding
+  package let bytes: Data
 
-  public init(url: URL, mimeType: String, encoding: String.Encoding = .utf8, bytes: Data) {
+  package init(url: URL, mimeType: String, encoding: String.Encoding = .utf8, bytes: Data) {
     self.url = url
     self.mimeType = mimeType
     self.encoding = encoding
@@ -154,7 +186,31 @@ public struct FetchedDocument: Sendable, Equatable {
 }
 
 /// 문서 한 건의 네트워크 왕복. **시험이 이 문으로 대역을 세운다.**
-public typealias ContentFetchTransport = @Sendable (URL) async throws -> FetchedDocument
+///
+/// 호스트에게는 열려 있지 않다(`package`). 주입된 문은 리다이렉트를 자기가 따라가고,
+/// 따라간 홉은 우리 표를 지나지 않는다 — 첫 주소만 통과시키면 공개 이름이 302 하나로
+/// 사설 주소를 읽게 만든다. 호스트가 조절할 것은 문이 아니라 정책이다
+/// (`WebReadConfiguration`).
+package typealias ContentFetchTransport = @Sendable (URL) async throws -> FetchedDocument
+
+/// 읽기의 **조절판.** 호스트가 만지는 것은 이 값이고, 문은 코어가 만든다.
+public struct WebReadConfiguration: Sendable {
+  public let policy: ContentFetchHostPolicy
+  public let byteLimit: Int
+  public let timeout: TimeInterval
+
+  public init(
+    policy: ContentFetchHostPolicy = ContentFetchHostPolicy(),
+    byteLimit: Int = ContentFetch.byteLimit,
+    timeout: TimeInterval = ContentFetch.timeout
+  ) {
+    self.policy = policy
+    self.byteLimit = byteLimit
+    self.timeout = timeout
+  }
+
+  public static let standard = WebReadConfiguration()
+}
 
 /// 공개 웹에서 문서 하나를 받아 온다.
 ///
@@ -167,15 +223,14 @@ public enum ContentFetch {
   public static let byteLimit = 2 * 1024 * 1024
   public static let timeout: TimeInterval = 15
 
-  public static let shared: ContentFetchTransport = standard()
-
-  public static func standard(
-    policy: ContentFetchHostPolicy = ContentFetchHostPolicy(),
-    session: URLSession = .shared,
-    byteLimit: Int = ContentFetch.byteLimit,
-    timeout: TimeInterval = ContentFetch.timeout
+  package static func standard(
+    _ configuration: WebReadConfiguration = .standard,
+    session: URLSession = .shared
   ) -> ContentFetchTransport {
-    { url in
+    let policy = configuration.policy
+    let byteLimit = configuration.byteLimit
+    let timeout = configuration.timeout
+    return { url in
       let target = try policy.vet(url)
       var request = URLRequest(url: target)
       request.timeoutInterval = timeout
@@ -219,9 +274,7 @@ public enum ContentFetch {
 
   /// 헤더의 charset 이름을 인코딩으로. 모르는 이름은 UTF-8로 본다 — 그 뒤에
   /// `WebReadTool`이 해독 실패를 한 번 더 받아 낸다.
-  /// 문을 직접 만드는 호스트도 이 표가 필요하다 — 같은 헤더를 두 곳에서 다르게
-  /// 읽으면 어떤 앱에서만 한국어 페이지가 물음표 벽이 된다.
-  public static func encoding(_ name: String?) -> String.Encoding {
+  package static func encoding(_ name: String?) -> String.Encoding {
     guard let name else { return .utf8 }
     let converted = CFStringConvertIANACharSetNameToEncoding(name as CFString)
     guard converted != kCFStringEncodingInvalidId else { return .utf8 }

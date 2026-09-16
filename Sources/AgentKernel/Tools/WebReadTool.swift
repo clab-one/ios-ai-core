@@ -33,8 +33,19 @@ public struct WebReadTool: CapabilityHandler {
   private let fetch: ContentFetchTransport
   private let policy: ContentFetchHostPolicy
 
-  public init(
-    fetch: @escaping ContentFetchTransport = ContentFetch.shared,
+  /// 제품이 쓰는 자리. **문은 코어가 만든다.**
+  ///
+  /// 호스트가 문을 주입하지 못하게 나눠 둔 이유는 리다이렉트다. 주입된 문은 홉을
+  /// 자기가 따라가고, 따라간 홉은 우리 표를 지나지 않는다 — 그러면 첫 주소만
+  /// 심사하는 이 툴은 `public.example → 302 → 192.168.0.1`을 막지 못한다.
+  public init(_ configuration: WebReadConfiguration = .standard) {
+    self.policy = configuration.policy
+    self.fetch = ContentFetch.standard(configuration)
+  }
+
+  /// 시험이 대역을 세우는 자리. 같은 패키지 안에서만 보인다.
+  package init(
+    fetch: @escaping ContentFetchTransport,
     policy: ContentFetchHostPolicy = ContentFetchHostPolicy()
   ) {
     self.fetch = fetch

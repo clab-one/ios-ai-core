@@ -48,35 +48,39 @@ final class LiveWebE2ETests: XCTestCase {
     let rows = try await Self.search("Apple Private Cloud Compute security blog")
     let tool = WebReadTool()
 
-    // 첫 줄이 열린다. 하나가 막히면(403·PDF·빈 문서) 다음 줄로 간다 —
-    // 어느 한 사이트의 사정이 이 층의 판정이 되면 안 된다.
-    var failures: [String] = []
-    for row in rows.prefix(4) {
+    // 첫 줄이 열린다. 하나가 **바깥 사정으로** 막히면 다음 줄로 간다. 우리 쪽
+    // 결함(파서·정책·계약)은 여기서 잡히지 않고 밖으로 던져진다 — 그 사유를
+    // "인터넷이 불안정하다"로 접으면 회귀가 건너뛴 시험 뒤에 숨는다.
+    var skipped: [String] = []
+    for row in rows.prefix(4) where Self.looksLikeDocument(row.identifier) {
+      let receipt: ActionReceipt
       do {
-        let receipt = try await tool.perform(
+        receipt = try await tool.perform(
           ActionRequest(
             capability: .webRead, arguments: ["url": .text(row.identifier)],
             origin: .modelPlan, accountID: "acct"))
-        let read = try XCTUnwrap(CapabilitySourceRow.rows(in: receipt.details).first)
-
-        XCTAssertGreaterThan(read.body.count, 200, "본문이 너무 짧다: \(row.identifier)")
-        XCTAssertFalse(read.body.contains("<script"), "스크립트가 본문에 남았다")
-        XCTAssertFalse(read.body.contains("<div"), "태그가 본문에 남았다")
-        XCTAssertEqual(receipt.coverage.first?.readCount, 1)
-
-        let resolved = TurnRuntime.resolvedValue(for: "sourceText", in: [receipt])
-        XCTAssertEqual(
-          resolved?.textValue?.isEmpty, false, "읽은 글이 요약 단계의 인자가 되지 않았다")
-
-        print(
-          "📐 E02 live-read: \(row.identifier) → \(read.body.count)자 "
-            + "(자름=\(receipt.coverage.first?.truncated == true))")
-        return
-      } catch {
-        failures.append("\(row.identifier): \(error)")
+      } catch let error where Self.isOutsideCondition(error) {
+        skipped.append("\(row.identifier): \(error)")
+        continue
       }
+
+      // 단정은 `do` 밖이다. 안에 두면 우리 단정의 실패가 위 `catch`로 흘러간다.
+      let read = try XCTUnwrap(CapabilitySourceRow.rows(in: receipt.details).first)
+      XCTAssertGreaterThan(read.body.count, 200, "본문이 너무 짧다: \(row.identifier)")
+      XCTAssertFalse(read.body.contains("<script"), "스크립트가 본문에 남았다")
+      XCTAssertFalse(read.body.contains("<div"), "태그가 본문에 남았다")
+      XCTAssertEqual(receipt.coverage.first?.readCount, 1)
+
+      let resolved = TurnRuntime.resolvedValue(for: "sourceText", in: [receipt])
+      XCTAssertEqual(
+        resolved?.textValue?.isEmpty, false, "읽은 글이 요약 단계의 인자가 되지 않았다")
+
+      print(
+        "📐 E02 live-read: \(row.identifier) → \(read.body.count)자 "
+          + "(자름=\(receipt.coverage.first?.truncated == true))")
+      return
     }
-    throw XCTSkip("네 줄 모두 읽히지 않았다 — 공급자 사정이다:\n\(failures.joined(separator: "\n"))")
+    throw XCTSkip("읽을 수 있는 줄이 없었다 — 전부 바깥 사정이다:\n\(skipped.joined(separator: "\n"))")
   }
 
   // MARK: E03 — 날짜 창의 공급자 계약
@@ -115,8 +119,8 @@ final class LiveWebE2ETests: XCTestCase {
           capability: .webSearch, arguments: ["query": .text(query)],
           origin: .modelPlan, accountID: "acct"))
       return CapabilitySourceRow.rows(in: receipt.details)
-    } catch {
-      throw XCTSkip("공급자가 답하지 않았다(막힘·네트워크): \(error)")
+    } catch let error where Self.isOutsideCondition(error) {
+      throw XCTSkip("공급자가 답하지 않았다: \(error)")
     }
   }
 
@@ -125,16 +129,66 @@ final class LiveWebE2ETests: XCTestCase {
   ) async throws -> Set<String> {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withFullDate]
-    guard let after = formatter.date(from: from), let before = formatter.date(from: to) else {
-      throw XCTSkip("날짜를 읽지 못했다")
-    }
+    let after = try XCTUnwrap(formatter.date(from: from))
+    let before = try XCTUnwrap(formatter.date(from: to))
     do {
       let results = try await engine.search(
         query: query, limit: 10,
-        window: WebSearchWindow(after: after, before: before, timeZone: TimeZone(identifier: "UTC")!))
+        window: WebSearchWindow(
+          after: after, before: before, timeZone: TimeZone(identifier: "UTC")!))
       return Set(results.map(\.url))
-    } catch {
-      throw XCTSkip("공급자가 답하지 않았다(막힘·네트워크): \(error)")
+    } catch let error where Self.isOutsideCondition(error) {
+      throw XCTSkip("공급자가 답하지 않았다: \(error)")
     }
+  }
+
+  /// **건너뛸 수 있는 것은 바깥의 사정뿐이다.**
+  ///
+  /// 이 표가 없으면 우리 결함이 "인터넷이 불안정하다"로 위장한다 — 파서 회귀,
+  /// 정책 버그, charset 처리, 계약 위반은 전부 네 줄 다 실패로 나타나고 그 끝은
+  /// 초록색 `skipped`다. 그래서 막힘·과부하·연결 실패만 건너뛰고, 우리가 만든
+  /// 판정(빈 문서·해독 실패·형식 오판·주소 정책)은 **실패로 남긴다.**
+  private static func isOutsideCondition(_ error: any Error) -> Bool {
+    switch error {
+    case let search as WebSearchError:
+      switch search {
+      // 사람인지 묻는 응답과 "아무 엔진도 답하지 못했다"는 공급자의 사정이다.
+      case .challenged, .noEngineAnswered: return true
+      case .rejected(let status): return status == 429 || (500...599).contains(status)
+      // 200을 주고 우리가 못 읽었다 — 마크업이 바뀌었다는 뜻이고, 그것이 이 층의
+      // 존재 이유다.
+      case .malformedResponse: return false
+      }
+    case let action as ActionError:
+      guard case .failed(let reason) = action else { return false }
+      return Self.outsideReadReasons.contains(reason)
+    case let url as URLError:
+      return Self.outsideURLCodes.contains(url.code)
+    default:
+      return false
+    }
+  }
+
+  /// 그 사이트가 우리에게 주지 않은 경우들. 나머지 `web.read.*` 사유는 우리 코드의
+  /// 판정이므로 실패다(`ContentFetchError.reason`).
+  private static let outsideReadReasons: Set<String> = [
+    "web.read.rejected",  // 403·404·5xx — 그 사이트의 결정이다
+    "web.read.tooLarge",  // 2 MiB를 넘는 문서를 준다
+  ]
+
+  private static let outsideURLCodes: Set<URLError.Code> = [
+    .timedOut, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+    .networkConnectionLost, .notConnectedToInternet, .secureConnectionFailed,
+    .serverCertificateUntrusted, .serverCertificateHasBadDate,
+  ]
+
+  /// 글 문서처럼 보이는 주소만 읽는다.
+  ///
+  /// 이 걸름이 있어야 `unsupportedType`이 **우리 결함의 신호**가 된다. 검색 결과에
+  /// PDF가 섞이는 것은 정상이고, 그것까지 읽으려다 실패한 것을 회귀로 셀 수는 없다.
+  private static func looksLikeDocument(_ url: String) -> Bool {
+    let path = (URL(string: url)?.path ?? "").lowercased()
+    let binary = [".pdf", ".zip", ".dmg", ".pkg", ".mp4", ".png", ".jpg", ".jpeg", ".gif"]
+    return !binary.contains(where: path.hasSuffix)
   }
 }

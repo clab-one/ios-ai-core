@@ -23,9 +23,18 @@ final class WebReadTests: XCTestCase {
       ("http://169.254.169.254/latest/meta-data/", "web.read.privateHost"),
       ("http://100.100.0.1/", "web.read.privateHost"),
       ("http://[::1]/", "web.read.privateHost"),
+      // 같은 루프백의 다른 표기. 글자 앞머리로 판정하던 동안 이 줄이 통과했다.
+      ("http://[0:0:0:0:0:0:0:1]/", "web.read.privateHost"),
+      ("http://[::]/", "web.read.privateHost"),
       ("http://[fd00::1]/", "web.read.privateHost"),
       ("http://[fe80::1%25en0]/", "web.read.privateHost"),
+      ("http://[fec0::1]/", "web.read.privateHost"),
+      // 멀티캐스트(ff00::/8). 설명은 막는다고 적고 코드는 막지 않았다.
+      ("http://[ff02::1]/", "web.read.privateHost"),
+      ("http://[ff05::1]/", "web.read.privateHost"),
       ("http://[::ffff:127.0.0.1]/", "web.read.privateHost"),
+      // NAT64가 사설 IPv4를 품은 주소.
+      ("http://[64:ff9b::192.168.0.1]/", "web.read.privateHost"),
       ("http://nas.local/", "web.read.privateHost"),
       ("http://wiki.internal/", "web.read.privateHost"),
       // 네 마디로 읽히지 않는 숫자 주소. `inet_aton`에서는 127.0.0.1이다.
