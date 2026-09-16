@@ -17,9 +17,13 @@
 set -eu
 
 # 층별 시험 클래스. 새 층 시험을 더하면 여기에 이름을 적는다.
-L1_CLASSES="OnDeviceReductionTests"
+L1_CLASSES="OnDeviceReductionTests OnDeviceTokenBaselineTests"
+# L2(PCC)는 이 저장소에서 돌지 않는다. SwiftPM의 iOS 시험 번들은 일반 호스트 앱에서
+# 돌고 그 앱에는 `com.apple.developer.private-cloud-compute`가 없다 — 계획 자리는
+# 권한이 없으면 세션을 만들지 못한다(`DynamicProfileAdapter.privateCloudSession`).
+# 그 층은 엔타이틀먼트를 든 호스트 앱의 시험 대상이 든다.
 L2_CLASSES=""
-L3_CLASSES=""
+L3_CLASSES="LiveWebE2ETests"
 
 mode="${1:-fast}"
 [ $# -gt 0 ] && shift

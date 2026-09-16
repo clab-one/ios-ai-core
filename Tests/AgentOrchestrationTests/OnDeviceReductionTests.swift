@@ -16,9 +16,9 @@ import XCTest
 final class OnDeviceReductionTests: XCTestCase {
   private static let marker = "DEEP-MARKER-IN-THE-MIDDLE"
   private static let article =
-    String(repeating: "애플은 서버에서 도는 추론의 검증 가능성을 이야기한다. ", count: 100)
+    String(repeating: "애플은 서버에서 도는 추론의 검증 가능성을 이야기한다. ", count: 120)
     + marker
-    + String(repeating: " 그리고 그 검증은 공개된 이미지로만 성립한다.", count: 100)
+    + String(repeating: " 그리고 그 검증은 공개된 이미지로만 성립한다.", count: 120)
 
   func testLongArticleIsReducedOnDevice() async throws {
     let model = SystemLanguageModel.default
