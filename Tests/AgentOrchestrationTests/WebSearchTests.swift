@@ -218,6 +218,37 @@ final class WebSearchTests: XCTestCase {
       prompt.count, PCCContextBudget.standard.totalCharacters, "문맥이 예산을 넘었다")
   }
 
+  // MARK: 5) 요약의 초점
+
+  /// **줄일 원문은 앞 단계에서 오고, 모델이 쓰는 글은 초점이다.**
+  ///
+  /// 그 글이 `query`로 떨어지면 계약이 버리고(`SummarizeTool.contracts`), 요약은
+  /// 초점 없이 돈다 — `"최신 변경사항만"`이 요약기에 닿지 않는다.
+  func testSummarizeStepCarriesTheFocusFromThePlan() throws {
+    CapabilityContract.register([
+      CapabilityContract(
+        .textSummarize,
+        required: [CapabilityContract.Argument("sourceText")],
+        optional: [CapabilityContract.Argument("focus")])
+    ])
+    let decision = ActionPlanValidator.validate(
+      GeneratedTurnDecision(
+        status: "complete",
+        steps: [
+          GeneratedActionStep(
+            capability: "text.summarize", text: "최신 변경사항만", target: "", when: "",
+            subject: "")
+        ],
+        needs: ""),
+      allowed: [.textSummarize], conversationID: "conv", accountID: "acct",
+      calendar: Calendar(identifier: .gregorian))
+
+    let step = try XCTUnwrap(decision.plan.steps.first)
+    XCTAssertEqual(step.arguments["focus"]?.textValue, "최신 변경사항만")
+    XCTAssertTrue(
+      step.unresolved.contains("sourceText"), "원문이 앞 단계에서 채워지는 자리가 아니게 됐다")
+  }
+
   // MARK: 조립
 
   private static let result = WebSearchResult(

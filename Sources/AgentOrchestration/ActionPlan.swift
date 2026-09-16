@@ -351,6 +351,15 @@ public enum ActionPlanValidator {
       if let url = Self.httpURL(target) ?? Self.httpURL(text) {
         arguments["url"] = .text(url)
       }
+    case .textSummarize:
+      // **줄일 원문은 앞 단계에서 온다**(`ResolvableArgument.sourceText`). 그래서
+      // 이 칸에 모델이 쓰는 글은 원문이 아니라 **초점**이다 — `"가격만 정리해줘"`,
+      // `"최신 변경사항만"`.
+      //
+      // 이 자리가 없던 동안 그 글은 `default`로 떨어져 `query`가 됐고, 계약에
+      // 없는 자리이므로 정규화가 버렸다(`SummarizeTool.contracts`). 요약은 언제나
+      // 초점 없이 돌았고, 사용자가 무엇을 물었는지는 요약기에 닿지 않았다.
+      if !text.isEmpty { arguments["focus"] = .text(text) }
     case .webSearch:
       if !text.isEmpty { arguments["query"] = .text(text) }
     default:
