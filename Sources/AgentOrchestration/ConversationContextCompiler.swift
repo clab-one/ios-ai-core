@@ -95,6 +95,14 @@ public struct ConversationContextCompiler: Sendable {
         actual: userMessage.count, limit: budget.requestCharacters)
     }
 
+    // 지시는 단계 상수다. 여기서 걸리는 것은 사용자가 아니라 **코드 변경**이고,
+    // 남는 자리를 빌려 통과하면 예산의 이름이 거짓이 된다.
+    let instructions = profile.instructions
+    guard instructions.count <= budget.instructionCharacters else {
+      throw ContextCompilationError.instructionsTooLarge(
+        actual: instructions.count, limit: budget.instructionCharacters)
+    }
+
     let capabilities = profile.scope.sorted
     var lines: [String] = []
 
@@ -189,12 +197,21 @@ public struct ConversationContextCompiler: Sendable {
       lines.append("<<<end>>>")
     }
 
+    // **조립 구획도 자기 예산으로 검사한다.** 봉투 하나만 검사하면 한 구획이
+    // 자란 것을 다른 구획의 여유가 가려 준다 — 그러면 `assembledCharacters`는
+    // 이름만 남는다. `<<<request>>>`는 이 검사 뒤에 선다.
+    let assembled = lines.reduce(0) { $0 + $1.count } + max(lines.count - 1, 0)
+    guard assembled <= budget.assembledCharacters else {
+      throw ContextCompilationError.assembledTooLarge(
+        actual: assembled, limit: budget.assembledCharacters)
+    }
+
     lines.append("<<<request>>>")
     lines.append(userMessage)
     lines.append("<<<end>>>")
 
     let context = CompiledConversationContext(
-      instructions: profile.instructions,
+      instructions: instructions,
       prompt: lines.joined(separator: "\n"),
       phase: profile.phase,
       capabilities: capabilities,

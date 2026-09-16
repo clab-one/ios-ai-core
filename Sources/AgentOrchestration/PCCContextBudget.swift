@@ -33,8 +33,12 @@ public struct PCCContextBudget: Sendable, Equatable {
   }
 
   /// `CompiledConversationContext.estimatedCharacters`가 넘을 수 없는 값.
+  ///
+  /// 구획 예산의 합이고, `<<<request>>>` 구획의 표시 비용까지 더한다 — 그 구획은
+  /// 조립 검사 뒤에 서므로 `assembledCharacters`에 세어지지 않는다.
   public var totalCharacters: Int {
     instructionCharacters + requestCharacters + assembledCharacters
+      + Self.requestFramingCharacters
   }
 
   // MARK: 구획별 예산
@@ -43,9 +47,11 @@ public struct PCCContextBudget: Sendable, Equatable {
   static let dataSectionCharacters = 96
   /// `<<<name>>>` `<<<end>>>` 한 쌍과 줄바꿈.
   static let sectionMarkerCharacters = 24
-  /// 이 조립이 세울 수 있는 구획의 최대 수(tools·now·recent·completed·coverage·
-  /// anchors·evidence·request).
+  /// 조립이 세울 수 있는 구획의 최대 수(tools·now·recent·completed·coverage·
+  /// anchors·evidence). `request`는 이 수에 들지 않는다.
   static let maximumSections = 8
+  /// `<<<request>>>` 구획의 표시 비용과 줄바꿈.
+  static let requestFramingCharacters = 32
   /// 최근 차례 한 줄에 붙는 역할 낱말과 줄임표.
   static let recentTurnOverhead = 16
   /// 근거 한 조각 앞에 서는 번호(`[8]\n`).
@@ -94,18 +100,27 @@ public enum ContextCompilationError: Error, Sendable, Equatable {
   /// 사용자 지시 하나가 상한을 넘었다. 정상 경로(정본 캡처 → 기기 읽기)가 놓친
   /// 입력이다.
   case requestTooLarge(actual: Int, limit: Int)
-  /// 조립 결과가 예산을 넘었다. 구획 상한 중 하나가 예산 밖으로 자란 것이므로
-  /// **코드의 결함**이고, 사용자에게 고칠 방법이 없다.
+  /// 지시 평면이 자기 예산을 넘었다. 단계 지시는 상수이므로 이것은 **코드 변경이
+  /// 예산을 넘긴 순간**이고, 남는 자리를 빌려 조용히 통과하지 않는다.
+  case instructionsTooLarge(actual: Int, limit: Int)
+  /// 조립 구획의 합이 예산을 넘었다. 예산 없이 더한 구획이 이 자리에서 드러난다.
+  case assembledTooLarge(actual: Int, limit: Int)
+  /// 전체 봉투가 예산을 넘었다. 구획별 검사를 모두 지나고도 걸리면 예산의 산술이
+  /// 실제 조립과 어긋난 것이다.
   case contextTooLarge(actual: Int, limit: Int)
 
   /// 계측과 문구가 읽는 열쇠. **이름은 여기 하나다** — 화면 문구가 자기 문자열을
   /// 들면 사유를 바꾸는 날 두 값이 갈라지고, 갈라진 사유는 다른 문장을 세운다.
   public static let requestTooLargeReason = "requestTooLarge"
+  public static let instructionsTooLargeReason = "instructionsTooLarge"
+  public static let assembledTooLargeReason = "assembledTooLarge"
   public static let contextTooLargeReason = "contextTooLarge"
 
   public var reason: String {
     switch self {
     case .requestTooLarge: return Self.requestTooLargeReason
+    case .instructionsTooLarge: return Self.instructionsTooLargeReason
+    case .assembledTooLarge: return Self.assembledTooLargeReason
     case .contextTooLarge: return Self.contextTooLargeReason
     }
   }
