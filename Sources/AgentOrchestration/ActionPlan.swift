@@ -52,7 +52,16 @@ public struct GeneratedActionStep {
     description:
       "person name, email address, or channel the user named; empty when not needed")
   public let target: String
-  @Guide(description: "ISO 8601 date-time, empty when the user did not say one")
+  /// **창의 아래 끝이다.** 위 끝은 기기가 박는다(`WebSearchTool`의 `requestedAt`).
+  ///
+  /// `"최신"`을 시각 없는 말로 두면 이 자리가 비고, 빈 자리는 창을 세우지 않는다 —
+  /// 그러면 `web.search`는 5년 전 문서를 "최신"으로 들고 온다. 그래서 새 지시문
+  /// 블록을 더하는 대신 **이 한 줄을 바꿨다**: 문맥 구획은 계획 호출마다 실리고,
+  /// 스키마 문구는 이미 실리고 있다.
+  @Guide(
+    description:
+      "ISO 8601 start time; for web.search latest or recent, use a recent start; empty when no time constraint"
+  )
   public let when: String
   @Guide(description: "mail subject line, empty for anything that is not mail")
   public let subject: String

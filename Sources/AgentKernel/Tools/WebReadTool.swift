@@ -1,0 +1,126 @@
+import Foundation
+
+/// `web.read`의 손. **주소 하나를 글로 바꿔 놓는 것이 전부다.**
+///
+/// 이 자리가 코어에 있는 이유는 앞뒤가 모두 코어이기 때문이다:
+/// `WebSearchTool` → **`WebReadTool`** → `HTMLMarkdown` → `SummarizeTool` →
+/// `Evidence`. 가운데 하나만 호스트에 두면 재사용 가능한 파이프라인이 앱마다
+/// 다시 구현된다.
+///
+/// `web.fetch`는 이 손이 아니다. 그쪽은 받은 것을 **정본 기록으로 남기는** 능력이라
+/// 호스트의 저장소가 필요하다 — 여기서 하는 일은 지나가는 읽기이고, 남는 것은 이
+/// 차례의 수령증뿐이다.
+///
+/// ## 무엇을 돌려주는가
+/// 줄 하나. `body`에 문서의 글이 들어가고(`ResolvableArgument.sourceText`가 이 자리를
+/// 찾는다) `identifier`에는 **리다이렉트를 따라간 최종 주소**가 들어간다.
+///
+/// 글을 PCC에 보내지 않는다. 이 본문은 기기 모델이 사실 몇 줄로 줄이는 재료이고
+/// (`EvidenceCompiler`), 줄이지 못하면 잘린다 — 원문이 문맥에 실리는 경로는 없다.
+public struct WebReadTool: CapabilityHandler {
+  /// 수령증에 담을 글자 상한.
+  ///
+  /// 이 값의 근거는 두 소비자다. 기기 모델은 앞 4,000자만 본다
+  /// (`EvidenceCompiler`의 `forModelContext(limit:)`), 결정적 추출은 **문서 전체**를
+  /// 훑어 질문과 겹치는 문장을 고른다. 그래서 4,000자로 자르면 뒤쪽에 답이 있는
+  /// 문서가 망가지고, 무한정 담으면 차례 기록(`TurnRunRecord`)이 그만큼 커진다.
+  ///
+  /// 40,000자는 본문만 남긴 기사 대부분을 통째로 담는다. 넘치면 자르고, 자른
+  /// 사실은 범위에 적는다(`CoverageRecord.truncated`) — 조용히 자르면 차례가
+  /// 문서를 다 읽은 것처럼 말한다.
+  public static let characterLimit = 40_000
+
+  private let fetch: ContentFetchTransport
+  private let policy: ContentFetchHostPolicy
+
+  public init(
+    fetch: @escaping ContentFetchTransport = ContentFetch.shared,
+    policy: ContentFetchHostPolicy = ContentFetchHostPolicy()
+  ) {
+    self.fetch = fetch
+    self.policy = policy
+  }
+
+  public var capabilities: Set<CapabilityID> { [.webRead] }
+
+  public func perform(_ request: ActionRequest) async throws -> ActionReceipt {
+    guard let raw = request.arguments["url"]?.textValue?
+      .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+      let url = URL(string: raw)
+    else { throw ActionError.invalidArguments(reason: "url") }
+
+    do {
+      // **문보다 앞에서 심사한다.** 심사를 기본 문 안에만 두면(`ContentFetch.standard`)
+      // 자기 문을 주입한 호스트에게는 이 능력이 그냥 HTTP 클라이언트가 된다 —
+      // 그리고 그 주소는 인터넷이 골라 준 주소다.
+      let document = try await fetch(policy.vet(url))
+      let text = try Self.text(in: document)
+      let truncated = text.count > Self.characterLimit
+      let body = truncated ? String(text.prefix(Self.characterLimit)) : text
+
+      return ActionReceipt(
+        requestID: request.id, capability: .webRead, summary: "web.read.result",
+        details: CapabilitySourceRow.detail([
+          CapabilitySourceRow(
+            title: Self.title(of: body, url: document.url),
+            // 부제에 주소를 넣지 않는다. 주소는 식별자 자리에 있고, 부제는
+            // 근거 한 줄로 문맥에 올라간다 — 같은 값을 두 자리에 담을 이유가 없다.
+            body: body, identifier: document.url.absoluteString)
+        ]),
+        coverage: [
+          CoverageRecord(
+            binding: .publicWeb, capability: .webRead,
+            queryFingerprint: ActionFingerprint.arguments(request.arguments),
+            state: truncated ? .partial : .complete,
+            discoveredCount: 1, readCount: 1, paginationExhausted: true,
+            truncated: truncated, reason: truncated ? .truncation : nil)
+        ])
+    } catch let error as ContentFetchError {
+      // **왜 못 읽었는지**가 화면에 남는다. 사설 주소를 막은 것과 서버가 500을 준
+      // 것은 사용자가 할 수 있는 일이 다르다.
+      throw ActionError.failed(reason: error.reason)
+    }
+  }
+
+  /// 바이트를 글로. **글이 아닌 것은 글로 읽지 않는다.**
+  static func text(in document: FetchedDocument) throws -> String {
+    let type = document.mimeType
+    let isHTML =
+      type.contains("html") || type.contains("xml") || type.isEmpty
+    let isPlain = type.hasPrefix("text/") || type.contains("json")
+    guard isHTML || isPlain else { throw ContentFetchError.unsupportedType(type) }
+
+    guard let raw = Self.decode(document.bytes, as: document.encoding) else {
+      throw ContentFetchError.undecodableText
+    }
+    // 구조가 하나도 없으면 `HTMLMarkdown`이 그 글을 그대로 돌려준다 — 플레인텍스트
+    // 경로를 따로 두지 않아도 되는 이유가 그 계약이다.
+    let text = isHTML ? HTMLMarkdown.markdown(fromHTML: raw) : raw
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { throw ContentFetchError.emptyDocument }
+    return trimmed
+  }
+
+  /// 헤더가 시킨 인코딩으로 먼저 읽고, 실패하면 UTF-8·Latin-1로 내려간다.
+  ///
+  /// Latin-1이 마지막인 이유: 어떤 바이트열이든 글자로 읽힌다. 거기서 멈추면
+  /// `undecodableText`가 사실상 일어나지 않으므로, 그 앞 두 단계가 진짜 판정이다.
+  static func decode(_ bytes: Data, as encoding: String.Encoding) -> String? {
+    if let text = String(data: bytes, encoding: encoding) { return text }
+    if let text = String(data: bytes, encoding: .utf8) { return text }
+    return String(data: bytes, encoding: .isoLatin1)
+  }
+
+  /// 제목은 **문서에서** 온다. 없으면 호스트 이름이다 — 제목을 지어내지 않는다.
+  static func title(of markdown: String, url: URL) -> String {
+    let heading = markdown.split(separator: "\n").first {
+      !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    let cleaned =
+      heading?
+      .trimmingCharacters(in: CharacterSet(charactersIn: "# "))
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !cleaned.isEmpty else { return url.host ?? url.absoluteString }
+    return cleaned.count > 120 ? String(cleaned.prefix(120)) : cleaned
+  }
+}

@@ -38,6 +38,16 @@ public struct AgentRuntimeConfiguration: Sendable {
   /// 켠 앱에는 `.standard`가 보통 답이다(`WebSearchBroker.standard`).
   public var webSearch: WebSearchBroker?
 
+  /// 주소 하나를 읽는 문. 주면 코어가 `web.read` 툴을 등록한다
+  /// (`ContentFetch.shared`가 보통 답이다).
+  ///
+  /// 검색과 나눠 둔 이유: 붙여넣은 주소만 읽는 앱이 있고, 그 앱은 사용자 문장을
+  /// 공개 웹으로 내보내지 않는다. 한 스위치로 묶으면 그 앱이 검색까지 켜야 한다.
+  ///
+  /// **`web.fetch`는 이 자리가 아니다.** 그쪽은 받은 것을 정본 기록으로 남기는
+  /// 능력이라 호스트의 저장소가 필요하다 — 여기서 하는 일은 지나가는 읽기다.
+  public var webRead: ContentFetchTransport?
+
   /// 상태 문구. 낱말과 언어는 호스트의 것이다(`TurnCopy.Key.all`).
   public var copy: TurnCopy
 
@@ -71,6 +81,7 @@ public struct AgentRuntimeConfiguration: Sendable {
     memoryIndex: (any SemanticMemoryIndex)? = nil,
     onDeviceModel: (any OnDeviceTextModel)? = nil,
     webSearch: WebSearchBroker? = nil,
+    webRead: ContentFetchTransport? = nil,
     copy: TurnCopy = .keysAsText,
     turnRuns: (any TurnRunStore)? = nil,
     actionLedger: (any ActionLedger)? = nil,
@@ -85,6 +96,7 @@ public struct AgentRuntimeConfiguration: Sendable {
     self.memoryIndex = memoryIndex
     self.onDeviceModel = onDeviceModel
     self.webSearch = webSearch
+    self.webRead = webRead
     self.copy = copy
     self.turnRuns = turnRuns
     self.actionLedger = actionLedger
@@ -156,6 +168,9 @@ public final class AgentRuntime {
     }
     if let broker = configuration.webSearch {
       await dispatcher.register(WebSearchTool(broker: broker))
+    }
+    if let fetch = configuration.webRead {
+      await dispatcher.register(WebReadTool(fetch: fetch))
     }
     for tool in configuration.tools {
       await dispatcher.register(tool)

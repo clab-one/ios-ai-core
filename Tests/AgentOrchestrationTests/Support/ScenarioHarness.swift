@@ -80,6 +80,11 @@ struct ScenarioRun {
   var planningContexts: [String] = []
   var finalizingContexts: [String] = []
   var approvals: [ActionApprovalRequest] = []
+  /// 계획·답 자리가 **대역인가.** L0에서는 참이다.
+  ///
+  /// 이 구분을 로그에 적는 이유: `pcc=2`를 본 사람은 이 층이 PCC를 두 번 부른다고
+  /// 읽는다. L0의 그 값은 **자리가 두 번 열렸다**는 뜻이고 호출 비용은 0이다.
+  var bandedSeats = true
   var result: ConversationTurnResult?
 
   var telemetry: TurnTelemetry { result?.telemetry ?? TurnTelemetry() }
@@ -96,7 +101,8 @@ struct ScenarioRun {
     print(
       """
       📐 \(scenario.name): context=\(largestContext)(기준선 \(budget.contextBaseline)) \
-      pcc=\(telemetry.pccCalls) iterations=\(telemetry.supervisorIterations) \
+      \(bandedSeats ? "seats(대역)" : "pcc")=\(telemetry.pccCalls) \
+      iterations=\(telemetry.supervisorIterations) \
       materials=\(telemetry.materialCount) rows=\(telemetry.retrievedRows) \
       local=\(telemetry.localExtractions)
       """)
