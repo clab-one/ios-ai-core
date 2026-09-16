@@ -146,12 +146,12 @@ final class TurnChainTests: XCTestCase {
       now: { Self.now },
       supervising: { _ in
         onPlan()
-        return .decided(resolved, Self.receipt)
+        return .decided(resolved, ModelInvocationTrail(outcome: Self.receipt))
       },
       finalizing: { _, _ in
         FinalizationStep(
           answer: .written(headline: "했어요", points: [], relevant: [], backend: .privateCloud),
-          receipt: Self.receipt)
+          trail: ModelInvocationTrail(outcome: Self.receipt))
       })
   }
 

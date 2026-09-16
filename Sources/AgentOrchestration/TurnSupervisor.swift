@@ -27,22 +27,22 @@ public struct SupervisorRequest: Sendable {
 /// (§48), 감독 되돌이가 1차 결과를 보고 2차 단계를 만드는지를 실제 모델로는
 /// 확인할 수 없다 — 확인할 수 없는 규칙은 지켜지지 않는 규칙이다(§41).
 public enum SupervisorStep: Sendable {
-  case decided(TurnDecision, ModelInvocationReceipt)
+  case decided(TurnDecision, ModelInvocationTrail)
   case failed(
-    disposition: ModelFailureDisposition, reason: String, ModelInvocationReceipt)
+    disposition: ModelFailureDisposition, reason: String, ModelInvocationTrail)
 }
 
 /// 감독자를 대신 세우는 문. 기본값은 실제 모델이다(`TurnRuntime.liveSupervising`).
 public typealias TurnSupervising = @MainActor (SupervisorRequest) async -> SupervisorStep
 
-/// 답 한 벌과 그것을 만든 모델의 영수증.
+/// 답 한 벌과 그것을 만든 **호출들**의 영수증.
 public struct FinalizationStep: Sendable {
   public let answer: FinalAnswer
-  public let receipt: ModelInvocationReceipt
+  public let trail: ModelInvocationTrail
 
-  public init(answer: FinalAnswer, receipt: ModelInvocationReceipt) {
+  public init(answer: FinalAnswer, trail: ModelInvocationTrail) {
     self.answer = answer
-    self.receipt = receipt
+    self.trail = trail
   }
 }
 
@@ -73,10 +73,10 @@ public struct TurnSupervisor: Sendable {
 
   public init() {}
 
-  /// 한 되돌이의 결과와 그것을 만든 호출의 영수증.
+  /// 한 되돌이의 결과와 그것을 만든 **호출들**의 영수증.
   public struct Outcome: Sendable {
     public let decision: TurnDecision
-    public let receipt: ModelInvocationReceipt
+    public let trail: ModelInvocationTrail
   }
 
   /// 답하지 못했다. 처분은 공통 분류기가 정한다(§37) — 계획·재계획·답 쓰기가
@@ -84,7 +84,7 @@ public struct TurnSupervisor: Sendable {
   public struct Failure: Error, Sendable {
     public let disposition: ModelFailureDisposition
     public let reason: String
-    public let receipt: ModelInvocationReceipt
+    public let trail: ModelInvocationTrail
   }
 
   /// 다음에 무엇을 부를지 정한다. **PCC가 정한다.**
@@ -102,10 +102,13 @@ public struct TurnSupervisor: Sendable {
     guard #available(iOS 27.0, *) else {
       return .failure(Self.unsupported(profile: profile, context: context, started: started))
     }
-    var retried = false
+    // **물리 호출마다 영수증 한 장.** 버리는 것은 결과뿐이고, 나간 호출은 문맥을
+    // 태웠다 — 한 장만 남기면 계측이 실제 요청 수보다 작게 나온다.
+    var discarded: [ModelInvocationReceipt] = []
     while true {
+      let attemptStarted = Date()
       do {
-        let generated = try await respond(context: context, profile: profile)
+        let (generated, usage) = try await respond(context: context, profile: profile)
         let decision = ActionPlanValidator.validate(
           generated, allowed: profile.scope.sorted, conversationID: conversationID,
           accountID: accountID, calendar: context.calendar)
@@ -114,20 +117,25 @@ public struct TurnSupervisor: Sendable {
           supervisor phase=\(profile.phase.rawValue, privacy: .public) \
           status=\(decision.status.rawValue, privacy: .public) \
           steps=\(decision.plan.steps.count, privacy: .public) \
-          retried=\(retried, privacy: .public)
+          calls=\(discarded.count + 1, privacy: .public) \
+          tokens=\(usage.inputTokens, privacy: .public)
           """)
         return .success(
           Outcome(
             decision: decision,
-            receipt: Self.receipt(
-              profile: profile, completed: true,
-              fallbackReason: retried ? "retried" : nil, context: context,
-              started: started)))
+            trail: ModelInvocationTrail(
+              outcome: Self.receipt(
+                profile: profile, completed: true, fallbackReason: nil,
+                context: context, started: attemptStarted, usage: usage),
+              discarded: discarded)))
       } catch {
         let reason = ModelFailureClassifier.reason(for: error)
         let disposition = ModelFailureClassifier.disposition(for: error)
-        if disposition == .retry, !retried {
-          retried = true
+        let receipt = Self.receipt(
+          profile: profile, completed: false, fallbackReason: reason,
+          context: context, started: attemptStarted)
+        if disposition == .retry, discarded.isEmpty {
+          discarded.append(receipt)
           Self.log.error(
             "supervisor retrying phase=\(profile.phase.rawValue, privacy: .public) reason=\(reason, privacy: .public)"
           )
@@ -137,7 +145,9 @@ public struct TurnSupervisor: Sendable {
         // 없으므로 영수증도 그렇게 적는다(§36).
         if reason == ModelFailureClassifier.unsupportedReason {
           return .failure(
-            Self.unsupported(profile: profile, context: context, started: started))
+            Self.unsupported(
+              profile: profile, context: context, started: attemptStarted,
+              discarded: discarded))
         }
         Self.log.error(
           "supervisor failed phase=\(profile.phase.rawValue, privacy: .public) reason=\(reason, privacy: .public)"
@@ -145,9 +155,7 @@ public struct TurnSupervisor: Sendable {
         return .failure(
           Failure(
             disposition: disposition, reason: reason,
-            receipt: Self.receipt(
-              profile: profile, completed: false, fallbackReason: reason,
-              context: context, started: started)))
+            trail: ModelInvocationTrail(outcome: receipt, discarded: discarded)))
       }
     }
   }
@@ -158,16 +166,18 @@ public struct TurnSupervisor: Sendable {
   private func respond(
     context: CompiledConversationContext,
     profile: DynamicTurnProfile
-  ) async throws -> GeneratedTurnDecision {
+  ) async throws -> (GeneratedTurnDecision, ModelTokenUsage) {
     let session = try DynamicProfileAdapter.privateCloudSession(
       instructions: context.instructions)
     let options = DynamicProfileAdapter.generationOptions(for: profile)
     // PCC 호출은 기기 대기열을 지나지 않는다 — 기기 모델을 붙잡지 않으므로
     // 입장 제어의 대상이 아니다. 기다린 시간이 0인 것은 사실이다.
-    return try await session.respond(
+    let response = try await session.respond(
       to: context.prompt, generating: GeneratedTurnDecision.self, options: options,
-      contextOptions: DynamicProfileAdapter.contextOptions(for: profile)
-    ).content
+      contextOptions: DynamicProfileAdapter.contextOptions(for: profile))
+    // **문맥 비용은 여기서만 사실이 된다.** 스키마와 `@Guide` 문구가 프롬프트에
+    // 실리는 값은 우리가 센 글자 수 어디에도 없다(TN3193).
+    return (response.content, DynamicProfileAdapter.tokenUsage(response.usage))
   }
 
   /// 이 기기에서는 에이전트를 열 수 없다. **기기 모델이 계획을 대신 쓰지 않는다.**
@@ -176,25 +186,28 @@ public struct TurnSupervisor: Sendable {
   /// 시도로 적으면 처리 위치가 `pccAttemptedButFallbackLocal`이 되어 화면이
   /// "클라우드에 보냈다가 기기로 돌아왔다"는 **거짓**을 말한다(§36).
   private static func unsupported(
-    profile: DynamicTurnProfile, context: CompiledConversationContext, started: Date
+    profile: DynamicTurnProfile, context: CompiledConversationContext, started: Date,
+    discarded: [ModelInvocationReceipt] = []
   ) -> Failure {
     log.error("supervisor unsupported reason=pcc.unsupported")
     return Failure(
       disposition: .surfaceFailure,
       reason: ModelFailureClassifier.unsupportedReason,
-      receipt: ModelInvocationReceipt(
-        phase: profile.phase,
-        purpose: AdmissionJob.conversationPlan.rawValue,
-        requestedBackend: .privateCloud,
-        resolvedBackend: .privateCloud,
-        pccAttempted: false,
-        pccCompleted: false,
-        onDeviceAttempted: false,
-        onDeviceCompleted: false,
-        fallbackReason: ModelFailureClassifier.unsupportedReason,
-        inputCharacters: context.estimatedCharacters,
-        latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1_000),
-        waitedMilliseconds: 0))
+      trail: ModelInvocationTrail(
+        outcome: ModelInvocationReceipt(
+          phase: profile.phase,
+          purpose: AdmissionJob.conversationPlan.rawValue,
+          requestedBackend: .privateCloud,
+          resolvedBackend: .privateCloud,
+          pccAttempted: false,
+          pccCompleted: false,
+          onDeviceAttempted: false,
+          onDeviceCompleted: false,
+          fallbackReason: ModelFailureClassifier.unsupportedReason,
+          inputCharacters: context.estimatedCharacters,
+          latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1_000),
+          waitedMilliseconds: 0),
+        discarded: discarded))
   }
 
   private static func receipt(
@@ -202,7 +215,8 @@ public struct TurnSupervisor: Sendable {
     completed: Bool,
     fallbackReason: String?,
     context: CompiledConversationContext,
-    started: Date
+    started: Date,
+    usage: ModelTokenUsage? = nil
   ) -> ModelInvocationReceipt {
     ModelInvocationReceipt(
       phase: profile.phase,
@@ -217,6 +231,7 @@ public struct TurnSupervisor: Sendable {
       fallbackReason: fallbackReason,
       inputCharacters: context.estimatedCharacters,
       latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1_000),
-      waitedMilliseconds: 0)
+      waitedMilliseconds: 0,
+      usage: usage)
   }
 }

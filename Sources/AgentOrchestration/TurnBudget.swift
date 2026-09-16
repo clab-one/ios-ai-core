@@ -28,7 +28,20 @@ public struct TurnTelemetry: Sendable, Equatable {
   public var toolCount = 0
   /// 근거 조각 수.
   public var materialCount = 0
-  public var estimatedInputCharacters = 0
+  /// 물리 PCC 호출 **전부가** 실은 글자 수의 합과 한 호출의 최대.
+  ///
+  /// 예전에는 `estimatedInputCharacters` 한 칸이었고, 단계마다 **덮어썼다** —
+  /// 감독 3회 + 답 1회를 돈 차례가 기록에 남기는 값은 마지막 호출의 크기였다.
+  /// 합만 보면 "호출이 많았다"와 "한 호출이 컸다"를 구별할 수 없으므로 둘을 든다.
+  public var inputCharacters = 0
+  public var maximumInputCharacters = 0
+  /// **실측 토큰.** 모델이 돌려준 값이고(`Response.usage`), 글자 수의 환산이
+  /// 아니다. 재지 못한 호출은 더하지 않으므로 `pccCalls`보다 적은 호출만 셀 수
+  /// 있다 — 그 차이가 곧 "이 기기에서 재지 못했다"는 사실이다.
+  public var inputTokens = 0
+  public var maximumInputTokens = 0
+  public var cachedInputTokens = 0
+  /// **물리** PCC 요청 수. 재시도는 호출이 하나 더인 것이다.
   public var pccCalls = 0
   /// 감독자에게 물은 횟수. 재계획이 실제로 일어났는가를 이 값이 말한다.
   public var supervisorIterations = 0
@@ -62,7 +75,10 @@ public struct TurnTelemetry: Sendable, Equatable {
       """
       turn profile=\(profile, privacy: .public) backend=\(backend, privacy: .public) \
       tools=\(toolCount, privacy: .public) materials=\(materialCount, privacy: .public) \
-      input=\(estimatedInputCharacters, privacy: .public) pcc=\(pccCalls, privacy: .public) \
+      chars=\(inputCharacters, privacy: .public)/\(maximumInputCharacters, privacy: .public) \
+      tokens=\(inputTokens, privacy: .public)/\(maximumInputTokens, privacy: .public) \
+      cached=\(cachedInputTokens, privacy: .public) \
+      pcc=\(pccCalls, privacy: .public) \
       iterations=\(supervisorIterations, privacy: .public) \
       compaction=\(localExtractions, privacy: .public)/\(retrievedRows, privacy: .public) \
       fanout=\(readFanout, privacy: .public) \

@@ -36,6 +36,22 @@ public struct ModelInvocationReceipt: Sendable, Equatable {
   /// 구별할 수 없다.
   public let waitedMilliseconds: Int
 
+  /// 이 호출이 실제로 태운 토큰. **모델이 돌려준 값**이다
+  /// (`LanguageModelSession.Response.usage`, iOS 27).
+  ///
+  /// 글자 수는 이 값의 대용이 아니다. Apple TN3193에 따르면 라틴 문자는 세~네
+  /// 글자가 한 토큰이고 **한국어·중국어·일본어는 대략 한 글자가 한 토큰**이므로,
+  /// 같은 `inputCharacters`가 언어에 따라 서로 다른 부하를 뜻한다. 그리고
+  /// `@Generable` 스키마와 `@Guide` 문구도 프롬프트에 실려 토큰을 태우는데, 그
+  /// 비용은 글자 수 어디에도 없다.
+  ///
+  /// 재지 못한 호출은 **nil이고 0이 아니다** — iOS 26에는 이 값이 없고, 응답을
+  /// 받지 못한 호출에는 사용량이 없다. 0으로 적으면 평균이 조용히 낮아진다.
+  public let inputTokens: Int?
+  /// 그중 캐시에서 온 토큰. 재시도가 같은 문맥을 다시 태우는지가 이 값에 보인다.
+  public let cachedInputTokens: Int?
+  public let outputTokens: Int?
+
   public init(
     phase: TurnPhase,
     purpose: String = "",
@@ -48,7 +64,8 @@ public struct ModelInvocationReceipt: Sendable, Equatable {
     fallbackReason: String?,
     inputCharacters: Int,
     latencyMilliseconds: Int,
-    waitedMilliseconds: Int = 0
+    waitedMilliseconds: Int = 0,
+    usage: ModelTokenUsage? = nil
   ) {
     self.phase = phase
     self.purpose = purpose
@@ -62,6 +79,9 @@ public struct ModelInvocationReceipt: Sendable, Equatable {
     self.inputCharacters = inputCharacters
     self.latencyMilliseconds = latencyMilliseconds
     self.waitedMilliseconds = waitedMilliseconds
+    self.inputTokens = usage?.inputTokens
+    self.cachedInputTokens = usage?.cachedInputTokens
+    self.outputTokens = usage?.outputTokens
   }
 }
 
@@ -121,6 +141,19 @@ public struct ModelUsageLog: Sendable, Equatable {
   /// 줄에서 기다린 시간의 합. 차례 지연에서 이 값을 빼면 모델이 쓴 시간이다.
   public var waitedMilliseconds: Int { receipts.reduce(0) { $0 + $1.waitedMilliseconds } }
 
+  /// 이 차례가 태운 **입력 토큰의 합**. 재지 못한 호출은 더하지 않는다.
+  public var inputTokens: Int { receipts.compactMap(\.inputTokens).reduce(0, +) }
+  /// 한 호출이 태운 최대 입력 토큰. 합만 보면 "호출이 많았다"와 "한 호출이
+  /// 컸다"를 구별할 수 없고, 문맥 창에 걸리는 것은 뒤쪽이다.
+  public var maximumInputTokens: Int { receipts.compactMap(\.inputTokens).max() ?? 0 }
+  public var cachedInputTokens: Int {
+    receipts.compactMap(\.cachedInputTokens).reduce(0, +)
+  }
+  /// 물리 호출 전체가 실은 글자 수의 합. 예산은 글자로 재고(호출 전) 비용은
+  /// 토큰으로 잰다(호출 후) — 두 값을 한 칸에 접지 않는다.
+  public var inputCharacters: Int { receipts.reduce(0) { $0 + $1.inputCharacters } }
+  public var maximumInputCharacters: Int { receipts.map(\.inputCharacters).max() ?? 0 }
+
   /// 단계별 한 줄씩 남긴다. 개인 데이터는 담지 않는다.
   public func emit() {
     for receipt in receipts {
@@ -131,10 +164,54 @@ public struct ModelUsageLog: Sendable, Equatable {
         requested=\(receipt.requestedBackend.rawValue, privacy: .public) \
         resolved=\(receipt.resolvedBackend.rawValue, privacy: .public) \
         input=\(receipt.inputCharacters, privacy: .public) \
+        tokens=\(receipt.inputTokens ?? -1, privacy: .public) \
+        cached=\(receipt.cachedInputTokens ?? -1, privacy: .public) \
         waited=\(receipt.waitedMilliseconds, privacy: .public) \
         latency=\(receipt.latencyMilliseconds, privacy: .public) \
         fallback=\(receipt.fallbackReason ?? "", privacy: .public)
         """)
     }
   }
+}
+
+/// 모델이 돌려준 **실제 토큰 사용량**.
+///
+/// 추정이 아니다. 이 값이 있는 이유는 글자 수로는 알 수 없는 것이 두 가지이기
+/// 때문이다: 언어에 따른 글자당 토큰 비율, 그리고 `@Generable` 스키마가 프롬프트에
+/// 실리는 비용. SDK 값을 그대로 퍼뜨리지 않고 이 모양으로 옮긴다
+/// (`DynamicProfileAdapter.tokenUsage`) — `LanguageModelSession.Usage`는 iOS 27
+/// 전용이고 이 코어는 iOS 26에서도 계획한다.
+public struct ModelTokenUsage: Sendable, Equatable {
+  public let inputTokens: Int
+  public let cachedInputTokens: Int
+  public let outputTokens: Int
+
+  public init(inputTokens: Int, cachedInputTokens: Int, outputTokens: Int) {
+    self.inputTokens = inputTokens
+    self.cachedInputTokens = cachedInputTokens
+    self.outputTokens = outputTokens
+  }
+}
+
+/// 요청 하나가 실제로 낸 **물리 호출들**의 영수증.
+///
+/// 재시도는 호출이 하나 더인 것이고, 그 호출도 문맥을 태우고 요금을 낸다. 영수증을
+/// 한 장만 남기던 동안 `ModelUsageLog.pccAttempts`는 재시도를 세지 않았고, 계측이
+/// 실제 PCC 요청 수보다 작게 나왔다 — 문맥 크기가 핵심 지표인 코어에서 그 오차는
+/// 지표 전체를 못 믿게 만든다.
+public struct ModelInvocationTrail: Sendable, Equatable {
+  /// 결과를 정한 호출. 처리 위치와 대역 사유는 이 영수증이 말한다.
+  public let outcome: ModelInvocationReceipt
+  /// 그 앞에 **실제로 나갔던** 호출들. 시간 순이고, 버린 것은 결과뿐이다.
+  public let discarded: [ModelInvocationReceipt]
+
+  public init(
+    outcome: ModelInvocationReceipt, discarded: [ModelInvocationReceipt] = []
+  ) {
+    self.outcome = outcome
+    self.discarded = discarded
+  }
+
+  /// 시간 순 전부. **계측은 이 목록을 센다.**
+  public var all: [ModelInvocationReceipt] { discarded + [outcome] }
 }

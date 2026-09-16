@@ -62,7 +62,7 @@ public struct TurnFinalizer: Sendable {
 
   public struct Outcome: Sendable {
     public let answer: FinalAnswer
-    public let receipt: ModelInvocationReceipt
+    public let trail: ModelInvocationTrail
   }
 
   /// 답 한 벌. **PCC가 쓴다.**
@@ -80,41 +80,54 @@ public struct TurnFinalizer: Sendable {
       Self.log.error("finalizer unsupported reason=\(reason, privacy: .public)")
       return Outcome(
         answer: .unavailable(reason: reason),
-        receipt: Self.receipt(
-          profile: profile, completed: false, fallbackReason: reason, context: context,
-          started: started))
+        trail: ModelInvocationTrail(
+          outcome: Self.receipt(
+            profile: profile, completed: false, fallbackReason: reason, context: context,
+            started: started)))
     }
-    var retried = false
+    // **물리 호출마다 영수증 한 장.** 다시 낸 호출도 같은 문맥을 태운다.
+    var discarded: [ModelInvocationReceipt] = []
     while true {
+      let attemptStarted = Date()
       let generated: GeneratedFinalAnswer
+      let usage: ModelTokenUsage
       do {
-        generated = try await respond(context: context, profile: profile)
+        (generated, usage) = try await respond(context: context, profile: profile)
       } catch {
         let reason = ModelFailureClassifier.reason(for: error)
-        if ModelFailureClassifier.disposition(for: error) == .retry, !retried {
-          retried = true
+        let receipt = Self.receipt(
+          profile: profile, completed: false, fallbackReason: reason,
+          context: context, started: attemptStarted)
+        if ModelFailureClassifier.disposition(for: error) == .retry, discarded.isEmpty {
+          discarded.append(receipt)
           Self.log.error("finalizer retrying reason=\(reason, privacy: .public)")
           continue
         }
         Self.log.error("finalizer failed reason=\(reason, privacy: .public)")
         return Outcome(
           answer: .unavailable(reason: reason),
-          receipt: Self.receipt(
-            profile: profile, completed: false, fallbackReason: reason,
-            context: context, started: started))
+          trail: ModelInvocationTrail(outcome: receipt, discarded: discarded))
       }
 
       let headline = generated.headline.trimmingCharacters(in: .whitespacesAndNewlines)
+      let trail = ModelInvocationTrail(
+        outcome: Self.receipt(
+          profile: profile, completed: !headline.isEmpty,
+          fallbackReason: headline.isEmpty ? "empty" : nil, context: context,
+          started: attemptStarted, usage: usage),
+        discarded: discarded)
       guard !headline.isEmpty else {
-        return Outcome(
-          answer: .unavailable(reason: "empty"),
-          receipt: Self.receipt(
-            profile: profile, completed: false, fallbackReason: "empty",
-            context: context, started: started))
+        return Outcome(answer: .unavailable(reason: "empty"), trail: trail)
       }
       let points = generated.points
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
+      Self.log.info(
+        """
+        finalizer calls=\(discarded.count + 1, privacy: .public) \
+        tokens=\(usage.inputTokens, privacy: .public) \
+        cached=\(usage.cachedInputTokens, privacy: .public)
+        """)
       return Outcome(
         answer: .written(
           headline: headline, points: points,
@@ -122,9 +135,7 @@ public struct TurnFinalizer: Sendable {
           // 모델이 센 것과 문맥에 실린 것이 어긋나면 그 번호는 아무것도 가리키지
           // 않는다.
           relevant: generated.relevant.filter { $0 > 0 }, backend: .privateCloud),
-        receipt: Self.receipt(
-          profile: profile, completed: true, fallbackReason: retried ? "retried" : nil,
-          context: context, started: started))
+        trail: trail)
     }
   }
 
@@ -132,14 +143,14 @@ public struct TurnFinalizer: Sendable {
   private func respond(
     context: CompiledConversationContext,
     profile: DynamicTurnProfile
-  ) async throws -> GeneratedFinalAnswer {
+  ) async throws -> (GeneratedFinalAnswer, ModelTokenUsage) {
     let session = try DynamicProfileAdapter.privateCloudSession(
       instructions: context.instructions)
     let options = DynamicProfileAdapter.generationOptions(for: profile)
-    return try await session.respond(
+    let response = try await session.respond(
       to: context.prompt, generating: GeneratedFinalAnswer.self, options: options,
-      contextOptions: DynamicProfileAdapter.contextOptions(for: profile)
-    ).content
+      contextOptions: DynamicProfileAdapter.contextOptions(for: profile))
+    return (response.content, DynamicProfileAdapter.tokenUsage(response.usage))
   }
 
   private static func receipt(
@@ -147,7 +158,8 @@ public struct TurnFinalizer: Sendable {
     completed: Bool,
     fallbackReason: String?,
     context: CompiledConversationContext,
-    started: Date
+    started: Date,
+    usage: ModelTokenUsage? = nil
   ) -> ModelInvocationReceipt {
     ModelInvocationReceipt(
       phase: .finalizing,
@@ -161,6 +173,7 @@ public struct TurnFinalizer: Sendable {
       fallbackReason: fallbackReason,
       inputCharacters: context.estimatedCharacters,
       latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1_000),
-      waitedMilliseconds: 0)
+      waitedMilliseconds: 0,
+      usage: usage)
   }
 }

@@ -337,20 +337,18 @@ final class PCCContextBoundaryTests: XCTestCase {
       dispatcher: dispatcher,
       emit: { _ in },
       present: present,
-      copy: .keysAsText,
-      now: { Self.now },
       supervising: { _ in
         calls.supervising += 1
         return .decided(
           TurnDecision(status: .complete, plan: ActionPlan(steps: [], needs: nil)),
-          Self.receipt)
+          ModelInvocationTrail(outcome: Self.receipt))
       },
       finalizing: { _, _ in
         calls.finalizing += 1
         return FinalizationStep(
           answer: .written(
             headline: "했어요", points: [], relevant: [], backend: .privateCloud),
-          receipt: Self.receipt)
+          trail: ModelInvocationTrail(outcome: Self.receipt))
       })
   }
 

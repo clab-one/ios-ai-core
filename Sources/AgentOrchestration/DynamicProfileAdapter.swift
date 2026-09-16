@@ -45,6 +45,22 @@ public enum DynamicProfileAdapter {
     return ContextOptions(reasoningLevel: reasoningLevel(reasoning))
   }
 
+  /// 응답이 들고 온 **실제 사용량**을 코어의 값으로.
+  ///
+  /// 확인한 SDK 사실: `LanguageModelSession.Response.usage`(iOS 27)와
+  /// `Usage.Input(totalTokenCount:cachedTokenCount:)`·
+  /// `Usage.Output(totalTokenCount:reasoningTokenCount:)`.
+  ///
+  /// 이 자리가 있는 이유는 가용성이다. iOS 26에는 이 타입이 없으므로 호출부마다
+  /// 분기를 두면 한 곳이 빠진 날 그 기기에서 프로세스가 죽는다.
+  @available(iOS 27.0, *)
+  public static func tokenUsage(_ usage: LanguageModelSession.Usage) -> ModelTokenUsage {
+    ModelTokenUsage(
+      inputTokens: usage.input.totalTokenCount,
+      cachedInputTokens: usage.input.cachedTokenCount,
+      outputTokens: usage.output.totalTokenCount)
+  }
+
   @available(iOS 27.0, *)
   public static func reasoningLevel(
     _ reasoning: DynamicTurnProfile.Reasoning

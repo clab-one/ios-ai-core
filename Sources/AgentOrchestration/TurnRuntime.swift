@@ -107,17 +107,17 @@ public final class TurnRuntime {
       return .failed(
         disposition: .surfaceFailure,
         reason: ModelFailureClassifier.unsupportedReason,
-        TurnRuntime.unavailableReceipt(request.profile))
+        ModelInvocationTrail(outcome: TurnRuntime.unavailableReceipt(request.profile)))
     }
     switch await TurnSupervisor().decide(
       request.context, profile: request.profile,
       conversationID: request.conversationID, accountID: request.accountID)
     {
     case .success(let outcome):
-      return .decided(outcome.decision, outcome.receipt)
+      return .decided(outcome.decision, outcome.trail)
     case .failure(let failure):
       return .failed(
-        disposition: failure.disposition, reason: failure.reason, failure.receipt)
+        disposition: failure.disposition, reason: failure.reason, failure.trail)
     }
   }
 
@@ -125,10 +125,10 @@ public final class TurnRuntime {
     guard #available(iOS 26.0, *) else {
       return FinalizationStep(
         answer: .unavailable(reason: ModelFailureClassifier.unsupportedReason),
-        receipt: TurnRuntime.unavailableReceipt(profile))
+        trail: ModelInvocationTrail(outcome: TurnRuntime.unavailableReceipt(profile)))
     }
     let outcome = await TurnFinalizer().finalize(context, profile: profile)
-    return FinalizationStep(answer: outcome.answer, receipt: outcome.receipt)
+    return FinalizationStep(answer: outcome.answer, trail: outcome.trail)
   }
 
   /// 부르지 못한 호출의 영수증. **부르려 했다고 적지 않는다** — 부른 적이 없으면
@@ -142,6 +142,22 @@ public final class TurnRuntime {
       onDeviceAttempted: false, onDeviceCompleted: false,
       fallbackReason: ModelFailureClassifier.unavailableReason,
       inputCharacters: 0, latencyMilliseconds: 0)
+  }
+
+  /// 물리 호출들의 영수증을 차례에 적는다.
+  ///
+  /// **버린 시도도 적는다.** 나간 호출은 문맥을 태웠고 요금을 냈다 — 세지 않으면
+  /// `pccCalls`가 실제 요청 수보다 작아지고, 문맥 크기가 핵심 지표인 코어에서
+  /// 그 오차는 지표 전체를 못 믿게 만든다.
+  ///
+  /// 대역 사유는 **가장 마지막에 말한 것**을 든다. 다시 내서 성공한 차례의 첫
+  /// 실패도 일어난 일이므로 그 사유가 계측에 남는다.
+  private func record(_ trail: ModelInvocationTrail, in state: inout TurnState) {
+    for receipt in trail.all { state.usage.record(receipt) }
+    state.telemetry.backend = trail.outcome.resolvedBackend.rawValue
+    if let reason = trail.all.compactMap(\.fallbackReason).last {
+      state.telemetry.fallbackReason = reason
+    }
   }
 
   // MARK: 차례의 상태
@@ -588,7 +604,6 @@ public final class TurnRuntime {
 
     state.iteration += 1
     state.telemetry.supervisorIterations = state.iteration
-    state.telemetry.estimatedInputCharacters = context.estimatedCharacters
 
     let step = await supervising(
       SupervisorRequest(
@@ -596,13 +611,9 @@ public final class TurnRuntime {
         accountID: state.account))
     guard eligible(state) else { return .stop(reason: "cancelled") }
     switch step {
-    case .decided(let decision, let receipt):
-      state.usage.record(receipt)
-      state.telemetry.backend = receipt.resolvedBackend.rawValue
-      if receipt.pccCompleted { state.pccSupervised = true }
-      if let reason = receipt.fallbackReason {
-        state.telemetry.fallbackReason = reason
-      }
+    case .decided(let decision, let trail):
+      record(trail, in: &state)
+      if trail.outcome.pccCompleted { state.pccSupervised = true }
       if let needs = decision.plan.needs {
         let reads = investigationSteps(decision.plan.steps, in: state)
         if !reads.isEmpty {
@@ -621,8 +632,8 @@ public final class TurnRuntime {
         return .complete
       }
       return .work(decision.plan.steps)
-    case .failed(let disposition, let reason, let receipt):
-      state.usage.record(receipt)
+    case .failed(let disposition, let reason, let trail):
+      record(trail, in: &state)
       state.telemetry.fallbackReason = reason
       switch disposition {
       case .surfaceFailure:
@@ -1401,10 +1412,8 @@ public final class TurnRuntime {
         context = nil
       }
       if let context {
-        state.telemetry.estimatedInputCharacters = context.estimatedCharacters
         let step = await finalizing(context, profile)
-        state.usage.record(step.receipt)
-        state.telemetry.backend = step.receipt.resolvedBackend.rawValue
+        record(step.trail, in: &state)
         switch step.answer {
         case .written(let written, let supporting, let relevant, _):
           headline = written
@@ -1469,10 +1478,8 @@ public final class TurnRuntime {
       await finish(state, phase: .failed, reason: error.reason)
       return
     }
-    state.telemetry.estimatedInputCharacters = context.estimatedCharacters
     let step = await finalizing(context, profile)
-    state.usage.record(step.receipt)
-    state.telemetry.backend = step.receipt.resolvedBackend.rawValue
+    record(step.trail, in: &state)
     switch step.answer {
     case .written(let written, let supporting, _, _):
       await finish(
@@ -1655,7 +1662,13 @@ public final class TurnRuntime {
 
     state.telemetry.toolCount = state.ledger.attempts.count
     state.telemetry.materialCount = state.evidence.evidence.count
+    // **물리 호출을 센다.** 재시도도 문맥을 태웠으므로 요청 하나로 접지 않는다.
     state.telemetry.pccCalls = state.usage.pccAttempts
+    state.telemetry.inputCharacters = state.usage.inputCharacters
+    state.telemetry.maximumInputCharacters = state.usage.maximumInputCharacters
+    state.telemetry.inputTokens = state.usage.inputTokens
+    state.telemetry.maximumInputTokens = state.usage.maximumInputTokens
+    state.telemetry.cachedInputTokens = state.usage.cachedInputTokens
     state.telemetry.processingLocation = state.usage.location
     // 기다린 시간은 **영수증에서 계산한다** — 따로 들면 두 값이 갈라진다. 값
     // 뽑기는 영수증을 남기지 않는 목적이라 차례 누적을 여기서 더한다.
