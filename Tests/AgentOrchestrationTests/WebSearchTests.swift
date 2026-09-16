@@ -218,7 +218,87 @@ final class WebSearchTests: XCTestCase {
       prompt.count, PCCContextBudget.standard.totalCharacters, "문맥이 예산을 넘었다")
   }
 
-  // MARK: 5) 요약의 초점
+  // MARK: 5) "최신"의 기준은 오늘
+
+  func testDayRangeFormatsTheWindow() {
+    let seoul = TimeZone(identifier: "Asia/Seoul") ?? .gmt
+    let window = WebSearchWindow(
+      after: Self.now.addingTimeInterval(-7 * 24 * 3_600), before: Self.now,
+      timeZone: seoul)
+    XCTAssertEqual(window.dayRange, "2026-09-10..2026-09-17")
+
+    let open = WebSearchWindow(after: nil, before: Self.now, timeZone: seoul)
+    XCTAssertEqual(open.dayRange, "..2026-09-17", "아래 끝이 없는 창이 닫힌 구간으로 갔다")
+  }
+
+  /// **위 끝은 오늘이고, 그 오늘은 기기 시계에서 온다.**
+  ///
+  /// 모델이 아는 날짜는 자기 학습 시점이다. 그 값이 창의 위 끝이 되면 몇 달 전이
+  /// "최신"이 되고, 오늘 나온 글은 창 밖으로 밀린다.
+  func testWindowEndsTodayEvenWhenThePlanSaysLater() async throws {
+    let captured = CapturingTransport(html: Self.htmlFixture)
+    let tool = WebSearchTool(
+      broker: WebSearchBroker(engines: [
+        DuckDuckGoHTMLSearch(transport: captured.transport)
+      ]))
+    _ = try await tool.perform(
+      ActionRequest(
+        capability: .webSearch,
+        arguments: [
+          "query": .text("pcc"),
+          "after": .timestamp(Self.now.addingTimeInterval(-7 * 24 * 3_600)),
+          // 모델이 내년을 말했다.
+          "before": .timestamp(Self.now.addingTimeInterval(400 * 24 * 3_600)),
+        ],
+        origin: .modelPlan, accountID: "acct", requestedAt: Self.now))
+
+    let body = try XCTUnwrap(captured.body)
+    let today = WebSearchWindow(after: nil, before: Self.now, timeZone: .current).dayRange
+    XCTAssertTrue(body.contains("df=" ), "날짜 창이 요청에 실리지 않았다")
+    XCTAssertTrue(body.hasSuffix(today), "위 끝이 오늘이 아니다: \(body)")
+    XCTAssertFalse(body.contains("2027-"), "모델이 말한 미래가 창의 위 끝으로 섰다")
+  }
+
+  /// 날짜를 말하지 않은 차례에는 **필터를 보내지 않는다.** 빈 값을 보내면 공급자가
+  /// 그것을 필터로 읽는다.
+  func testNoDateMeansNoFilter() async throws {
+    let captured = CapturingTransport(html: Self.htmlFixture)
+    let tool = WebSearchTool(
+      broker: WebSearchBroker(engines: [
+        DuckDuckGoHTMLSearch(transport: captured.transport)
+      ]))
+    _ = try await tool.perform(
+      ActionRequest(
+        capability: .webSearch, arguments: ["query": .text("pcc")],
+        origin: .modelPlan, accountID: "acct", requestedAt: Self.now))
+
+    let body = try XCTUnwrap(captured.body)
+    XCTAssertFalse(body.contains("df="), "창이 없는데 날짜 필터가 실렸다")
+  }
+
+  /// 모델이 줄 수 있는 것은 **창의 아래 끝**뿐이다.
+  func testPlanDateBecomesTheWindowStart() throws {
+    var seoul = Calendar(identifier: .gregorian)
+    seoul.timeZone = TimeZone(identifier: "Asia/Seoul") ?? .gmt
+    let decision = ActionPlanValidator.validate(
+      GeneratedTurnDecision(
+        status: "continue",
+        steps: [
+          GeneratedActionStep(
+            capability: "web.search", text: "PCC 소식", target: "",
+            when: "2026-09-10T00:00:00+09:00", subject: "")
+        ],
+        needs: ""),
+      allowed: [.webSearch], conversationID: "conv", accountID: "acct",
+      calendar: seoul)
+
+    let step = try XCTUnwrap(decision.plan.steps.first)
+    XCTAssertEqual(step.arguments["query"]?.textValue, "PCC 소식")
+    XCTAssertNotNil(step.arguments["after"]?.dateValue, "모델이 말한 시작점이 버려졌다")
+    XCTAssertNil(step.arguments["before"], "모델이 창의 위 끝을 정했다")
+  }
+
+  // MARK: 6) 요약의 초점
 
   /// **줄일 원문은 앞 단계에서 오고, 모델이 쓰는 글은 초점이다.**
   ///
@@ -315,8 +395,36 @@ private struct StubEngine: WebSearchEngine {
   let name: String
   let outcome: Result<[WebSearchResult], any Error>
 
-  func search(query: String, limit: Int) async throws -> [WebSearchResult] {
+  func search(
+    query: String, limit: Int, window: WebSearchWindow?
+  ) async throws -> [WebSearchResult] {
     try outcome.get()
+  }
+}
+
+/// 요청을 적어 두는 왕복. **무엇을 보냈는가**가 관찰 지점이다.
+private final class CapturingTransport: @unchecked Sendable {
+  private let lock = NSLock()
+  private let html: String
+  private var sent: Data?
+
+  init(html: String) {
+    self.html = html
+  }
+
+  var body: String? {
+    lock.lock()
+    defer { lock.unlock() }
+    return sent.flatMap { String(data: $0, encoding: .utf8) }
+  }
+
+  var transport: WebSearchTransport {
+    { [self] request in
+      lock.lock()
+      sent = request.httpBody
+      lock.unlock()
+      return Data(html.utf8)
+    }
   }
 }
 

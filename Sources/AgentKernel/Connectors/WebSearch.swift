@@ -18,6 +18,42 @@ public struct WebSearchResult: Sendable, Hashable {
   }
 }
 
+/// 검색의 **시간 창.**
+///
+/// `"최신"`을 물으면 기준은 **오늘**이다. 그 오늘은 기기의 벽시계에서 오고
+/// (`ActionRequest.requestedAt`) 모델이 정하지 않는다 — 모델이 아는 날짜는 자기
+/// 학습 시점이지 사용자의 오늘이 아니다(§45).
+///
+/// 시간대를 값으로 드는 이유: 하루의 경계가 시간대에 따라 다르다. UTC로 접으면
+/// KST 오전 한 시의 "오늘"이 어제가 되고, 오늘 나온 글이 창 밖으로 밀린다.
+public struct WebSearchWindow: Sendable, Equatable {
+  /// 이 시각 이후. 없으면 아래 끝이 열려 있다.
+  public let after: Date?
+  /// 이 시각까지. **부르는 쪽이 오늘을 넣는다.**
+  public let before: Date
+  public let timeZone: TimeZone
+
+  public init(after: Date?, before: Date, timeZone: TimeZone) {
+    self.after = after
+    self.before = before
+    self.timeZone = timeZone
+  }
+
+  /// 공급자가 읽는 날짜 구간(`2026-09-10..2026-09-17`).
+  ///
+  /// 아래 끝이 없으면 위 끝만 적는다 — 그 형태도 `df`가 받는다.
+  public var dayRange: String {
+    var formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = timeZone
+    formatter.dateFormat = "yyyy-MM-dd"
+    let upper = formatter.string(from: before)
+    guard let after else { return ".." + upper }
+    return formatter.string(from: after) + ".." + upper
+  }
+}
+
 /// 웹에서 찾는 **한 가지 방법**.
 ///
 /// 공급자 이름이 능력에 들어가지 않는다 — `web.search`는 "웹에서 찾는다"의
@@ -29,7 +65,10 @@ public struct WebSearchResult: Sendable, Hashable {
 public protocol WebSearchEngine: Sendable {
   /// 로그와 계측에 남을 이름. **질의는 담지 않는다** — 사용자 글이다.
   var name: String { get }
-  func search(query: String, limit: Int) async throws -> [WebSearchResult]
+  /// - Parameter window: 시간 창. nil이면 공급자의 기본 정렬을 쓴다.
+  func search(
+    query: String, limit: Int, window: WebSearchWindow?
+  ) async throws -> [WebSearchResult]
 }
 
 /// 찾지 못했다. **사유를 나눠 든다** — 없는 것과 막힌 것은 다른 사실이다.
@@ -71,12 +110,14 @@ public struct WebSearchBroker: Sendable {
   /// 한 곳이라도 답했다면 결과 0건은 관찰된 사실이고, 그 사실은 화면이 말해야
   /// 한다. 아무도 답하지 못했으면 그것은 실패다 — 그때 0건을 돌려주면 앱이
   /// "찾지 못했어요"라고 **거짓을** 말한다.
-  public func search(query: String, limit: Int) async throws -> [WebSearchResult] {
+  public func search(
+    query: String, limit: Int, window: WebSearchWindow? = nil
+  ) async throws -> [WebSearchResult] {
     var answered = false
     var failure: any Error = WebSearchError.noEngineAnswered
     for engine in engines {
       do {
-        let results = try await engine.search(query: query, limit: limit)
+        let results = try await engine.search(query: query, limit: limit, window: window)
         answered = true
         guard results.isEmpty else {
           Self.log.info(

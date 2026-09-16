@@ -33,7 +33,11 @@ public struct WebSearchTool: CapabilityHandler {
     let limit = Self.limit(request.arguments["limit"]?.numberValue)
     let results = try await search(
       Self.scoped(query: query, site: request.arguments["site"]?.textValue),
-      limit: limit)
+      limit: limit,
+      window: Self.window(
+        after: request.arguments["after"]?.dateValue,
+        before: request.arguments["before"]?.dateValue,
+        now: request.requestedAt))
 
     let rows = results.map { result in
       CapabilitySourceRow(
@@ -62,13 +66,31 @@ public struct WebSearchTool: CapabilityHandler {
   /// 엔진이 답하고 0건이면 그것은 관찰된 사실이므로 빈 줄의 수령증이 된다. 아무도
   /// 답하지 못했으면 실패다 — 그때 0건을 돌려주면 화면이 "찾지 못했어요"라고
   /// 거짓을 말하고, 사용자는 다시 물어볼 이유를 알 수 없다.
-  private func search(_ query: String, limit: Int) async throws -> [WebSearchResult] {
+  private func search(
+    _ query: String, limit: Int, window: WebSearchWindow?
+  ) async throws -> [WebSearchResult] {
     do {
-      return try await broker.search(query: query, limit: limit)
+      return try await broker.search(query: query, limit: limit, window: window)
     } catch {
       // 사유 코드에 **질의를 담지 않는다** — 원장과 계측에 남는 값이다(§35).
       throw ActionError.failed(reason: "web.search.unavailable")
     }
+  }
+
+  /// 시간 창. **위 끝은 오늘이다.**
+  ///
+  /// `"최신"`을 물었을 때 기준이 되는 오늘은 이 차례가 제출된 시각에서 온다
+  /// (`ActionRequest.requestedAt`) — 모델이 아는 날짜는 자기 학습 시점이고, 그
+  /// 값으로 창을 세우면 몇 달 전이 "최신"이 된다(§45).
+  ///
+  /// 아래 끝이 없으면 창을 세우지 않는다. 위 끝만 오늘로 박아 둔 창은 "오늘까지의
+  /// 전부"이고, 그것은 필터가 아니라 기본 정렬과 같다 — 보낼 이유가 없다.
+  private static func window(
+    after: Date?, before: Date?, now: Date
+  ) -> WebSearchWindow? {
+    guard after != nil || before != nil else { return nil }
+    return WebSearchWindow(
+      after: after, before: min(before ?? now, now), timeZone: .current)
   }
 
   /// `site`는 질의 연산자로 옮긴다. 공급자별 인자로 넘기지 않는 이유는 능력의

@@ -42,6 +42,13 @@ public enum WebSearchHTTP {
     return request
   }
 
+  /// 두 엔진이 같은 폼 자리를 쓴다(`q`, `df`). 창이 없으면 `df`를 **보내지 않는다** —
+  /// 빈 값을 보내면 공급자가 그것을 필터로 읽는다.
+  static func fields(query: String, window: WebSearchWindow?) -> [(String, String)] {
+    guard let window else { return [("q", query)] }
+    return [("q", query), ("df", window.dayRange)]
+  }
+
   /// 예약되지 않은 글자만 남기고 전부 인코딩한다.
   ///
   /// `URLComponents`를 쓰지 않는 이유는 `+`다. 그 글자를 그대로 두면 서버가 공백으로
@@ -72,9 +79,13 @@ public struct DuckDuckGoHTMLSearch: WebSearchEngine {
     self.transport = transport
   }
 
-  public func search(query: String, limit: Int) async throws -> [WebSearchResult] {
+  public func search(
+    query: String, limit: Int, window: WebSearchWindow? = nil
+  ) async throws -> [WebSearchResult] {
     let data = try await transport(
-      try WebSearchHTTP.form("https://html.duckduckgo.com/html/", fields: [("q", query)]))
+      try WebSearchHTTP.form(
+        "https://html.duckduckgo.com/html/",
+        fields: WebSearchHTTP.fields(query: query, window: window)))
     guard let html = String(data: data, encoding: .utf8) else {
       throw WebSearchError.malformedResponse
     }
@@ -95,9 +106,13 @@ public struct DuckDuckGoLiteSearch: WebSearchEngine {
     self.transport = transport
   }
 
-  public func search(query: String, limit: Int) async throws -> [WebSearchResult] {
+  public func search(
+    query: String, limit: Int, window: WebSearchWindow? = nil
+  ) async throws -> [WebSearchResult] {
     let data = try await transport(
-      try WebSearchHTTP.form("https://lite.duckduckgo.com/lite/", fields: [("q", query)]))
+      try WebSearchHTTP.form(
+        "https://lite.duckduckgo.com/lite/",
+        fields: WebSearchHTTP.fields(query: query, window: window)))
     guard let html = String(data: data, encoding: .utf8) else {
       throw WebSearchError.malformedResponse
     }

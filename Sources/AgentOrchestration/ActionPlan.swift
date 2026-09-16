@@ -362,6 +362,9 @@ public enum ActionPlanValidator {
       if !text.isEmpty { arguments["focus"] = .text(text) }
     case .webSearch:
       if !text.isEmpty { arguments["query"] = .text(text) }
+      // **모델이 말한 시각은 창의 아래 끝이다.** 위 끝은 오늘이고 그 값은 기기가
+      // 박는다 — `"지난주부터 PCC 소식"`에서 모델이 줄 수 있는 것은 시작점뿐이다.
+      if let when { arguments["after"] = .timestamp(when) }
     default:
       if !text.isEmpty { arguments["query"] = .text(text) }
     }

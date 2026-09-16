@@ -252,9 +252,12 @@ extension CapabilityContract {
       optional: providerChoice),
 
     // MARK: 웹
+    // 날짜 자리는 메일 검색과 **같은 낱말**을 쓴다. `"최신"`을 물은 차례가 이 자리로
+    // 좁혀지고, 그 창의 위 끝은 툴이 기기 시계에서 박는다(`WebSearchTool.window`).
     CapabilityContract(
       .webSearch, required: [Argument("query")],
-      optional: searchPaging + [Argument("site")]),
+      optional: searchPaging + [Argument("site")]
+        + [Argument("after", .timestamp), Argument("before", .timestamp)]),
     // 주소는 **사용자나 앞 단계의 검색 결과**에서만 온다. 모델이 주소를 지어낼
     // 자리를 만들지 않는다 — 지어낸 주소는 존재하지 않는 페이지이거나, 더 나쁘게는
     // 남의 사설망 주소다(`ContentFetchHostPolicy`).
