@@ -83,14 +83,14 @@ public struct WebSearchTool: CapabilityHandler {
   /// (`ActionRequest.requestedAt`) — 모델이 아는 날짜는 자기 학습 시점이고, 그
   /// 값으로 창을 세우면 몇 달 전이 "최신"이 된다(§45).
   ///
-  /// 오늘을 창에 따로 싣는다(`asOf`). 공급자에게 보낼 굵은 값은 창의 위 끝이
-  /// 아니라 **오늘에서** 세기 때문이다(`WebSearchHTTP.recency`).
+  /// 아래 끝이 없으면 공급자가 창을 무시하지만(`WebSearchWindow.dayRange`) 창
+  /// 자체는 세운다 — 세운 창을 무엇에 쓸지는 부르는 쪽의 몫이다.
   private static func window(
     after: Date?, before: Date?, now: Date
   ) -> WebSearchWindow? {
     guard after != nil || before != nil else { return nil }
     return WebSearchWindow(
-      after: after, before: min(before ?? now, now), asOf: now, timeZone: .current)
+      after: after, before: min(before ?? now, now), timeZone: .current)
   }
 
   /// `site`는 질의 연산자로 옮긴다. 공급자별 인자로 넘기지 않는 이유는 능력의

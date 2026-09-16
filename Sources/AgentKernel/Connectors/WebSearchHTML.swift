@@ -53,33 +53,12 @@ public enum WebSearchHTTP {
     return request
   }
 
-  /// 두 엔진이 같은 폼 자리를 쓴다(`q`, `df`). 창이 없거나 굵은 값으로 덮이지
-  /// 않으면 `df`를 **보내지 않는다** — 빈 값을 보내면 공급자가 그것을 필터로 읽는다.
+  /// 두 엔진이 같은 폼 자리를 쓴다(`q`, `df`). 창이 없거나 한쪽이 열려 있으면
+  /// `df`를 **보내지 않는다** — 그 값은 공급자가 조용히 무시하고, 무시될 값을 보내면
+  /// 걸렀다고 믿은 채 안 걸린 목록을 받는다(`WebSearchWindow.dayRange`).
   static func fields(query: String, window: WebSearchWindow?) -> [(String, String)] {
-    guard let recency = recency(window) else { return [("q", query)] }
-    return [("q", query), ("df", recency)]
-  }
-
-  /// 창을 **공급자가 읽는 굵은 값으로.**
-  ///
-  /// 이 창구의 `df`가 받는 값은 넷뿐이다: `d`·`w`·`m`·`y`(지난 하루·주·달·해).
-  /// `2026-09-10..2026-09-17` 같은 절대 구간은 이 문에서 필터로 성립하지 않는다.
-  ///
-  /// 그래서 **창을 덮는 가장 작은 값**을 고른다 — 덮어야 하는 이유는 좁게 고르면
-  /// 창 안의 글이 응답에서 빠지고, 그 손실은 기기에서 되돌릴 수 없기 때문이다.
-  /// 남는 넓이는 기기가 자른다(`WebSearchBroker.inWindow`).
-  ///
-  /// 아래 끝이 열린 창은 굵은 값이 없다. 해를 넘는 창도 없다 — 그 창에 `y`를
-  /// 보내면 창 안의 오래된 글을 공급자가 지운다.
-  static func recency(_ window: WebSearchWindow?) -> String? {
-    guard let days = window?.daysSinceStart, days >= 0 else { return nil }
-    switch days {
-    case 0...1: return "d"
-    case 2...7: return "w"
-    case 8...31: return "m"
-    case 32...366: return "y"
-    default: return nil
-    }
+    guard let range = window?.dayRange else { return [("q", query)] }
+    return [("q", query), ("df", range)]
   }
 
   /// 예약되지 않은 글자만 남기고 전부 인코딩한다.
@@ -124,8 +103,7 @@ public struct DuckDuckGoHTMLSearch: WebSearchEngine {
     }
     guard !WebSearchHTTP.isChallenge(html) else { throw WebSearchError.challenged }
     return SERPScraper.results(
-      in: html, linkClass: "result__a", snippetClass: "result__snippet", limit: limit,
-      timeZone: window?.timeZone ?? .current)
+      in: html, linkClass: "result__a", snippetClass: "result__snippet", limit: limit)
   }
 }
 
@@ -153,8 +131,7 @@ public struct DuckDuckGoLiteSearch: WebSearchEngine {
     }
     guard !WebSearchHTTP.isChallenge(html) else { throw WebSearchError.challenged }
     return SERPScraper.results(
-      in: html, linkClass: "result-link", snippetClass: "result-snippet", limit: limit,
-      timeZone: window?.timeZone ?? .current)
+      in: html, linkClass: "result-link", snippetClass: "result-snippet", limit: limit)
   }
 }
 
@@ -177,8 +154,7 @@ enum SERPScraper {
   }
 
   static func results(
-    in html: String, linkClass: String, snippetClass: String, limit: Int,
-    timeZone: TimeZone = .current
+    in html: String, linkClass: String, snippetClass: String, limit: Int
   ) -> [WebSearchResult] {
     var staged: [(title: String, url: String, snippet: String)] = []
     var capture: Capture?
@@ -229,9 +205,7 @@ enum SERPScraper {
     }
 
     return staged.map {
-      WebSearchResult(
-        title: $0.title, url: $0.url, snippet: $0.snippet,
-        published: publicationDate(in: $0.snippet, timeZone: timeZone))
+      WebSearchResult(title: $0.title, url: $0.url, snippet: $0.snippet)
     }
   }
 
@@ -257,30 +231,6 @@ enum SERPScraper {
       host != "duckduckgo.com", !host.hasSuffix(".duckduckgo.com")
     else { return nil }
     return url.absoluteString
-  }
-
-  /// 스니펫 앞머리의 **발행 날짜.**
-  ///
-  /// 이 창구는 날짜 구간을 필터로 받지 않으므로(`WebSearchHTTP.recency`) 창의
-  /// 정확한 경계는 결과에 적힌 이 날짜로만 세울 수 있다. 자리는 스니펫 맨 앞이고
-  /// 뒤에 가운뎃점이 온다 — `"Sep 17, 2026 · 본문…"`.
-  ///
-  /// **앞머리만 본다.** 본문 어디서든 날짜를 찾으면 인용된 연도가 발행일이 되고,
-  /// 그 값으로 거른 결과는 조용히 틀린다. 읽지 못하면 `nil`이고, `nil`은 "모른다"다.
-  private static func publicationDate(in snippet: String, timeZone: TimeZone) -> Date? {
-    let head = snippet.split(separator: "·", maxSplits: 1).first.map(String.init) ?? snippet
-    let candidate = head.trimmingCharacters(in: .whitespacesAndNewlines)
-    // 날짜 하나가 차지하는 길이. 이 위는 날짜가 아니라 문장이다.
-    guard !candidate.isEmpty, candidate.count <= 18 else { return nil }
-    let formatter = DateFormatter()
-    formatter.calendar = Calendar(identifier: .gregorian)
-    formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.timeZone = timeZone
-    for format in ["MMM d, yyyy", "MMMM d, yyyy", "d MMM yyyy", "yyyy-MM-dd"] {
-      formatter.dateFormat = format
-      if let date = formatter.date(from: candidate) { return date }
-    }
-    return nil
   }
 
   /// 공백을 접는다. 표 레이아웃의 스니펫은 줄바꿈과 들여쓰기를 그대로 들고 온다.

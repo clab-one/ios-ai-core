@@ -10,16 +10,11 @@ public struct WebSearchResult: Sendable, Hashable {
   public let title: String
   public let url: String
   public let snippet: String
-  /// 결과 목록이 적어 준 발행 날짜. **없으면 "모른다"다** — 창 밖이라는 뜻이
-  /// 아니다. 공급자가 적어 주지 않는 결과가 흔하므로 이 값으로 거르는 일은
-  /// 값이 있는 줄에만 일어난다(`WebSearchBroker.inWindow`).
-  public let published: Date?
 
-  public init(title: String, url: String, snippet: String, published: Date? = nil) {
+  public init(title: String, url: String, snippet: String) {
     self.title = title
     self.url = url
     self.snippet = snippet
-    self.published = published
   }
 }
 
@@ -31,53 +26,36 @@ public struct WebSearchResult: Sendable, Hashable {
 ///
 /// 시간대를 값으로 드는 이유: 하루의 경계가 시간대에 따라 다르다. UTC로 접으면
 /// KST 오전 한 시의 "오늘"이 어제가 되고, 오늘 나온 글이 창 밖으로 밀린다.
-///
-/// **공급자는 이 창을 그대로 받지 못한다.** 열쇠 없는 검색 창구가 받는 최신성은
-/// "지난 하루·주·달·해" 같은 굵은 값뿐이다. 그래서 창은 두 번 쓰인다: 공급자에게는
-/// 창을 덮는 가장 작은 굵은 값을 보내고(`WebSearchHTTP.recency`), 정확한 경계는
-/// 기기에서 자른다(`WebSearchBroker.inWindow`).
 public struct WebSearchWindow: Sendable, Equatable {
   /// 이 시각 이후. 없으면 아래 끝이 열려 있다.
   public let after: Date?
   /// 이 시각까지. **부르는 쪽이 오늘을 넣는다.**
   public let before: Date
-  /// 이 차례의 오늘.
-  ///
-  /// `before`와 따로 드는 이유는 굵은 필터가 **오늘에 매달려 있기** 때문이다 —
-  /// `"지난 주"`는 창의 위 끝에서 세는 값이 아니라 지금에서 세는 값이다. 지난달
-  /// 어느 한 주를 묻는 창에 `"지난 주"`를 보내면 공급자가 창 밖만 돌려준다.
-  public let asOf: Date
   public let timeZone: TimeZone
 
-  public init(after: Date?, before: Date, asOf: Date, timeZone: TimeZone) {
+  public init(after: Date?, before: Date, timeZone: TimeZone) {
     self.after = after
     self.before = before
-    self.asOf = asOf
     self.timeZone = timeZone
   }
 
-  private var calendar: Calendar {
-    var calendar = Calendar(identifier: .gregorian)
-    calendar.timeZone = timeZone
-    return calendar
-  }
-
-  /// 창의 아래 끝이 **며칠 전인가.** 아래 끝이 열려 있으면 없다.
-  public var daysSinceStart: Int? {
+  /// 공급자가 읽는 날짜 구간(`2026-09-10..2026-09-17`).
+  ///
+  /// **양 끝이 다 있어야 필터가 성립한다.** 실측 2026-09-17: `html.duckduckgo.com`과
+  /// `lite.duckduckgo.com`은 닫힌 구간을 정확히 적용하고(`2024-06-01..2024-06-30`은
+  /// 그 달의 문서만 돌려준다) 한쪽이 열린 `..2024-06-30`·`2024-06-01..`은 **조용히
+  /// 무시한다** — 무필터와 같은 목록이 온다.
+  ///
+  /// 그래서 아래 끝이 없으면 값이 없다. 무시될 값을 보내면 걸렀다고 믿은 채 안
+  /// 걸린 목록을 받는다.
+  public var dayRange: String? {
     guard let after else { return nil }
-    return calendar.dateComponents(
-      [.day], from: calendar.startOfDay(for: after),
-      to: calendar.startOfDay(for: asOf)
-    ).day
-  }
-
-  /// 이 날짜가 창 안에 드는가. **하루 단위로 본다** — 결과 목록이 적어 주는 것은
-  /// 날짜이고, 그 날짜에 시각은 없다.
-  public func contains(_ date: Date) -> Bool {
-    let calendar = self.calendar
-    let day = calendar.startOfDay(for: date)
-    if let after, day < calendar.startOfDay(for: after) { return false }
-    return day <= calendar.startOfDay(for: before)
+    var formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = timeZone
+    formatter.dateFormat = "yyyy-MM-dd"
+    return formatter.string(from: after) + ".." + formatter.string(from: before)
   }
 }
 
@@ -144,9 +122,8 @@ public struct WebSearchBroker: Sendable {
     var failure: any Error = WebSearchError.noEngineAnswered
     for engine in engines {
       do {
-        let results = Self.inWindow(
-          try await engine.search(query: query, limit: limit, window: window),
-          window)
+        let results = try await engine.search(
+          query: query, limit: limit, window: window)
         answered = true
         guard results.isEmpty else {
           Self.log.info(
@@ -164,23 +141,5 @@ public struct WebSearchBroker: Sendable {
     }
     guard answered else { throw failure }
     return []
-  }
-
-  /// 공급자의 굵은 필터가 남긴 것을 **정확한 경계로** 자른다.
-  ///
-  /// 창이 열흘이어도 공급자에게 보낼 수 있는 값은 `"지난 달"`이다. 그 응답에는 창
-  /// 밖의 글이 섞여 있고, 그것을 그대로 넘기면 `"최신"`을 물은 차례가 석 주 전
-  /// 글을 첫 줄로 받는다 — 그리고 첫 줄이 열린다.
-  ///
-  /// **날짜를 모르는 줄은 남긴다.** 모르는 것과 창 밖인 것은 다른 사실이고, 모른다는
-  /// 이유로 버리면 날짜를 적지 않는 공급자에서 결과가 통째로 사라진다.
-  private static func inWindow(
-    _ results: [WebSearchResult], _ window: WebSearchWindow?
-  ) -> [WebSearchResult] {
-    guard let window else { return results }
-    return results.filter { result in
-      guard let published = result.published else { return true }
-      return window.contains(published)
-    }
   }
 }
