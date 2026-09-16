@@ -1,5 +1,5 @@
+import AgentKernel
 import Foundation
-import OSLog
 
 
 /// 성공한 새 실행이 없는 동안만 적용하는 정체 감지 창.
@@ -90,8 +90,7 @@ public struct TurnTelemetry: Sendable, Equatable {
 
   public init() {}
 
-  private static let log = Logger(
-    subsystem: "dev.hyunminkim.justsend", category: "orchestrator")
+  private static let log = AgentHost.logger("orchestrator")
 
   public func emit() {
     Self.log.info(

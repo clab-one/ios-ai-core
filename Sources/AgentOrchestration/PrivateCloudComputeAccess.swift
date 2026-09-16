@@ -1,6 +1,6 @@
+import AgentKernel
 import Foundation
 import FoundationModels
-import OSLog
 
 
 /// Private Cloud Compute를 **부를 자격이 있는가.**
@@ -19,21 +19,20 @@ import OSLog
 /// 이 신호로 죽었고, 개별 검사는 전부 통과한 채 런이 `TEST FAILED`로 끝났다.
 /// `do/catch`로 감쌀 수 없는 실패이므로 **부르기 전에** 막아야 한다.
 public enum PrivateCloudComputeAccess {
-  private static let log = Logger(
-    subsystem: "dev.hyunminkim.justsend", category: "orchestrator")
+  private static let log = AgentHost.logger("orchestrator")
 
   public static let entitlementKey = "com.apple.developer.private-cloud-compute"
 
-  /// 이 앱의 서명에 PCC 권한이 있는가.
+  /// 이 앱의 서명에 PCC 권한이 있는가. **코어가 알 수 없으므로 호스트가 말한다**
+  /// (`AgentHostIdentity.isPrivateCloudComputeEntitled`).
   ///
-  /// **값이 여기 하나뿐인 이유**: iOS에는 자기 엔타이틀먼트를 읽는 공개 API가 없다
+  /// 값이 한 자리뿐인 이유: iOS에는 자기 엔타이틀먼트를 읽는 공개 API가 없다
   /// (`SecTaskCopyValueForEntitlement`는 macOS 전용이고 iOS SDK에 없다). 그래서
-  /// 이 상수와 `JustSend.entitlements`가 갈리면 앱이 죽는다 —
-  /// `PrivateCloudComputeEntitlementTests`가 두 자리를 대조해 그 드리프트를 막는다.
+  /// 호스트가 넘긴 값과 서명이 갈리면 앱이 죽는다 — 호스트는 그 두 자리를
+  /// 대조하는 시험을 들고 있어야 한다(JustSend: `PrivateCloudComputeEntitlementTests`).
   ///
-  /// 참인 근거: App ID `dev.hyunminkim.justsend.app`의 "Access to models on
-  /// Private Cloud Compute"가 활성인 것을 개발자 계정에서 확인했다(2026-09-14).
-  public static let isEntitled = true
+  /// 설정하지 않은 호스트는 **거짓**이다. PCC를 부르지 않는 쪽이 죽지 않는 쪽이다.
+  public static var isEntitled: Bool { AgentHost.identity.isPrivateCloudComputeEntitled }
 
   /// 지금 이 차례에 PCC를 쓸 수 있는가. **권한이 먼저, 가용성이 다음이다.**
   @available(iOS 27.0, *)

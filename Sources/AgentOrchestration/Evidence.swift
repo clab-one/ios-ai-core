@@ -49,8 +49,9 @@ public struct Evidence: Sendable, Equatable, Identifiable {
       case .calendar: "calendar:event"
       case .reminders: "reminders:item"
       case .people: "contacts:person"
-      case .action: "justsend:receipt"
-      default: "justsend:item"
+      // 코어가 만든 사실의 출처는 **호스트 이름**으로 가리킨다.
+      case .action: "\(AgentHost.identity.citationScheme):receipt"
+      default: "\(AgentHost.identity.citationScheme):item"
       }
     }
   }

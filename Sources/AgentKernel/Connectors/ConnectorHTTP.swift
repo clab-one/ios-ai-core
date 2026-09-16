@@ -7,8 +7,7 @@ import OSLog
 /// error normalization). 가져오지 않은 것은 그 프로젝트의 파이썬 에이전트 루프와
 /// 모델 공급자 UI다 — 그 둘은 우리 구조(코드가 orchestration을 소유한다)와 반대다.
 public struct ConnectorHTTP: Sendable {
-  private static let log = Logger(
-    subsystem: "dev.hyunminkim.justsend", category: "connector-http")
+  private static let log = AgentHost.logger("connector-http")
 
   private let session: URLSession
   /// 읽기 요청의 재시도 횟수. **쓰기는 재시도하지 않는다**(`send`).

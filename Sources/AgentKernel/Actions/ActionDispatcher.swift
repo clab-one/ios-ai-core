@@ -42,8 +42,7 @@ public struct ApprovalPolicy: Sendable {
 /// PCC도, 로컬 라우터도 저장소·EventKit·Gmail을 직접 만지지 않는다. 여기를
 /// 지나가게 하면 멱등성·승인·계정 경계를 한 자리에서만 지키면 된다.
 public actor ActionDispatcher {
-  private static let log = Logger(
-    subsystem: "dev.hyunminkim.justsend", category: "action-dispatcher")
+  private static let log = AgentHost.logger("action-dispatcher")
 
   private var handlers: [CapabilityID: any CapabilityHandler] = [:]
   private var connectorReadinessProvider: (any ConnectorReadinessProviding)?

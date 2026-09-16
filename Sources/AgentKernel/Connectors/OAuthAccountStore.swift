@@ -51,7 +51,9 @@ public struct KeychainOAuthTokenVault: OAuthTokenVault {
 
   private let service: String
 
-  public init(service: String = "dev.hyunminkim.justsend.connector") {
+  /// 기본값은 호스트 신원에서 온다. **이미 출하된 앱은 처음 쓰던 이름을 넘겨야
+  /// 한다** — 이름이 바뀌면 저장된 토큰을 찾지 못한다.
+  public init(service: String = AgentHost.identity.keychainService) {
     self.service = service
   }
 
@@ -112,8 +114,7 @@ public enum OAuthAccountStoreError: Error, Equatable, Sendable {
 /// Gmail 토큰이 보이면 그것은 유출이다 — 열쇠에 범위를 넣으면 조회 자체가
 /// 다른 계정의 토큰에 닿지 못한다.
 public actor OAuthAccountStore {
-  private static let log = Logger(
-    subsystem: "dev.hyunminkim.justsend", category: "connector-auth")
+  private static let log = AgentHost.logger("connector-auth")
 
   /// 계정 이름표는 Keychain이 아니라 앱 기본값에 둔다 — 비밀이 아니고, 화면이
   /// 목록을 그릴 때 Keychain을 두드리지 않아야 한다.
@@ -133,7 +134,7 @@ public actor OAuthAccountStore {
   }
 
   private func directoryKey() -> String {
-    "justsend.connectors.\(accountScope())"
+    "\(AgentHost.identity.defaultsNamespace).connectors.\(accountScope())"
   }
 
   public func currentAccountScope() -> String { accountScope() }

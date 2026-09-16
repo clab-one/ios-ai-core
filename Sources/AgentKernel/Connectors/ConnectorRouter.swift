@@ -29,7 +29,7 @@ public struct OAuthClientConfiguration: Sendable {
     else { return nil }
     let redirect =
       bundle.object(forInfoDictionaryKey: "JSGoogleOAuthRedirectURI") as? String
-      ?? "dev.hyunminkim.justsend:/oauth2redirect/google"
+      ?? "\(AgentHost.identity.oauthRedirectScheme):/oauth2redirect/google"
     return OAuthClientConfiguration(
       clientID: clientID,
       redirectURI: redirect,
@@ -48,7 +48,7 @@ public struct OAuthClientConfiguration: Sendable {
     else { return nil }
     let redirect =
       bundle.object(forInfoDictionaryKey: "JSSlackOAuthRedirectURI") as? String
-      ?? "dev.hyunminkim.justsend:/oauth2redirect/slack"
+      ?? "\(AgentHost.identity.oauthRedirectScheme):/oauth2redirect/slack"
     return OAuthClientConfiguration(
       clientID: clientID,
       redirectURI: redirect,
@@ -167,8 +167,7 @@ public struct OAuthRefresher: Sendable {
 public struct ConnectorRouter: CapabilityHandler, ConnectorReadinessProviding,
   TargetRevisionVerifying
 {
-  private static let log = Logger(
-    subsystem: "dev.hyunminkim.justsend", category: "connector-router")
+  private static let log = AgentHost.logger("connector-router")
 
   private let adapters: [any ConnectorAdapter]
   private let store: OAuthAccountStore

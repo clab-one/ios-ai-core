@@ -1,5 +1,5 @@
+import AgentKernel
 import Foundation
-import OSLog
 
 
 /// 모델 호출 한 번의 **영수증**.
@@ -105,8 +105,7 @@ public struct ModelUsageLog: Sendable, Equatable {
     return .entirelyOnDevice
   }
 
-  private static let log = Logger(
-    subsystem: "dev.hyunminkim.justsend", category: "orchestrator")
+  private static let log = AgentHost.logger("orchestrator")
 
   /// 이 차례가 **목적별로** 부른 횟수와 기다린 시간.
   ///
