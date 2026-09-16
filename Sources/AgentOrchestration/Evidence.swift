@@ -77,6 +77,12 @@ public struct Evidence: Sendable, Equatable, Identifiable {
   public static let factLimit = 240
   /// 한 조각이 들 사실의 개수 상한.
   public static let factsPerEvidence = 3
+  /// 한 조각이 문맥에서 차지하는 글자 상한. 사실 줄 외에 제목·시각·요약·식별자가
+  /// 서므로 사실 개수보다 둘 큰 폭을 잡는다.
+  ///
+  /// **이 값이 예산의 입력이다**(`PCCContextBudget`). 이름이 하나여야 상한을
+  /// 줄일 때 예산이 함께 줄고, 시험이 그 사실을 붙잡는다.
+  public static var contextCharacterLimit: Int { factLimit * (factsPerEvidence + 2) }
 
   public init(
     source: Source,
@@ -119,7 +125,7 @@ public struct Evidence: Sendable, Equatable, Identifiable {
     if let summary { lines.append("summary: \(summary)") }
     for fact in facts { lines.append("- \(fact)") }
     return UntrustedText(origin: source.contextOrigin, lines.joined(separator: "\n"))
-      .forModelContext(limit: Self.factLimit * (Self.factsPerEvidence + 2))
+      .forModelContext(limit: Self.contextCharacterLimit)
   }
 
   /// 사람이 읽을 한 줄. 합성이 없는 차례에서 화면이 세우는 근거다.

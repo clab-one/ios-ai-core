@@ -40,6 +40,18 @@ public struct ConversationContextCompiler: Sendable {
   public static let recentTurnCharacterLimit = 200
   /// 문맥에 싣는 근거 조각 수의 상한. 압축기가 이미 줄였고 이것은 마지막 방벽이다.
   public static let evidenceLimit = 8
+  /// 덜 읽은 곳을 말하는 한 줄의 상한.
+  public static let coverageCharacterLimit = 300
+  /// 끝난 일 구획의 상한. 넘으면 **오래된 줄부터** 버린다 — 방금 일어난 실패가
+  /// 남아야 답이 그 사실을 말한다(§2.6·§10.1).
+  public static let completedCharacterLimit = 600
+
+  /// 이 조립이 지킬 예산. 넘으면 던진다 — **자르지 않는다.**
+  public let budget: PCCContextBudget
+
+  public init(budget: PCCContextBudget = .standard) {
+    self.budget = budget
+  }
 
   /// 모델에게 보내는 시각 한 줄. **오프셋과 지역을 함께 적는다.**
   ///
@@ -52,19 +64,37 @@ public struct ConversationContextCompiler: Sendable {
     return "\(stamp) (\(timeZone.identifier))"
   }
 
+  /// - Throws: `ContextCompilationError`. PCC를 부르는 모든 경로가 이 문을 지나므로,
+  ///   이 던짐이 곧 **어떤 경로로도 예산을 넘길 수 없다**는 뜻이다.
   public func compile(
     profile: DynamicTurnProfile,
     userMessage: String,
     recentTurns: [ConversationMessage] = [],
     evidence: [Evidence] = [],
     coverage: [CoverageRecord] = [],
-    /// 이 대화가 **이미 표시한 결과**의 고정점(§4.4). `"그 메일"`·`"1번"`은 여기서
-    /// 풀린다 — 이 구획이 없으면 모델이 식별자를 지어내거나 사용자에게 되묻는다.
-    anchors: [String] = [],
+    /// 이 대화가 **이미 표시한 결과**에서 로컬이 채울 수 있는 자리(§4.4).
+    /// `"그 메일"`·`"1번"`이 여기서 풀린다 — 이 구획이 없으면 모델이 식별자를
+    /// 지어내거나 사용자에게 되묻는다.
+    ///
+    /// **자리만 싣는다. 값은 싣지 않는다.** 실제 식별자·계정·revision은
+    /// `BoundReference`가 기기에 들고 있고 실행 직전에 소비한다
+    /// (`TurnRuntime.resolve`). 모델이 알아야 하는 것은 "이 자리는 로컬이 채울 수
+    /// 있다"뿐이고, 타입이 닫힌 열거이므로 여기에 `"id=\(source.id)"`를 끼워 넣는
+    /// 길이 **없다** — 경계를 주석이 아니라 타입으로 세운다.
+    anchoredSlots: [ResolvableArgument] = [],
     completed: String = "",
     now: Date = Date(),
     calendar: Calendar
-  ) -> CompiledConversationContext {
+  ) throws(ContextCompilationError) -> CompiledConversationContext {
+    // **지시는 자르지 않는다.** 긴 본문이 붙은 제출에서 뒤를 자르면 `"수정하지
+    // 말고 보내줘"`가 사라지고, 사라진 지시는 어디에도 남지 않는다. 긴 내용의
+    // 정상 경로는 정본 캡처 → 기기 읽기 → `Evidence`이고, 이 자리는 그 경로가
+    // 놓친 입력이 PCC로 새는 것을 막는 마지막 방벽이다.
+    guard userMessage.count <= budget.requestCharacters else {
+      throw ContextCompilationError.requestTooLarge(
+        actual: userMessage.count, limit: budget.requestCharacters)
+    }
+
     let capabilities = profile.scope.sorted
     var lines: [String] = []
 
@@ -101,9 +131,10 @@ public struct ConversationContextCompiler: Sendable {
 
     // **무엇이 이미 끝났는가.** 이 구획이 없으면 재계획은 이미 보낸 메일을 또
     // 계획한다(§12). 담는 것은 능력 이름과 결과 코드뿐이다.
-    if !completed.isEmpty {
+    let recentlyCompleted = Self.clipped(completed)
+    if !recentlyCompleted.isEmpty {
       lines.append("<<<completed>>>")
-      lines.append(completed)
+      lines.append(recentlyCompleted)
       lines.append("<<<end>>>")
     }
 
@@ -120,15 +151,20 @@ public struct ConversationContextCompiler: Sendable {
         UntrustedText(
           origin: "\(AgentHost.identity.citationScheme):coverage",
           records.joined(separator: "\n")
-        ).forModelContext(limit: 300))
+        ).forModelContext(limit: Self.coverageCharacterLimit))
     }
 
     // **표시한 결과의 고정점.** `"그 메일"`이 무엇인지는 모델이 기억하는 것이
     // 아니라 우리가 적어 둔 이 목록이 정한다 — 적어 두지 않으면 식별자를
     // 지어내거나(그 식별자는 존재하지 않는다) 사용자에게 다시 묻는다(§4.4).
-    if !anchors.isEmpty {
+    //
+    // **도구가 닫힌 단계에는 서지 않는다.** 고정점은 다음 단계의 인자를 어디서
+    // 채울지에 대한 배선이고, 다음 단계가 없는 단계에는 쓸모가 없다. 근거에서
+    // 식별자를 빼 놓고(`includeIdentifier`) 이 구획으로 다시 넣던 구조가 그
+    // 모순이었다.
+    if !anchoredSlots.isEmpty, profile.toolCalling != .disallowed {
       lines.append("<<<anchors>>>")
-      lines.append(anchors.joined(separator: "\n"))
+      lines.append(anchoredSlots.map(\.rawValue).joined(separator: "\n"))
       lines.append("<<<end>>>")
     }
 
@@ -157,12 +193,36 @@ public struct ConversationContextCompiler: Sendable {
     lines.append(userMessage)
     lines.append("<<<end>>>")
 
-    return CompiledConversationContext(
+    let context = CompiledConversationContext(
       instructions: profile.instructions,
       prompt: lines.joined(separator: "\n"),
       phase: profile.phase,
       capabilities: capabilities,
       carriesEvidence: carriesEvidence,
       calendar: calendar)
+
+    // 구획마다 상한이 있어도 **합에 상한이 없으면** 구획이 하나 늘 때 조용히
+    // 새 구멍이 난다. 예산은 구획 상한의 합이므로(`PCCContextBudget.assembled`)
+    // 예산 없이 더한 구획은 이 자리에서 드러난다.
+    guard context.estimatedCharacters <= budget.totalCharacters else {
+      throw ContextCompilationError.contextTooLarge(
+        actual: context.estimatedCharacters, limit: budget.totalCharacters)
+    }
+    return context
+  }
+
+  /// 끝난 일 구획을 상한 안으로. **새 줄을 남기고 오래된 줄을 버린다** — 방금
+  /// 일어난 실패가 잘려 나가면 답이 그 실패를 말하지 못한다.
+  private static func clipped(_ completed: String) -> String {
+    guard completed.count > completedCharacterLimit else { return completed }
+    var kept: [String] = []
+    var total = 0
+    for line in completed.split(separator: "\n").reversed() {
+      let cost = line.count + (kept.isEmpty ? 0 : 1)
+      guard total + cost <= completedCharacterLimit else { break }
+      total += cost
+      kept.append(String(line))
+    }
+    return kept.reversed().joined(separator: "\n")
   }
 }

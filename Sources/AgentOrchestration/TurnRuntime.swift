@@ -344,6 +344,18 @@ public final class TurnRuntime {
     persistRun(state, status: .running)
     state.telemetry.profile = "supervised"
 
+    // **긴 입력은 PCC 문을 열지 않는다.** 정상 경로는 정본 캡처가 긴 내용을 기록으로
+    // 바꾸고(`attachedItemIDs`) 기기가 읽어 근거로 만드는 것이다(§24). 그 경로가
+    // 놓친 입력을 조용히 자르면 잘린 뒤의 지시가 사라지므로, 아무것도 하기 전에
+    // 멈춘다 — 자르지 않고 거절한다.
+    guard input.count <= PCCContextBudget.standard.requestCharacters else {
+      let refusal = ContextCompilationError.requestTooLarge(
+        actual: input.count, limit: PCCContextBudget.standard.requestCharacters)
+      state.telemetry.fallbackReason = refusal.reason
+      await finish(state, phase: .failed, reason: refusal.reason)
+      return
+    }
+
     // **할 수 있는 일이 하나도 없으면 모델을 부르지 않는다.** 그리고 그때는
     // "하지 못했어요"가 아니라 **연결이 없다**고 말한다 — 이 자리가 그냥 실패로
     // 접히던 동안, 연결이 없는 기기의 모든 요청이 `model.unavailable`로 끝났다
@@ -555,16 +567,24 @@ public final class TurnRuntime {
     // 길이었고, 그때 계측의 `backend` 칸도 갈라졌다.
     let profile = DynamicTurnProfile.supervising(
       phase: phase, target: .privateCloud, scope: scope, iteration: state.iteration)
-    let context = ConversationContextCompiler().compile(
-      profile: profile,
-      userMessage: state.input,
-      recentTurns: state.context.recentMessages,
-      evidence: state.ledger.evidence,
-      coverage: state.ledger.coverage,
-      anchors: anchorLines(state),
-      completed: state.ledger.completedDigest(),
-      now: state.context.referenceTime,
-      calendar: state.context.calendar)
+    let context: CompiledConversationContext
+    do {
+      context = try ConversationContextCompiler().compile(
+        profile: profile,
+        userMessage: state.input,
+        recentTurns: state.context.recentMessages,
+        evidence: state.ledger.evidence,
+        coverage: state.ledger.coverage,
+        anchoredSlots: anchoredSlots(state),
+        completed: state.ledger.completedDigest(),
+        now: state.context.referenceTime,
+        calendar: state.context.calendar)
+    } catch {
+      // **예산을 넘긴 문맥으로는 부르지 않는다.** 자른 문맥으로 부르면 사용자가
+      // 시킨 일과 다른 일이 계획되고, 그 차이는 어디에도 남지 않는다.
+      state.telemetry.fallbackReason = error.reason
+      return .stop(reason: error.reason)
+    }
 
     state.iteration += 1
     state.telemetry.supervisorIterations = state.iteration
@@ -1131,36 +1151,20 @@ public final class TurnRuntime {
     state.telemetry.retrievedRows = compiled.retrievedRows
   }
 
-  /// 이 대화가 **표시한 결과의 고정점**을 모델이 읽을 한 줄씩으로 옮긴다(§4.4).
+  /// 이 대화가 표시한 결과에서 **로컬이 채울 수 있는 자리**를 모델이 읽을 이름으로
+  /// 옮긴다(§4.4).
   ///
-  /// 담는 것은 무엇을 가리키는가뿐이다: 자리 이름, 그것을 만든 능력, 어느 연결의
-  /// 것인가, 아는 revision. **공급자 본문은 담지 않는다** — 본문이 실리는 자리는
-  /// 근거 구획 하나뿐이다.
-  private func anchorLines(_ state: TurnState) -> [String] {
+  /// **값은 옮기지 않는다.** 식별자·계정·thread·revision은 `BoundReference`가 기기에
+  /// 들고 있고 `resolve`가 실행 직전에 소비한다 — 그 값을 받은 모델이 할 수 있는
+  /// 일은 없고, 받은 값을 사실로 읽어 답에 적는 일만 있었다(`Evidence`의 실측
+  /// 주석). 근거에서 식별자를 빼면서 이 구획으로 다시 넣던 것이 그 모순이다.
+  private func anchoredSlots(_ state: TurnState) -> [ResolvableArgument] {
     guard let conversation = state.conversation, let anchor = anchors[conversation]
     else { return [] }
     return anchor.references
       .filter { $0.value.isValid(in: state.context) }
-      .sorted { $0.key.rawValue < $1.key.rawValue }
-      .map { slot, reference in
-        var parts: [String] = []
-        let identifier = reference.source?.id ?? reference.sourceID ?? ""
-        parts.append("\(slot.rawValue)=\(identifier)")
-        parts.append("via=\(reference.capability.rawValue)")
-        if case .connector(let binding) = reference.source?.binding {
-          parts.append("account=\(binding.provider.rawValue)/\(binding.principalID)")
-          if let workspace = binding.workspaceID, !workspace.isEmpty {
-            parts.append("workspace=\(workspace)")
-          }
-        }
-        if let container = reference.source?.containerID, !container.isEmpty {
-          parts.append("thread=\(container)")
-        }
-        if let revision = reference.source?.revision, !revision.isEmpty {
-          parts.append("revision=\(revision)")
-        }
-        return parts.joined(separator: " ")
-      }
+      .map(\.key)
+      .sorted { $0.rawValue < $1.rawValue }
   }
 
   /// 주소를 주고 읽어 달라고 했는데 그 주소를 읽지 않았다면, 읽는다(§24).
@@ -1377,33 +1381,44 @@ public final class TurnRuntime {
     if needsAnswer, !state.evidence.evidence.isEmpty {
       // 답도 PCC가 쓴다. 근거 크기로 모델을 갈아타지 않는다.
       let profile = DynamicTurnProfile.finalizing(target: .privateCloud)
-      let context = ConversationContextCompiler().compile(
-        profile: profile,
-        userMessage: state.input,
-        recentTurns: state.context.recentMessages,
-        evidence: state.evidence.evidence,
-        coverage: state.ledger.coverage,
-        anchors: anchorLines(state),
-        completed: state.ledger.completedDigest(),
-        now: state.context.referenceTime,
-        calendar: state.context.calendar)
-      state.telemetry.estimatedInputCharacters = context.estimatedCharacters
-      let step = await finalizing(context, profile)
-      state.usage.record(step.receipt)
-      state.telemetry.backend = step.receipt.resolvedBackend.rawValue
-      switch step.answer {
-      case .written(let written, let supporting, let relevant, _):
-        headline = written
-        points = Array(supporting.prefix(3))
-        wroteAnswer = true
-        // **판정을 통과한 것만 화면에 선다.** 색인이 고른 후보는 추측이고,
-        // 추측을 결과로 세우면 사용자가 묻지 않은 것이 답의 자리에 온다
-        // (사용자 지적 2026-09-15: 찾지 못한 사람의 자리에 무관한 연락처).
-        state.evidence.references = Self.judged(
-          state.evidence.references, relevant: relevant,
-          evidence: state.evidence.evidence, pointedAt: Self.pointedAt(state))
-      case .unavailable(let reason):
-        state.telemetry.fallbackReason = reason
+      let context: CompiledConversationContext?
+      do {
+        context = try ConversationContextCompiler().compile(
+          profile: profile,
+          userMessage: state.input,
+          recentTurns: state.context.recentMessages,
+          evidence: state.evidence.evidence,
+          coverage: state.ledger.coverage,
+          // **고정점을 주지 않는다.** 도구가 닫혀 다음 단계가 없고, 식별자의 쓸모는
+          // 다음 단계의 인자 하나뿐이다.
+          completed: state.ledger.completedDigest(),
+          now: state.context.referenceTime,
+          calendar: state.context.calendar)
+      } catch {
+        // 효과는 이미 일어났다. 답을 쓰지 못한 사유만 남기고 아래의 호스트 문구로
+        // 닫는다 — 자른 문맥으로 PCC를 부르지 않는다.
+        state.telemetry.fallbackReason = error.reason
+        context = nil
+      }
+      if let context {
+        state.telemetry.estimatedInputCharacters = context.estimatedCharacters
+        let step = await finalizing(context, profile)
+        state.usage.record(step.receipt)
+        state.telemetry.backend = step.receipt.resolvedBackend.rawValue
+        switch step.answer {
+        case .written(let written, let supporting, let relevant, _):
+          headline = written
+          points = Array(supporting.prefix(3))
+          wroteAnswer = true
+          // **판정을 통과한 것만 화면에 선다.** 색인이 고른 후보는 추측이고,
+          // 추측을 결과로 세우면 사용자가 묻지 않은 것이 답의 자리에 온다
+          // (사용자 지적 2026-09-15: 찾지 못한 사람의 자리에 무관한 연락처).
+          state.evidence.references = Self.judged(
+            state.evidence.references, relevant: relevant,
+            evidence: state.evidence.evidence, pointedAt: Self.pointedAt(state))
+        case .unavailable(let reason):
+          state.telemetry.fallbackReason = reason
+        }
       }
     }
 
@@ -1442,10 +1457,18 @@ public final class TurnRuntime {
     var state = initial
     emit(.finalizing, state)
     let profile = DynamicTurnProfile.conversing(target: .privateCloud)
-    let context = ConversationContextCompiler().compile(
-      profile: profile, userMessage: state.input, recentTurns: state.context.recentMessages,
-      now: state.context.referenceTime,
-      calendar: state.context.calendar)
+    let context: CompiledConversationContext
+    do {
+      context = try ConversationContextCompiler().compile(
+        profile: profile, userMessage: state.input,
+        recentTurns: state.context.recentMessages,
+        now: state.context.referenceTime,
+        calendar: state.context.calendar)
+    } catch {
+      state.telemetry.fallbackReason = error.reason
+      await finish(state, phase: .failed, reason: error.reason)
+      return
+    }
     state.telemetry.estimatedInputCharacters = context.estimatedCharacters
     let step = await finalizing(context, profile)
     state.usage.record(step.receipt)

@@ -53,6 +53,11 @@ public struct TurnCopy: Sendable {
     if reason.hasPrefix("notAuthorized") || reason == "noCapability" {
       return resolve(Key.answerNotConnected)
     }
+    // **입력이 너무 길다.** 사용자가 고칠 수 있는 유일한 실패이므로 다른 문장을
+    // 쓴다 — "하지 못했어요"는 무엇을 줄여야 하는지 말해 주지 않는다.
+    if reason == ContextCompilationError.requestTooLargeReason {
+      return resolve(Key.answerRequestTooLarge)
+    }
     return resolve(Key.answerFailed)
   }
 
@@ -74,6 +79,8 @@ public struct TurnCopy: Sendable {
     public static let answerFailed = "conversation.answer.failed"
     /// 이 기기·계정으로는 에이전트를 열 수 없다. **실패가 아니라 환경의 사실**이다.
     public static let answerUnsupported = "conversation.answer.unsupported"
+    /// 지시 하나가 문맥 예산을 넘었다. **사용자가 줄일 수 있는 실패**다.
+    public static let answerRequestTooLarge = "conversation.answer.requestTooLarge"
     public static let progressCancelled = "thread.progress.cancelled"
     public static let progressReconciling = "thread.progress.reconciling"
     public static let progressPartial = "thread.progress.partial"
@@ -106,7 +113,7 @@ public struct TurnCopy: Sendable {
       Set(
         [
           answerFound, answerNone, answerDone, answerNotConnected, answerFailed,
-          answerUnsupported,
+          answerUnsupported, answerRequestTooLarge,
           progressCancelled, progressReconciling, progressPartial, needsOther,
         ] + needs.values)
     }

@@ -1,0 +1,332 @@
+import AgentKernel
+import XCTest
+
+@testable import AgentOrchestration
+
+/// **PCC로 무엇이 나가는가.**
+///
+/// 이 저장소의 정체는 "기기에서 줄이고, 결정에 필요한 최소 정보만 보낸다"이고,
+/// 그 문장은 지금까지 주석과 상수로만 있었다 — 어떤 시험도 문맥의 크기나 내용을
+/// 읽지 않았다. 상한이 강제되지 않으면 구획이 하나 늘 때마다 조용히 구멍이 난다.
+///
+/// 그래서 여기서 증명하는 것은 세 가지다:
+///
+/// 1. 답을 쓰는 단계의 문맥에는 **식별자가 하나도 없다** — 근거의 id도, 고정점도.
+/// 2. 고정점은 **자리 이름만** 나간다. 값(계정·workspace·revision)은 기기에 남는다.
+/// 3. 긴 지시는 **자르지 않고 거절한다.** 그리고 그 차례는 PCC를 부른 적이 없다.
+@available(iOS 26.0, *)
+@MainActor
+final class PCCContextBoundaryTests: XCTestCase {
+  private static let now = Date(timeIntervalSince1970: 1_789_610_400)
+  private static let calendar: Calendar = {
+    var value = Calendar(identifier: .gregorian)
+    value.timeZone = TimeZone(identifier: "Asia/Seoul") ?? .gmt
+    return value
+  }()
+
+  private let compiler = ConversationContextCompiler()
+
+  // **문맥에 서면 안 되는 값들.** 전부 배선이다 — 사용자가 읽을 사실이 아니다.
+  private static let secretMessageID = "secret-message-id-18ca9f"
+  private static let secretPrincipal = "secret-principal-roy@example.com"
+  private static let secretWorkspace = "secret-workspace-T01"
+  private static let secretRevision = "secret-revision-4471"
+  private static let secretThread = "secret-thread-99dd"
+
+  // MARK: 1) 답 단계에는 식별자가 없다
+
+  func testFinalizingContextCarriesNoIdentifierAndNoAnchors() throws {
+    let context = try compiler.compile(
+      profile: .finalizing(target: .privateCloud),
+      userMessage: "그 메일 뭐라고 왔어?",
+      evidence: [Self.mailEvidence],
+      anchoredSlots: ResolvableArgument.allCases,
+      completed: "mail.read=ok",
+      now: Self.now,
+      calendar: Self.calendar)
+
+    XCTAssertTrue(context.carriesEvidence, "근거가 실리지 않으면 이 시험이 아무것도 보지 않는다")
+    XCTAssertTrue(context.prompt.contains("답장 일정은 목요일입니다."), "근거의 사실이 빠졌다")
+    XCTAssertFalse(
+      context.prompt.contains("<<<anchors>>>"),
+      "도구가 닫힌 단계에 고정점이 섰다 — 다음 단계가 없는데 배선을 넘겼다")
+    for secret in Self.secrets {
+      XCTAssertFalse(context.prompt.contains(secret), "답 단계 문맥에 \(secret)이 실렸다")
+    }
+  }
+
+  // MARK: 2) 고정점은 자리 이름만
+
+  func testPlanningContextCarriesAnchorSlotNamesWithoutValues() throws {
+    let context = try compiler.compile(
+      profile: .supervising(
+        phase: .reviewing, target: .privateCloud, scope: Self.scope, iteration: 1),
+      userMessage: "그 메일에 답장해줘",
+      evidence: [Self.mailEvidence],
+      anchoredSlots: [.messageID, .threadID, .to],
+      now: Self.now,
+      calendar: Self.calendar)
+
+    XCTAssertTrue(context.prompt.contains("<<<anchors>>>"), "계획 단계가 채울 자리를 알지 못한다")
+    for slot in ["messageID", "threadID", "to"] {
+      XCTAssertTrue(context.prompt.contains(slot), "\(slot) 자리가 문맥에 없다")
+    }
+
+    // **다음 단계의 인자는 계획 단계에만 실린다.** 이 비대칭이 설계다.
+    XCTAssertTrue(
+      context.prompt.contains(Self.secretMessageID), "계획 단계가 다음 단계의 인자를 잃었다")
+
+    // 그러나 바인딩은 어느 단계에도 실리지 않는다 — 모델이 그 값으로 할 일이 없다.
+    for secret in [Self.secretPrincipal, Self.secretWorkspace, Self.secretRevision,
+      Self.secretThread]
+    {
+      XCTAssertFalse(context.prompt.contains(secret), "계획 단계 문맥에 \(secret)이 실렸다")
+    }
+  }
+
+  // MARK: 3) 긴 지시는 자르지 않고 거절한다
+
+  func testOversizedRequestThrowsInsteadOfTruncating() {
+    let limit = PCCContextBudget.standard.requestCharacters
+    for count in [limit + 1, 100_000] {
+      let request = String(repeating: "가", count: count)
+      XCTAssertThrowsError(
+        try compiler.compile(
+          profile: .finalizing(target: .privateCloud),
+          userMessage: request, now: Self.now, calendar: Self.calendar),
+        "\(count)자 지시가 문맥으로 조립됐다"
+      ) { error in
+        XCTAssertEqual(
+          (error as? ContextCompilationError)?.reason,
+          ContextCompilationError.requestTooLargeReason)
+      }
+    }
+  }
+
+  func testRequestAtTheLimitStillCompiles() throws {
+    let limit = PCCContextBudget.standard.requestCharacters
+    let context = try compiler.compile(
+      profile: .finalizing(target: .privateCloud),
+      userMessage: String(repeating: "가", count: limit),
+      now: Self.now, calendar: Self.calendar)
+    XCTAssertTrue(context.prompt.contains("<<<request>>>"))
+  }
+
+  /// **PCC 문이 열리지 않았다**가 진짜 판정 기준이다. 문맥 크기 검사만으로는
+  /// 상위 경로가 그 문맥 없이 모델을 부르는 길이 남는다.
+  func testOversizedInputNeverInvokesSupervisorOrFinalizer() async {
+    let calls = ModelCallCounter()
+    var presented: ConversationTurnResult?
+    let runtime = await makeRuntime(calls: calls) { presented = $0 }
+
+    let paste = String(repeating: "가", count: PCCContextBudget.standard.requestCharacters)
+    await runtime.run(Self.snapshot(input: paste + "\n이 내용을 수정하지 말고 김철수에게 보내줘"))
+
+    XCTAssertEqual(calls.supervising, 0, "예산을 넘긴 지시로 계획을 물었다")
+    XCTAssertEqual(calls.finalizing, 0, "예산을 넘긴 지시로 답을 물었다")
+    XCTAssertEqual(presented?.phase, .failed)
+    XCTAssertEqual(
+      presented?.telemetry.fallbackReason, ContextCompilationError.requestTooLargeReason)
+    XCTAssertEqual(presented?.telemetry.pccCalls, 0)
+  }
+
+  /// 상한 안의 지시는 **반드시 통과한다.** 이 짝이 없으면 "전부 거절"도 위 시험을
+  /// 지난다.
+  func testRequestWithinTheLimitOpensThePCCDoor() async {
+    let calls = ModelCallCounter()
+    let runtime = await makeRuntime(calls: calls) { _ in }
+
+    await runtime.run(Self.snapshot(input: "어제 받은 메일 찾아줘"))
+
+    XCTAssertEqual(calls.supervising, 1, "정상 길이의 지시가 계획까지 가지 못했다")
+  }
+
+  // MARK: 4) 조립 결과는 언제나 예산 안
+
+  func testNoCompiledContextExceedsTheBudget() throws {
+    let budget = PCCContextBudget.standard
+    let profiles: [DynamicTurnProfile] = [
+      .supervising(phase: .planning, target: .privateCloud, scope: Self.scope, iteration: 0),
+      .supervising(phase: .reviewing, target: .privateCloud, scope: Self.scope, iteration: 1),
+      .finalizing(target: .privateCloud),
+      .conversing(target: .privateCloud),
+    ]
+    let requests = [0, budget.requestCharacters - 1, budget.requestCharacters]
+
+    for profile in profiles {
+      for length in requests {
+        for evidence in [[], Self.flood(evidence: 1_000)] {
+          for recent in [[], Self.flood(messages: 1_000)] {
+            let context = try compiler.compile(
+              profile: profile,
+              userMessage: String(repeating: "가", count: length),
+              recentTurns: recent,
+              evidence: evidence,
+              coverage: Self.flood(coverage: 200),
+              anchoredSlots: ResolvableArgument.allCases,
+              completed: Self.flood(completed: 400),
+              now: Self.now,
+              calendar: Self.calendar)
+            XCTAssertLessThanOrEqual(
+              context.estimatedCharacters, budget.totalCharacters,
+              """
+              \(profile.phase.rawValue) 문맥이 예산을 넘었다 \
+              (request=\(length) evidence=\(evidence.count) recent=\(recent.count))
+              """)
+          }
+        }
+      }
+    }
+  }
+
+  /// 끝난 일 구획은 상한 안으로 줄지만 **방금 일어난 실패는 남는다.** 보낸 메일이
+  /// 실패한 사실이 잘려 나가면 답이 그 사실을 말할 수 없다(§2.6·§10.1).
+  func testCompletedDigestKeepsTheNewestLines() throws {
+    let digest =
+      (1...400).map { "memory.save=ok\($0)" }.joined(separator: "\n")
+      + "\nmail.send=notAuthorized:mail"
+    let context = try compiler.compile(
+      profile: .supervising(
+        phase: .reviewing, target: .privateCloud, scope: Self.scope, iteration: 1),
+      userMessage: "보냈어?",
+      completed: digest,
+      now: Self.now,
+      calendar: Self.calendar)
+
+    XCTAssertTrue(
+      context.prompt.contains("mail.send=notAuthorized:mail"), "가장 최근의 실패가 잘렸다")
+    XCTAssertFalse(context.prompt.contains("memory.save=ok1\n"), "오래된 줄이 남았다")
+  }
+
+  // MARK: 조립
+
+  private static let secrets = [
+    secretMessageID, secretPrincipal, secretWorkspace, secretRevision, secretThread,
+  ]
+
+  private static let scope = CapabilityScope.compile(
+    registered: [.mailSearch, .mailRead, .mailSend, .peopleResolve, .memorySearch])
+
+  /// 메일 한 통의 근거. **바인딩까지 붙여 둔다** — 그 값이 프롬프트로 새는지가
+  /// 이 시험의 관찰 지점이다.
+  private static var mailEvidence: Evidence {
+    var evidence = Evidence(
+      source: .mail,
+      sourceID: secretMessageID,
+      title: "목요일 회의 일정",
+      facts: ["답장 일정은 목요일입니다."],
+      timestamp: "2026-09-15 09:12")
+    evidence.sourceReference = SourceReference(
+      accountID: "acct",
+      binding: .connector(
+        ConnectorBindingID(
+          provider: .google, principalID: secretPrincipal, workspaceID: secretWorkspace)),
+      kind: .mailMessage,
+      id: secretMessageID,
+      containerID: secretThread,
+      revision: secretRevision)
+    return evidence
+  }
+
+  private static func flood(evidence count: Int) -> [Evidence] {
+    (0..<count).map { index in
+      Evidence(
+        source: .chat,
+        sourceID: "id-\(index)-\(String(repeating: "x", count: 400))",
+        title: String(repeating: "제", count: 800),
+        facts: (0..<8).map { _ in String(repeating: "사", count: 900) },
+        summary: String(repeating: "요", count: 900),
+        timestamp: String(repeating: "시", count: 200))
+    }
+  }
+
+  private static func flood(messages count: Int) -> [ConversationMessage] {
+    (0..<count).map { index in
+      ConversationMessage(
+        accountID: "acct", conversationID: "conv", sequence: index,
+        requestID: "req-\(index)",
+        role: index.isMultiple(of: 2) ? .user : .assistant,
+        text: String(repeating: "말", count: 5_000))
+    }
+  }
+
+  private static func flood(coverage count: Int) -> [CoverageRecord] {
+    (0..<count).map { index in
+      CoverageRecord(
+        binding: .accountLocal(accountID: "acct", domain: "memory"),
+        capability: .memorySearch,
+        queryFingerprint: "fp-\(index)",
+        state: .partial,
+        discoveredCount: 999, readCount: 1,
+        paginationExhausted: false, truncated: true, reason: .pagination)
+    }
+  }
+
+  private static func flood(completed count: Int) -> String {
+    (0..<count).map { "memory.search=ok-\($0)" }.joined(separator: "\n")
+  }
+
+  private static func snapshot(input: String) -> TurnContextSnapshot {
+    TurnContextSnapshot(
+      requestID: UUID(), accountID: "acct", conversationID: "conv", input: input,
+      recentMessages: [], submittedAt: now,
+      registeredCapabilities: [.mailSearch, .mailRead])
+  }
+
+  private func makeRuntime(
+    calls: ModelCallCounter,
+    present: @escaping @MainActor (ConversationTurnResult) -> Void
+  ) async -> TurnRuntime {
+    let dispatcher = ActionDispatcher(
+      ledger: NoopActionLedger(), currentAccountID: { "acct" })
+    return TurnRuntime(
+      dispatcher: dispatcher,
+      emit: { _ in },
+      present: present,
+      copy: .keysAsText,
+      now: { Self.now },
+      supervising: { _ in
+        calls.supervising += 1
+        return .decided(
+          TurnDecision(status: .complete, plan: ActionPlan(steps: [], needs: nil)),
+          Self.receipt)
+      },
+      finalizing: { _, _ in
+        calls.finalizing += 1
+        return FinalizationStep(
+          answer: .written(
+            headline: "했어요", points: [], relevant: [], backend: .privateCloud),
+          receipt: Self.receipt)
+      })
+  }
+
+  private static let receipt = ModelInvocationReceipt(
+    phase: .planning, purpose: AdmissionJob.conversationPlan.rawValue,
+    requestedBackend: .privateCloud, resolvedBackend: .privateCloud,
+    pccAttempted: true, pccCompleted: true, onDeviceAttempted: false,
+    onDeviceCompleted: false, fallbackReason: nil, inputCharacters: 0,
+    latencyMilliseconds: 0)
+}
+
+// MARK: - 대역
+
+/// PCC 자리를 몇 번 열었는가. **횟수가 판정**이므로 값을 따로 든다.
+@MainActor
+private final class ModelCallCounter {
+  var supervising = 0
+  var finalizing = 0
+}
+
+/// 원장 없이는 디스패처를 세울 수 없다. 이 시험은 실행까지 가지 않으므로 빈 값이다.
+private struct NoopActionLedger: ActionLedger {
+  func replay(_ request: ActionRequest) throws -> ActionLedgerReplay? { nil }
+  func claim(_ request: ActionRequest, at date: Date) throws -> ActionLedgerClaim {
+    .granted(idempotencyKey: request.idempotencyKey)
+  }
+  func settle(
+    idempotencyKey: String, state: ActionLedgerEntry.State, externalID: String?,
+    summary: String, at date: Date
+  ) throws {}
+  func entry(idempotencyKey: String) throws -> ActionLedgerEntry? { nil }
+  func deleteAll(accountID: String) throws {}
+}
