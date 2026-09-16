@@ -171,6 +171,27 @@ public enum ResolvableArgument: String, Sendable, CaseIterable {
   public static func isResolvable(_ key: String) -> Bool {
     ResolvableArgument(rawValue: key) != nil
   }
+
+  /// 이 자리의 값이 **사람이 읽을 것이 아닌 손잡이**인가.
+  ///
+  /// 답을 쓰는 단계는 도구가 닫혀 있어 손잡이로 할 일이 없고, 받은 손잡이를
+  /// 사실로 읽어 답에 적었다 — `"ID는 52C3E0B2-4A3A-…입니다."`(시뮬레이터 실측
+  /// 2026-09-15 03:13). `Evidence.sourceID`는 그 실측 뒤에 막혔지만, 수령증의
+  /// 딸린 값에서 사실 줄로 들어온 같은 값은 막히지 않았다.
+  ///
+  /// switch가 닫혀 있는 것이 이 값의 요점이다. 자리를 하나 더하면 **분류할
+  /// 때까지 컴파일이 거부한다** — 분류하지 않은 자리가 조용히 통과하지 않는다.
+  public var isOpaqueHandle: Bool {
+    switch self {
+    case .messageID, .channelID, .threadTS, .threadID, .messageIDHeader, .itemID,
+      .eventID, .reminderID:
+      return true
+    // 주소·주소창·사람이 쓴 글은 사용자가 말했거나 읽은 값이다. 답이 그것을
+    // 되읽는 것은 누설이 아니라 §43이 요구하는 일이다.
+    case .to, .url, .sourceText, .body:
+      return false
+    }
+  }
 }
 
 @available(iOS 26.0, *)

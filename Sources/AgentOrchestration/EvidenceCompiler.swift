@@ -234,7 +234,7 @@ public struct EvidenceCompiler: Sendable {
   /// 수령증 하나를 근거로. 담는 것은 **관찰된 결과**뿐이다.
   public static func action(_ receipt: ActionReceipt) -> Evidence {
     var facts = [receipt.summary]
-    for key in receipt.details.keys.sorted() where key != CapabilitySourceRow.detailKey {
+    for key in receipt.details.keys.sorted() where Self.tellable(key, of: receipt.capability) {
       switch receipt.details[key] {
       case .text(let value): facts.append("\(key): \(value)")
       case .number(let value): facts.append("\(key): \(Int(value))")
@@ -251,6 +251,30 @@ public struct EvidenceCompiler: Sendable {
       sourceID: receipt.externalID,
       title: receipt.capability.rawValue,
       facts: facts)
+  }
+
+  /// 수령증의 딸린 값 중 **답이 말할 수 있는 자리.**
+  ///
+  /// `details`는 실행 배선과 표시용 값이 섞인 사전이다(`ActionReceipt.details`).
+  /// 전부를 사실로 옮기던 동안 `memory.save`의 `itemID`가 답의 문맥까지 갔다 —
+  /// `Evidence.sourceID`를 막은 것으로는 이 길이 닫히지 않는다.
+  ///
+  /// 두 관문을 **모두** 지나야 한다:
+  ///
+  /// 1. **그 능력의 계약이 선언한 인자**여야 한다. 어댑터가 지어낸 자리(`cursor`,
+  ///    `bodyMimeType`, 공급자가 돌려준 id)는 계약에 없다. 코어는 호스트 어댑터가
+  ///    무엇을 담는지 알 수 없으므로 **모르는 열쇠는 막는다** — 목록을 뒤에서
+  ///    늘리는 금지 목록은 새 어댑터가 하나 붙을 때마다 뚫린다.
+  /// 2. 그 자리가 **다음 단계의 손잡이가 아니어야** 한다(`isOpaqueHandle`).
+  ///    계약 인자에도 손잡이가 있다(`mail.read`의 `messageID`).
+  ///
+  /// 막히면 `summary` 한 줄이 남는다. 무엇을 했는지는 그 줄이 말하고, 그 줄은
+  /// 어댑터가 관찰한 결과다.
+  private static func tellable(_ key: String, of capability: CapabilityID) -> Bool {
+    guard key != CapabilitySourceRow.detailKey else { return false }
+    if let slot = ResolvableArgument(rawValue: key), slot.isOpaqueHandle { return false }
+    guard let contract = CapabilityContract.contract(for: capability) else { return false }
+    return (contract.required + contract.optional).contains { $0.key == key }
   }
 
   public static func terms(in query: String) -> [String] {

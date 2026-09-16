@@ -198,6 +198,60 @@ final class PCCContextBoundaryTests: XCTestCase {
     XCTAssertFalse(context.prompt.contains("memory.save=ok1\n"), "오래된 줄이 남았다")
   }
 
+  // MARK: 5) 수령증의 딸린 값도 식별자를 흘리지 않는다
+
+  /// `Evidence.sourceID`를 막은 것으로는 이 길이 닫히지 않는다. 수령증의
+  /// `details`가 사실 줄로 옮겨지면 같은 값이 답의 문맥에 그대로 선다.
+  func testActionEvidenceDropsExecutionHandles() throws {
+    let cases: [(CapabilityID, String, String)] = [
+      // 계약이 등록되지 않은 능력 — **모르는 열쇠는 막는다.**
+      (.memorySave, "itemID", "기록했어요"),
+      // 계약이 선언한 인자이지만 다음 단계의 손잡이다(`isOpaqueHandle`).
+      (.mailRead, "messageID", "mail.read.result"),
+    ]
+
+    for (capability, key, summary) in cases {
+      let secret = "secret-handle-52C3E0B2-\(key)"
+      let evidence = EvidenceCompiler.action(
+        ActionReceipt(
+          requestID: UUID(), capability: capability, externalID: secret,
+          summary: summary, details: [key: .text(secret)]))
+      let context = try compiler.compile(
+        profile: .finalizing(target: .privateCloud),
+        userMessage: "기억해뒀어?",
+        evidence: [evidence],
+        now: Self.now, calendar: Self.calendar)
+
+      XCTAssertTrue(context.prompt.contains(summary), "\(capability)의 관찰된 결과가 사라졌다")
+      XCTAssertFalse(context.prompt.contains(secret), "\(capability)의 \(key) 값이 실렸다")
+      XCTAssertFalse(context.prompt.contains(key), "\(capability)의 \(key) 자리 이름이 실렸다")
+    }
+  }
+
+  /// 짝이 되는 시험. 이것이 없으면 "딸린 값을 전부 버린다"도 위 시험을 지나고,
+  /// 그러면 답이 **한 일의 값**을 말할 수 없다(§43).
+  func testActionEvidenceKeepsContractDeclaredFacts() throws {
+    let evidence = EvidenceCompiler.action(
+      ActionReceipt(
+        requestID: UUID(), capability: .mailSend, externalID: Self.secretMessageID,
+        summary: "mail.send.done",
+        details: [
+          "to": .text("chulsoo@example.com"), "subject": .text("목요일 회의"),
+          // 어댑터가 지어낸 자리는 계약에 없다.
+          "cursor": .text("secret-cursor-991"),
+        ]))
+    let context = try compiler.compile(
+      profile: .finalizing(target: .privateCloud),
+      userMessage: "보냈어?",
+      evidence: [evidence],
+      now: Self.now, calendar: Self.calendar)
+
+    XCTAssertTrue(context.prompt.contains("chulsoo@example.com"), "누구에게 보냈는지가 사라졌다")
+    XCTAssertTrue(context.prompt.contains("목요일 회의"), "무엇을 보냈는지가 사라졌다")
+    XCTAssertFalse(context.prompt.contains("secret-cursor-991"), "계약 밖의 자리가 실렸다")
+    XCTAssertFalse(context.prompt.contains(Self.secretMessageID), "보낸 메일의 id가 실렸다")
+  }
+
   // MARK: 조립
 
   private static let secrets = [
