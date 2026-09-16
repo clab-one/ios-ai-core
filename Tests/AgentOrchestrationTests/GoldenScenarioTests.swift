@@ -340,4 +340,69 @@ final class GoldenScenarioTests: XCTestCase {
       save.requests.first?.arguments["body"]?.textValue, "PCC가 서버로 확장됐다.",
       "읽고 줄인 글이 저장 자리로 흐르지 않았다")
   }
+
+  // MARK: G09 — 읽기를 뺀 계획
+
+  /// **찾았으면 읽는다.** 계획에 읽기가 없어도 그렇다.
+  ///
+  /// 실기 2026-09-17(iPad, 실제 PCC)에서 PCC는 `"찾아서 요약해서 저장해줘"`의
+  /// 계획을 `web.search → text.summarize → memory.save`로 냈다. 읽기가 없는데
+  /// 요약이 성립한 이유는 원문 자리가 **검색 줄의 제목과 스니펫**으로 채워졌기
+  /// 때문이다 — 그 차례는 페이지를 한 장도 열지 않고 공급자가 쓴 한 줄을 요약해
+  /// 기록으로 저장하고 `completed`로 닫혔다.
+  ///
+  /// 그래서 둘을 함께 본다: 손잡이 줄은 원문 자리를 채우지 못하고(`produces`),
+  /// 채우지 못한 그 자리는 **되물음이 아니라 읽기로** 메워진다.
+  func testG09SearchWithoutReadStillReadsThePage() async throws {
+    let model = ScenarioOnDeviceModel(reply: "PCC가 서버로 확장됐다.")
+    let save = FixtureTool(
+      .memorySave, required: [.init("body")], optional: [.init("title")]
+    ) { _ in [] }
+    let read = FixtureTool(.webRead, required: [.init("url")]) { _ in
+      [CapabilitySourceRow(title: "PCC", body: Self.page)]
+    }
+    let run = await ScenarioRunner.run(
+      GoldenScenario(
+        name: "G09 search-without-read",
+        input: "PCC 최신 소식 찾아서 요약해서 메모로 저장해줘",
+        scope: [.webSearch, .webRead, .textSummarize, .memorySave],
+        // **계획에 `web.read`가 없다.** 이것이 실기에서 PCC가 낸 계획이다.
+        plan: [
+          PlannedStep(capability: .webSearch, arguments: ["query": .text("PCC 최신")]),
+          PlannedStep(
+            capability: .textSummarize, arguments: [:], unresolved: ["sourceText"]),
+          PlannedStep(capability: .memorySave, arguments: [:], unresolved: ["body"]),
+        ],
+        tools: [
+          WebSearchTool(
+            broker: WebSearchBroker(engines: [
+              StubSearchEngine(
+                name: "stub",
+                outcome: .success([
+                  WebSearchResult(
+                    title: "PCC", url: "https://example.com/pcc", snippet: Self.snippet)
+                ]))
+            ])),
+          read,
+          SummarizeTool(model: model),
+          save,
+        ],
+        budget: ScenarioBudget(contextBaseline: 492, materials: 3, retrievedRows: 3),
+        forbidden: [Self.pageMarker, Self.snippet]))
+
+    try run.assertBounds()
+    XCTAssertEqual(
+      run.executed, ["web.search", "web.read", "text.summarize", "memory.save"],
+      "빠진 읽기가 메워지지 않았다")
+    XCTAssertEqual(
+      read.requests.first?.arguments["url"]?.textValue, "https://example.com/pcc",
+      "검색이 준 주소를 읽지 않았다")
+    // **요약한 것은 페이지다.** 스니펫이 아니다.
+    XCTAssertEqual(model.received.count, 1)
+    let material = try XCTUnwrap(model.received.first)
+    XCTAssertTrue(material.contains(Self.pageMarker), "페이지 본문이 요약기에 닿지 않았다")
+    XCTAssertFalse(material.contains(Self.snippet), "공급자가 쓴 한 줄을 요약했다")
+    XCTAssertEqual(
+      save.requests.first?.arguments["body"]?.textValue, "PCC가 서버로 확장됐다.")
+  }
 }

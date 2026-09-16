@@ -211,6 +211,8 @@ public final class TurnRuntime {
     public var startedAt: Date
     /// 의미 불변식을 이미 적용했는가. 한 번만 적용한다(§24).
     public var invariantApplied = false
+    /// 찾은 페이지를 읽으라고 **한 번** 냈는가.
+    public var searchedPageReadApplied = false
     /// 감독을 PCC가 했는가. 답을 누가 써야 하는지의 근거다(§19).
     public var pccSupervised = false
     /// 이미 **똑같이** 실행한 호출. 열쇠는 능력 이름 + 인자 지문이다.
@@ -539,6 +541,15 @@ public final class TurnRuntime {
         continue
       }
 
+      //    웹도 같다. 검색 결과는 주소와 공급자가 쓴 한 줄이고, 그 줄로 답을 쓰면
+      //    열어 보지 않은 페이지에 대해 답한 것이 된다(`searchedPageReadStep`).
+      if let injected = Self.searchedPageReadStep(state) {
+        state.searchedPageReadApplied = true
+        state.steps = [injected]
+        state.telemetry.fallbackReason = "invariant:web.read"
+        continue
+      }
+
       guard ContinuousClock.now < state.executionDeadline else {
         state.telemetry.fallbackReason = "deadline"
         state.incomplete = true
@@ -829,8 +840,22 @@ public final class TurnRuntime {
         return .drained
       }
       guard var arguments = resolve(&step, in: state) else {
-        // 채울 수 없는 자리가 있으면 **되묻는다.** 규칙이 만든 다른 길로 갈아타지
-        // 않는다 — 사용자가 말한 일과 다른 일을 하게 된다.
+        // 채울 수 없는 자리를 **먼저 메운다.** 검색이 준 것은 손잡이이므로 원문
+        // 자리를 채우지 못한다 — 찾은 페이지를 읽으면 채워진다. 이 보정이 없으면
+        // `"찾아서 요약해줘"`가 검색을 성공한 뒤 `"무엇을 요약할까요?"`로 끝난다.
+        //
+        // 읽기를 **그 단계 앞에** 끼운다. 계획이 끝난 뒤에 메우면 요약과 저장이
+        // 이미 지나간 자리이고, 그때 읽은 페이지는 아무 자리도 채우지 못한다.
+        if step.unresolved.contains(ResolvableArgument.sourceText.rawValue),
+          let injected = Self.searchedPageReadStep(state)
+        {
+          state.searchedPageReadApplied = true
+          state.steps.insert(contentsOf: [injected, step], at: 0)
+          state.telemetry.fallbackReason = "invariant:web.read"
+          continue
+        }
+        // 그 밖의 빈 자리는 **되묻는다.** 규칙이 만든 다른 길로 갈아타지 않는다 —
+        // 사용자가 말한 일과 다른 일을 하게 된다.
         return .stopped(
           phase: .awaitingUser, needs: step.unresolved.first ?? "value", reason: nil)
       }
@@ -1030,8 +1055,15 @@ public final class TurnRuntime {
     case .eventID: return capability.domain == "calendar"
     case .reminderID: return capability.domain == "reminders"
     case .url: return capability == .webSearch
-    // 줄일 원문은 **읽은 것**에서 온다. 어느 영역이든 읽기 수령증이면 재료가 된다.
-    case .sourceText: return capability.executionClass == .readOnly
+    // 줄일 원문은 **읽은 것**에서 온다. 검색은 읽기가 아니다: 그 줄은 손잡이이고
+    // (`CapabilityContract.RowKind.handle`) 본문 자리가 비어 있다. 제목과 스니펫으로
+    // 이 자리를 채우면 차례는 페이지를 한 장도 열지 않고 **공급자가 쓴 한 줄**을
+    // 요약한다 — 실기 2026-09-17(iPad, 실제 PCC)에서 `"찾아서 요약해서 저장해줘"`가
+    // `web.search → text.summarize → memory.save`로 `completed`가 됐고, 저장된
+    // 메모는 SERP 스니펫의 요약이었다.
+    case .sourceText:
+      guard CapabilityContract.contract(for: capability)?.rows != .handle else { return false }
+      return capability.executionClass == .readOnly
     // 본문은 **만든 글**에서만 온다. 읽은 원문을 그대로 보내지 않는다.
     case .body: return capability == .textSummarize
     }
@@ -1129,6 +1161,10 @@ public final class TurnRuntime {
           return .text(candidate)
         }
       case .sourceText:
+        // 손잡이 줄은 재료가 아니다(`produces`). 이 자리에도 같은 표가 서야 한다 —
+        // 두 경로가 갈리면 한쪽만 막힌다.
+        guard CapabilityContract.contract(for: receipt.capability)?.rows != .handle
+        else { continue }
         // 읽은 줄들의 본문을 잇는다. 본문이 없는 줄(일정·미리 알림)은 제목과
         // 부제가 재료다 — 빈 글을 요약 툴에 넘기면 그 툴은 지어낸다.
         let material = rows.compactMap { row -> String? in
@@ -1244,6 +1280,28 @@ public final class TurnRuntime {
     case .failure:
       return nil
     }
+  }
+
+  /// 찾은 페이지를 읽는 단계. **한 차례에 한 번만.**
+  ///
+  /// 검색이 돌려주는 줄은 주소와 공급자가 쓴 한 줄뿐이다(`RowKind.handle`). 그
+  /// 줄로 답을 쓰면 우리가 **열어 보지 않은 페이지**에 대해 답한 것이 된다.
+  ///
+  /// 실기 2026-09-17(iPad, 실제 PCC): `"애플 PCC 최신 내용 알려줘"`의 계획이
+  /// `web.search` 하나였고 차례는 다섯 줄을 찾은 뒤 `partial`로 닫혔다 — 근거
+  /// 조각은 0개였다. 모델에게 다시 묻지 않고 여기서 메운다: 찾았다는 사실이 곧
+  /// 읽을 것이 있다는 뜻이다(`recordReadStep`과 같은 자리).
+  private static func searchedPageReadStep(_ state: TurnState) -> PlannedStep? {
+    guard !state.searchedPageReadApplied else { return nil }
+    guard state.scope.contains(.webRead) else { return nil }
+    guard let hit = state.ledger.receipts.last(where: { $0.capability == .webSearch }),
+      let candidate = CapabilitySourceRow.rows(in: hit.details).first?.identifier,
+      let url = URL(string: candidate), url.scheme == "http" || url.scheme == "https",
+      !state.readURLs.contains(candidate),
+      case .success(let arguments) = CapabilityContract.normalize(
+        ["url": .text(candidate)], for: .webRead)
+    else { return nil }
+    return PlannedStep(capability: .webRead, arguments: arguments)
   }
 
   private static func urlInvariantStep(_ state: TurnState) -> PlannedStep? {
