@@ -100,15 +100,34 @@ public struct TurnSupervisor: Sendable {
   ) async -> Result<Outcome, Failure> {
     let started = Date()
     guard #available(iOS 27.0, *) else {
-      return .failure(Self.unsupported(profile: profile, context: context, started: started))
+      return .failure(
+        Self.notAttempted(
+          profile: profile, context: context, started: started,
+          reason: ModelFailureClassifier.unsupportedReason))
     }
     // **물리 호출마다 영수증 한 장.** 버리는 것은 결과뿐이고, 나간 호출은 문맥을
     // 태웠다 — 한 장만 남기면 계측이 실제 요청 수보다 작게 나온다.
     var discarded: [ModelInvocationReceipt] = []
     while true {
+      // **세션을 세우는 일과 요청을 내는 일을 나눈다.** 부르기 전에 막힌 것은
+      // 시도가 아니고(§36), 그 구별을 사유 문자열 비교로 하면 분류기가 바뀌는 날
+      // `pccAttempted`가 조용히 거짓이 된다. 경계를 **코드 구조로** 세운다.
+      let session: LanguageModelSession
+      do {
+        session = try DynamicProfileAdapter.privateCloudSession(
+          instructions: context.instructions)
+      } catch {
+        return .failure(
+          Self.notAttempted(
+            profile: profile, context: context, started: started,
+            reason: ModelFailureClassifier.reason(for: error), discarded: discarded))
+      }
+
+      // 여기부터 요청이 나간다 — 이 아래의 실패는 모두 **시도**다.
       let attemptStarted = Date()
       do {
-        let (generated, usage) = try await respond(context: context, profile: profile)
+        let (generated, usage) = try await respond(
+          session: session, context: context, profile: profile)
         let decision = ActionPlanValidator.validate(
           generated, allowed: profile.scope.sorted, conversationID: conversationID,
           accountID: accountID, calendar: context.calendar)
@@ -141,14 +160,6 @@ public struct TurnSupervisor: Sendable {
           )
           continue
         }
-        // **미지원은 시도가 아니다.** PCC를 부르기 전에 막힌 실패는 부른 적이
-        // 없으므로 영수증도 그렇게 적는다(§36).
-        if reason == ModelFailureClassifier.unsupportedReason {
-          return .failure(
-            Self.unsupported(
-              profile: profile, context: context, started: attemptStarted,
-              discarded: discarded))
-        }
         Self.log.error(
           "supervisor failed phase=\(profile.phase.rawValue, privacy: .public) reason=\(reason, privacy: .public)"
         )
@@ -164,11 +175,10 @@ public struct TurnSupervisor: Sendable {
 
   @available(iOS 27.0, *)
   private func respond(
+    session: LanguageModelSession,
     context: CompiledConversationContext,
     profile: DynamicTurnProfile
   ) async throws -> (GeneratedTurnDecision, ModelTokenUsage) {
-    let session = try DynamicProfileAdapter.privateCloudSession(
-      instructions: context.instructions)
     let options = DynamicProfileAdapter.generationOptions(for: profile)
     // PCC 호출은 기기 대기열을 지나지 않는다 — 기기 모델을 붙잡지 않으므로
     // 입장 제어의 대상이 아니다. 기다린 시간이 0인 것은 사실이다.
@@ -180,33 +190,26 @@ public struct TurnSupervisor: Sendable {
     return (response.content, DynamicProfileAdapter.tokenUsage(response.usage))
   }
 
-  /// 이 기기에서는 에이전트를 열 수 없다. **기기 모델이 계획을 대신 쓰지 않는다.**
+  /// 요청이 **나가지 못했다.** 이 기기·계정으로 PCC를 열 수 없거나 iOS가 그
+  /// API를 들고 있지 않다.
   ///
-  /// 영수증에 `pccAttempted`를 적지 않는다 — 부르기 전에 막은 것은 시도가 아니고,
-  /// 시도로 적으면 처리 위치가 `pccAttemptedButFallbackLocal`이 되어 화면이
-  /// "클라우드에 보냈다가 기기로 돌아왔다"는 **거짓**을 말한다(§36).
-  private static func unsupported(
+  /// 기기 모델이 계획을 대신 쓰지 않는다. 그리고 영수증에 `pccAttempted`를 적지
+  /// 않는다 — 부르기 전에 막은 것은 시도가 아니다(§36).
+  private static func notAttempted(
     profile: DynamicTurnProfile, context: CompiledConversationContext, started: Date,
-    discarded: [ModelInvocationReceipt] = []
+    reason: String, discarded: [ModelInvocationReceipt] = []
   ) -> Failure {
-    log.error("supervisor unsupported reason=pcc.unsupported")
+    log.error("supervisor not attempted reason=\(reason, privacy: .public)")
     return Failure(
       disposition: .surfaceFailure,
-      reason: ModelFailureClassifier.unsupportedReason,
+      reason: reason,
       trail: ModelInvocationTrail(
-        outcome: ModelInvocationReceipt(
+        outcome: .notAttempted(
           phase: profile.phase,
           purpose: AdmissionJob.conversationPlan.rawValue,
-          requestedBackend: .privateCloud,
-          resolvedBackend: .privateCloud,
-          pccAttempted: false,
-          pccCompleted: false,
-          onDeviceAttempted: false,
-          onDeviceCompleted: false,
-          fallbackReason: ModelFailureClassifier.unsupportedReason,
+          reason: reason,
           inputCharacters: context.estimatedCharacters,
-          latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1_000),
-          waitedMilliseconds: 0),
+          latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1_000)),
         discarded: discarded))
   }
 

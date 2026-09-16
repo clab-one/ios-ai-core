@@ -28,21 +28,30 @@ public struct TurnTelemetry: Sendable, Equatable {
   public var toolCount = 0
   /// 근거 조각 수.
   public var materialCount = 0
-  /// 물리 PCC 호출 **전부가** 실은 글자 수의 합과 한 호출의 최대.
+  /// **실제로 나간** PCC 호출들이 실은 글자 수의 합과 한 호출의 최대.
   ///
   /// 예전에는 `estimatedInputCharacters` 한 칸이었고, 단계마다 **덮어썼다** —
   /// 감독 3회 + 답 1회를 돈 차례가 기록에 남기는 값은 마지막 호출의 크기였다.
   /// 합만 보면 "호출이 많았다"와 "한 호출이 컸다"를 구별할 수 없으므로 둘을 든다.
+  ///
+  /// 부르기 전에 막힌 차례는 0이다. 조립한 문맥의 크기와 **기기를 떠난** 문맥의
+  /// 크기는 다른 값이고, 이 칸은 뒤쪽이다.
   public var inputCharacters = 0
   public var maximumInputCharacters = 0
-  /// **실측 토큰.** 모델이 돌려준 값이고(`Response.usage`), 글자 수의 환산이
-  /// 아니다. 재지 못한 호출은 더하지 않으므로 `pccCalls`보다 적은 호출만 셀 수
-  /// 있다 — 그 차이가 곧 "이 기기에서 재지 못했다"는 사실이다.
-  public var inputTokens = 0
-  public var maximumInputTokens = 0
-  public var cachedInputTokens = 0
+  /// **실측 토큰.** 모델이 돌려준 값이고(`Response.usage`) 글자 수의 환산이 아니다.
+  ///
+  /// **하나라도 재지 못했으면 nil이다.** 부분 합을 총량으로 적으면 재시도가 많은
+  /// 차례가 실제보다 작게 잡히고, 그 값으로 뽑은 p50/p95는 문맥 축소 판단의
+  /// 근거가 되지 못한다. 부분 값이 필요하면 `measuredInputTokens`를 본다.
+  public var inputTokens: Int?
+  public var maximumInputTokens: Int?
+  public var cachedInputTokens: Int?
+  /// 잰 호출만의 합. **부분 값**이라는 사실이 이름에 있다.
+  public var measuredInputTokens = 0
   /// **물리** PCC 요청 수. 재시도는 호출이 하나 더인 것이다.
   public var pccCalls = 0
+  /// 그중 사용량을 받은 호출 수. `pccCalls`와 다르면 총량은 알 수 없다.
+  public var tokenMeasuredCalls = 0
   /// 감독자에게 물은 횟수. 재계획이 실제로 일어났는가를 이 값이 말한다.
   public var supervisorIterations = 0
   /// 기기 모델로 압축한 횟수와 그 분모(§33 Local Compaction Ratio).
@@ -76,9 +85,10 @@ public struct TurnTelemetry: Sendable, Equatable {
       turn profile=\(profile, privacy: .public) backend=\(backend, privacy: .public) \
       tools=\(toolCount, privacy: .public) materials=\(materialCount, privacy: .public) \
       chars=\(inputCharacters, privacy: .public)/\(maximumInputCharacters, privacy: .public) \
-      tokens=\(inputTokens, privacy: .public)/\(maximumInputTokens, privacy: .public) \
-      cached=\(cachedInputTokens, privacy: .public) \
-      pcc=\(pccCalls, privacy: .public) \
+      tokens=\(inputTokens.map(String.init) ?? "unknown", privacy: .public)/\(maximumInputTokens.map(String.init) ?? "unknown", privacy: .public) \
+      measured=\(measuredInputTokens, privacy: .public) \
+      cached=\(cachedInputTokens.map(String.init) ?? "unknown", privacy: .public) \
+      pcc=\(pccCalls, privacy: .public)/\(tokenMeasuredCalls, privacy: .public) \
       iterations=\(supervisorIterations, privacy: .public) \
       compaction=\(localExtractions, privacy: .public)/\(retrievedRows, privacy: .public) \
       fanout=\(readFanout, privacy: .public) \

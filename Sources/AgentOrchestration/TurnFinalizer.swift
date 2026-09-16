@@ -76,23 +76,33 @@ public struct TurnFinalizer: Sendable {
   ) async -> Outcome {
     let started = Date()
     guard #available(iOS 27.0, *) else {
-      let reason = ModelFailureClassifier.unsupportedReason
-      Self.log.error("finalizer unsupported reason=\(reason, privacy: .public)")
-      return Outcome(
-        answer: .unavailable(reason: reason),
-        trail: ModelInvocationTrail(
-          outcome: Self.receipt(
-            profile: profile, completed: false, fallbackReason: reason, context: context,
-            started: started)))
+      return Self.notAttempted(
+        profile: profile, context: context, started: started,
+        reason: ModelFailureClassifier.unsupportedReason)
     }
     // **물리 호출마다 영수증 한 장.** 다시 낸 호출도 같은 문맥을 태운다.
     var discarded: [ModelInvocationReceipt] = []
     while true {
+      // **세션을 세우는 일과 요청을 내는 일을 나눈다.** PCC 가용성은 계획과 답
+      // 사이에 바뀔 수 있고, 그때 답 자리에서 막힌 것은 **부른 적이 없는 것**이다
+      // (§36). 이 경계가 없던 동안 나가지 않은 요청이 `pccCalls`에 섞였다.
+      let session: LanguageModelSession
+      do {
+        session = try DynamicProfileAdapter.privateCloudSession(
+          instructions: context.instructions)
+      } catch {
+        return Self.notAttempted(
+          profile: profile, context: context, started: started,
+          reason: ModelFailureClassifier.reason(for: error), discarded: discarded)
+      }
+
+      // 여기부터 요청이 나간다 — 이 아래의 실패는 모두 **시도**다.
       let attemptStarted = Date()
       let generated: GeneratedFinalAnswer
       let usage: ModelTokenUsage
       do {
-        (generated, usage) = try await respond(context: context, profile: profile)
+        (generated, usage) = try await respond(
+          session: session, context: context, profile: profile)
       } catch {
         let reason = ModelFailureClassifier.reason(for: error)
         let receipt = Self.receipt(
@@ -141,16 +151,33 @@ public struct TurnFinalizer: Sendable {
 
   @available(iOS 27.0, *)
   private func respond(
+    session: LanguageModelSession,
     context: CompiledConversationContext,
     profile: DynamicTurnProfile
   ) async throws -> (GeneratedFinalAnswer, ModelTokenUsage) {
-    let session = try DynamicProfileAdapter.privateCloudSession(
-      instructions: context.instructions)
     let options = DynamicProfileAdapter.generationOptions(for: profile)
     let response = try await session.respond(
       to: context.prompt, generating: GeneratedFinalAnswer.self, options: options,
       contextOptions: DynamicProfileAdapter.contextOptions(for: profile))
     return (response.content, DynamicProfileAdapter.tokenUsage(response.usage))
+  }
+
+  /// 요청이 **나가지 못했다.** 답 자리도 계획 자리와 같은 규칙을 쓴다(§36·§37).
+  private static func notAttempted(
+    profile: DynamicTurnProfile, context: CompiledConversationContext, started: Date,
+    reason: String, discarded: [ModelInvocationReceipt] = []
+  ) -> Outcome {
+    log.error("finalizer not attempted reason=\(reason, privacy: .public)")
+    return Outcome(
+      answer: .unavailable(reason: reason),
+      trail: ModelInvocationTrail(
+        outcome: .notAttempted(
+          phase: .finalizing,
+          purpose: AdmissionJob.conversationAnswer.rawValue,
+          reason: reason,
+          inputCharacters: context.estimatedCharacters,
+          latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1_000)),
+        discarded: discarded))
   }
 
   private static func receipt(

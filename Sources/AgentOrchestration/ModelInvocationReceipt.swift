@@ -83,6 +83,35 @@ public struct ModelInvocationReceipt: Sendable, Equatable {
     self.cachedInputTokens = usage?.cachedInputTokens
     self.outputTokens = usage?.outputTokens
   }
+
+  /// **부르지 못한 호출.**
+  ///
+  /// 세션을 세우는 데서 막힌 것은 시도가 아니다 — 요청은 나가지 않았고, 토큰도
+  /// 글자도 기기를 떠나지 않았다. 시도로 적으면 처리 위치가
+  /// `pccAttemptedButFallbackLocal`이 되어 화면이 "클라우드에 보냈다가 기기로
+  /// 돌아왔다"는 거짓을 말한다(§36).
+  ///
+  /// 계획과 답 두 자리가 같은 모양을 쓰므로 이름은 여기 하나다.
+  public static func notAttempted(
+    phase: TurnPhase,
+    purpose: String,
+    reason: String,
+    inputCharacters: Int,
+    latencyMilliseconds: Int
+  ) -> ModelInvocationReceipt {
+    ModelInvocationReceipt(
+      phase: phase,
+      purpose: purpose,
+      requestedBackend: .privateCloud,
+      resolvedBackend: .privateCloud,
+      pccAttempted: false,
+      pccCompleted: false,
+      onDeviceAttempted: false,
+      onDeviceCompleted: false,
+      fallbackReason: reason,
+      inputCharacters: inputCharacters,
+      latencyMilliseconds: latencyMilliseconds)
+  }
 }
 
 /// 이 차례의 처리가 **어디서** 일어났는가(§36).
@@ -112,8 +141,13 @@ public struct ModelUsageLog: Sendable, Equatable {
     receipts.append(receipt)
   }
 
-  public var pccAttempts: Int { receipts.filter(\.pccAttempted).count }
+  /// **실제로 나간** 물리 호출들. 부르기 전에 막힌 영수증은 호출이 아니다(§36).
+  private var attempted: [ModelInvocationReceipt] { receipts.filter(\.pccAttempted) }
+
+  public var pccAttempts: Int { attempted.count }
   public var pccCompletions: Int { receipts.filter(\.pccCompleted).count }
+  /// 그중 사용량을 **받은** 호출 수. `pccAttempts`와 다르면 총량은 알 수 없다.
+  public var measuredCalls: Int { attempted.filter { $0.inputTokens != nil }.count }
 
   /// 기기를 떠난 **읽기**는 이 값이 말하지 않는다 — 그것은 접근 영수증의 일이다
   /// (`ToolResultReducer.Reduced.leftDevice`). 이 값은 **모델이 어디서 돌았는가**만
@@ -141,18 +175,44 @@ public struct ModelUsageLog: Sendable, Equatable {
   /// 줄에서 기다린 시간의 합. 차례 지연에서 이 값을 빼면 모델이 쓴 시간이다.
   public var waitedMilliseconds: Int { receipts.reduce(0) { $0 + $1.waitedMilliseconds } }
 
-  /// 이 차례가 태운 **입력 토큰의 합**. 재지 못한 호출은 더하지 않는다.
-  public var inputTokens: Int { receipts.compactMap(\.inputTokens).reduce(0, +) }
+  /// 이 차례가 태운 **입력 토큰의 총량**.
+  ///
+  /// **하나라도 재지 못했으면 nil이다.** 부분 합을 총량이라 부르면 재시도가 많은
+  /// 차례가 실제보다 작게 잡히고, 그 값으로 뽑은 p50/p95는 축소 판단의 근거가
+  /// 되지 못한다 — 모르는 것은 모른다고 말한다. 부분 합이 필요하면 이름이
+  /// 그렇게 붙은 `measuredInputTokens`를 쓴다.
+  public var inputTokens: Int? { measuredEvery(\.inputTokens)?.reduce(0, +) }
   /// 한 호출이 태운 최대 입력 토큰. 합만 보면 "호출이 많았다"와 "한 호출이
   /// 컸다"를 구별할 수 없고, 문맥 창에 걸리는 것은 뒤쪽이다.
-  public var maximumInputTokens: Int { receipts.compactMap(\.inputTokens).max() ?? 0 }
-  public var cachedInputTokens: Int {
-    receipts.compactMap(\.cachedInputTokens).reduce(0, +)
+  public var maximumInputTokens: Int? { measuredEvery(\.inputTokens)?.max() }
+  public var cachedInputTokens: Int? {
+    measuredEvery(\.cachedInputTokens)?.reduce(0, +)
   }
-  /// 물리 호출 전체가 실은 글자 수의 합. 예산은 글자로 재고(호출 전) 비용은
-  /// 토큰으로 잰다(호출 후) — 두 값을 한 칸에 접지 않는다.
-  public var inputCharacters: Int { receipts.reduce(0) { $0 + $1.inputCharacters } }
-  public var maximumInputCharacters: Int { receipts.map(\.inputCharacters).max() ?? 0 }
+  /// **잰 호출만의** 합. 부분 값이라는 사실이 이름에 있다.
+  public var measuredInputTokens: Int { attempted.compactMap(\.inputTokens).reduce(0, +) }
+
+  /// 나간 호출 **전부**가 이 값을 들고 있을 때만 목록을 돌려준다.
+  private func measuredEvery(
+    _ key: KeyPath<ModelInvocationReceipt, Int?>
+  ) -> [Int]? {
+    let calls = attempted
+    guard !calls.isEmpty else { return nil }
+    var values: [Int] = []
+    values.reserveCapacity(calls.count)
+    for call in calls {
+      guard let value = call[keyPath: key] else { return nil }
+      values.append(value)
+    }
+    return values
+  }
+
+  /// 물리 호출이 실은 글자 수의 합. 예산은 글자로 재고(호출 전) 비용은 토큰으로
+  /// 잰다(호출 후) — 두 값을 한 칸에 접지 않는다.
+  ///
+  /// **조립한 문맥의 크기가 아니다.** 부르기 전에 막힌 차례도 문맥을 조립했고 그
+  /// 크기가 영수증에 남지만, 그 글자는 기기를 떠나지 않았다.
+  public var inputCharacters: Int { attempted.reduce(0) { $0 + $1.inputCharacters } }
+  public var maximumInputCharacters: Int { attempted.map(\.inputCharacters).max() ?? 0 }
 
   /// 단계별 한 줄씩 남긴다. 개인 데이터는 담지 않는다.
   public func emit() {

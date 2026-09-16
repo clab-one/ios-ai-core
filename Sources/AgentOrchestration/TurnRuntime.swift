@@ -1663,12 +1663,16 @@ public final class TurnRuntime {
     state.telemetry.toolCount = state.ledger.attempts.count
     state.telemetry.materialCount = state.evidence.evidence.count
     // **물리 호출을 센다.** 재시도도 문맥을 태웠으므로 요청 하나로 접지 않는다.
+    // 토큰 총량은 그 호출 전부를 재지 못하면 nil이고, 그 사실을 `tokenMeasuredCalls`
+    // 가 말한다 — 부분 합을 총량으로 적지 않는다.
     state.telemetry.pccCalls = state.usage.pccAttempts
+    state.telemetry.tokenMeasuredCalls = state.usage.measuredCalls
     state.telemetry.inputCharacters = state.usage.inputCharacters
     state.telemetry.maximumInputCharacters = state.usage.maximumInputCharacters
     state.telemetry.inputTokens = state.usage.inputTokens
     state.telemetry.maximumInputTokens = state.usage.maximumInputTokens
     state.telemetry.cachedInputTokens = state.usage.cachedInputTokens
+    state.telemetry.measuredInputTokens = state.usage.measuredInputTokens
     state.telemetry.processingLocation = state.usage.location
     // 기다린 시간은 **영수증에서 계산한다** — 따로 들면 두 값이 갈라진다. 값
     // 뽑기는 영수증을 남기지 않는 목적이라 차례 누적을 여기서 더한다.
