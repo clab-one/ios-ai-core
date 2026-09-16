@@ -47,6 +47,15 @@ public struct AgentRuntimeConfiguration: Sendable {
   /// 끝난(또는 진행 중인) 차례 하나.
   public var onResult: @MainActor @Sendable (ConversationTurnResult) -> Void
 
+  /// 계획의 자리. `nil`이면 **PCC**다.
+  ///
+  /// 이 문이 있는 이유는 시뮬레이터다. PCC도 기기 모델도 없는 환경에서 조립이
+  /// 도는지 확인할 방법이 필요하고, 그 확인은 **모델 없이** 되어야 한다 —
+  /// 확인할 수 없는 규칙은 지켜지지 않는 규칙이다.
+  public var supervising: TurnSupervising?
+  /// 답의 자리. `nil`이면 PCC다.
+  public var finalizing: TurnFinalizing?
+
   public init(
     host: AgentHostIdentity,
     tools: [any CapabilityHandler] = [],
@@ -56,6 +65,8 @@ public struct AgentRuntimeConfiguration: Sendable {
     turnRuns: (any TurnRunStore)? = nil,
     actionLedger: (any ActionLedger)? = nil,
     currentAccountID: @escaping @Sendable () -> String?,
+    supervising: TurnSupervising? = nil,
+    finalizing: TurnFinalizing? = nil,
     onEvent: @escaping @MainActor @Sendable (TurnEventEnvelope) -> Void = { _ in },
     onResult: @escaping @MainActor @Sendable (ConversationTurnResult) -> Void
   ) {
@@ -67,6 +78,8 @@ public struct AgentRuntimeConfiguration: Sendable {
     self.turnRuns = turnRuns
     self.actionLedger = actionLedger
     self.currentAccountID = currentAccountID
+    self.supervising = supervising
+    self.finalizing = finalizing
     self.onEvent = onEvent
     self.onResult = onResult
   }
@@ -96,9 +109,20 @@ public final class AgentRuntime {
   /// PCC가 오케스트레이터이므로, PCC를 쓸 수 없는 기기·계정·서명에서는 **기능이
   /// 없다고 말해야 한다.** 기기 모델로 몰래 내려서지 않는다 — 계획과 답의 품질이
   /// 사용자 모르게 갈리는 것이 그 길이다.
-  public static var isSupported: Bool {
+  ///
+  /// **신원을 명시로 받는 쪽이 기본이다.** 전역 신원을 읽는 `isSupported`는
+  /// `boot` 전에는 설정되지 않은 값을 보고 거짓을 말한다 — 화면이 기동 전에
+  /// 지원 여부를 그리는 흔한 순서에서 그 거짓이 그대로 보인다(실기 확인
+  /// 2026-09-16: `entitled=false`가 그 순서였다).
+  public static func isSupported(for identity: AgentHostIdentity) -> Bool {
     guard #available(iOS 27.0, *) else { return false }
-    return PrivateCloudComputeAccess.isUsable()
+    guard identity.isPrivateCloudComputeEntitled else { return false }
+    return PrivateCloudComputeAccess.isDeviceEligible()
+  }
+
+  /// 설정된 신원 기준. `AgentHost.configure` 뒤에만 뜻이 있다.
+  public static var isSupported: Bool {
+    isSupported(for: AgentHost.identity)
   }
 
   /// 설정 하나로 기동한다.
@@ -137,6 +161,8 @@ public final class AgentRuntime {
       emit: { onEvent($0) },
       present: { onResult($0) },
       copy: configuration.copy,
+      supervising: configuration.supervising,
+      finalizing: configuration.finalizing,
       turnRuns: configuration.turnRuns)
   }
 

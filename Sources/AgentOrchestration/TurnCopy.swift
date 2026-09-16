@@ -45,6 +45,11 @@ public struct TurnCopy: Sendable {
     if reason.hasSuffix("sendOutcomeUnknown") {
       return resolve(Key.progressReconciling)
     }
+    // **미지원은 실패가 아니다.** 이 기기·계정으로는 에이전트를 열 수 없다는
+    // 환경의 사실이고, "하지 못했어요"는 다시 눌러 보라는 말로 읽힌다.
+    if reason == ModelFailureClassifier.unsupportedReason {
+      return resolve(Key.answerUnsupported)
+    }
     if reason.hasPrefix("notAuthorized") || reason == "noCapability" {
       return resolve(Key.answerNotConnected)
     }
@@ -67,16 +72,23 @@ public struct TurnCopy: Sendable {
     public static let answerDone = "conversation.answer.done"
     public static let answerNotConnected = "conversation.answer.notConnected"
     public static let answerFailed = "conversation.answer.failed"
+    /// 이 기기·계정으로는 에이전트를 열 수 없다. **실패가 아니라 환경의 사실**이다.
+    public static let answerUnsupported = "conversation.answer.unsupported"
     public static let progressCancelled = "thread.progress.cancelled"
     public static let progressReconciling = "thread.progress.reconciling"
     public static let progressPartial = "thread.progress.partial"
     public static let needsOther = "conversation.needs.other"
 
     /// 인자 이름 → 되물음 열쇠.
+    ///
+    /// 계약이 요구하는 **사용자만 줄 수 있는 자리**는 모두 여기 있어야 한다.
+    /// 빠진 이름은 `needsOther`로 떨어지고, 화면은 "값이 하나 더 필요해요"라는
+    /// 쓸모없는 문장을 세운다(실기 2026-09-16: PCC가 `url`을 물었고 그 문장이 났다).
     public static let needs: [String: String] = [
       "to": "conversation.needs.recipient",
       "recipient": "conversation.needs.recipient",
       "body": "conversation.needs.body",
+      "text": "conversation.needs.body",
       "itemID": "conversation.needs.item",
       "start": "conversation.needs.time",
       "due": "conversation.needs.time",
@@ -85,6 +97,8 @@ public struct TurnCopy: Sendable {
       "channelID": "conversation.needs.channel",
       "messageID": "conversation.needs.message",
       "eventID": "conversation.needs.event",
+      "url": "conversation.needs.url",
+      "name": "conversation.needs.person",
     ]
 
     /// 코어가 부르는 열쇠 전부.
@@ -92,6 +106,7 @@ public struct TurnCopy: Sendable {
       Set(
         [
           answerFound, answerNone, answerDone, answerNotConnected, answerFailed,
+          answerUnsupported,
           progressCancelled, progressReconciling, progressPartial, needsOther,
         ] + needs.values)
     }

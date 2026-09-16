@@ -34,6 +34,22 @@ public enum PrivateCloudComputeAccess {
   /// 설정하지 않은 호스트는 **거짓**이다. PCC를 부르지 않는 쪽이 죽지 않는 쪽이다.
   public static var isEntitled: Bool { AgentHost.identity.isPrivateCloudComputeEntitled }
 
+  /// 이 기기·계정이 PCC를 받을 수 있는가. **권한은 묻지 않는다.**
+  ///
+  /// 권한과 가용성을 나눠 두는 이유는 진단이다. 하나로 접으면 "서명에 권한이
+  /// 없다"와 "이 기기에서 Apple Intelligence가 준비되지 않았다"가 같은 거짓으로
+  /// 보이고, 호스트는 사용자에게 무엇을 고치라고 말할지 알 수 없다
+  /// (실기 2026-09-16: iPad는 `modelNotReady`였고 언어 설정이 원인이었다).
+  @available(iOS 27.0, *)
+  public static func isDeviceEligible() -> Bool {
+    let cloud = PrivateCloudComputeLanguageModel()
+    guard cloud.isAvailable else {
+      log.info("pcc skipped reason=unavailable")
+      return false
+    }
+    return true
+  }
+
   /// 지금 이 차례에 PCC를 쓸 수 있는가. **권한이 먼저, 가용성이 다음이다.**
   @available(iOS 27.0, *)
   public static func isUsable() -> Bool {
@@ -41,11 +57,6 @@ public enum PrivateCloudComputeAccess {
       log.info("pcc skipped reason=entitlement")
       return false
     }
-    let cloud = PrivateCloudComputeLanguageModel()
-    guard cloud.isAvailable else {
-      log.info("pcc skipped reason=unavailable")
-      return false
-    }
-    return true
+    return isDeviceEligible()
   }
 }

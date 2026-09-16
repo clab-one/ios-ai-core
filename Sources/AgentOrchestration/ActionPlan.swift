@@ -24,7 +24,10 @@ public struct GeneratedTurnDecision {
       "continue when more capabilities must run, complete when the evidence already answers the request",
     .anyOf(["continue", "complete"]))
   public let status: String
-  @Guide(description: "capability names to run, in order", .maximumCount(4))
+  @Guide(
+    description:
+      "every capability to run, in order, including the final send or create step",
+    .maximumCount(5))
   public let steps: [GeneratedActionStep]
   @Guide(
     description:
@@ -203,7 +206,14 @@ public enum ActionPlanValidator {
       // 이름으로 보내라는 요청은 **연락처 조회를 먼저 세운다.** 모델이 주소를
       // 지어낼 수 있는 자리가 바로 여기고, 조회를 한 단계로 세우면 그 조회의
       // 실패가 화면에 보인다("그 이름으로 한 사람을 찾지 못했어요").
+      //
+      // **이미 조회가 계획에 있으면 끼워 넣지 않는다.** 두 번 서면 뒤엣것이
+      // 조사 붙은 이름(`"지민에게"`)으로 실패하고, `.to` 해석은 같은 능력의
+      // 마지막 시도를 보므로 앞의 성공이 무효가 된다 — 그래서 전송이 인자를
+      // 못 채우고 죽었다(실기 2026-09-16 시나리오 2).
+      let alreadyResolving = steps.contains { $0.capability == .peopleResolve }
       if Self.needsContactResolution(capability, target: target),
+        !alreadyResolving,
         allowedSet.contains(CapabilityID.peopleResolve.rawValue)
       {
         steps.append(
@@ -266,7 +276,11 @@ public enum ActionPlanValidator {
     case .memorySave:
       if !text.isEmpty { arguments["text"] = .text(text) }
     case .memoryRead, .artifactRead, .contentRead, .contentSummarize, .recordingRead:
+      // 식별자는 `target`이 정석이지만 모델은 파일 이름·기록 제목을 `text`에
+      // 담기도 한다. 둘 다 받는다 — 받지 않으면 계약이 `itemID` 없음으로 거절하고,
+      // 화면은 "어느 기록을 말하는 걸까요?"를 띄운다(실기 2026-09-16 PDF·MD 시나리오).
       if !target.isEmpty { arguments["itemID"] = .text(target) }
+      else if !text.isEmpty { arguments["itemID"] = .text(text) }
     case .calendarSearch:
       if let when {
         let start = calendar.startOfDay(for: when)
@@ -309,12 +323,31 @@ public enum ActionPlanValidator {
       if !text.isEmpty { arguments["text"] = .text(text) }
     case .sharePublish, .shareRevoke:
       if !target.isEmpty { arguments["itemID"] = .text(target) }
-    case .contentIngest:
-      if !text.isEmpty { arguments["url"] = .text(text) }
+    case .webRead, .webFetch, .contentIngest:
+      // **주소는 문장에서 온다.** 이 자리가 없던 동안 `web.read`는 `default`로
+      // 떨어져 URL이 `query`가 됐고, 계약은 `url` 없음으로 거절했다
+      // (실기 2026-09-16: 툴이 하나도 돌지 않고 주소를 되물었다).
+      if let url = Self.httpURL(target) ?? Self.httpURL(text) {
+        arguments["url"] = .text(url)
+      }
+    case .webSearch:
+      if !text.isEmpty { arguments["query"] = .text(text) }
     default:
       if !text.isEmpty { arguments["query"] = .text(text) }
     }
     return arguments
+  }
+
+  /// 문자열 하나에서 **명시된 http(s) 주소**만 꺼낸다.
+  ///
+  /// 모델은 주소를 문장에 섞어 담는다(`"이 페이지 https://… 요약"`). 도메인 언급을
+  /// 주소로 승격하지 않는 것이 요점이다 — `apple.com`을 말한 문장이 페이지 읽기로
+  /// 바뀌면 사용자가 요청하지 않은 네트워크 호출이 된다(`LinkText.firstExplicitURL`).
+  private static func httpURL(_ raw: String) -> String? {
+    guard !raw.isEmpty, let url = LinkText.firstExplicitURL(in: raw),
+      url.scheme == "http" || url.scheme == "https"
+    else { return nil }
+    return url.absoluteString
   }
 
   /// 모델이 낸 시각 문자열 하나.

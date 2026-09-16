@@ -205,21 +205,18 @@ public enum TurnInstructions {
       // 이 단계들은 모델을 부르지 않는다. 값을 요구받으면 공통 경계를 돌려준다.
       return common
     case .planning:
+      // **오케스트레이터가 하는 일은 하나다: 툴을 고르고 순서를 세운다.**
+      //
+      // 규칙을 여기 더 적지 않는다. 인자 검사는 계약이(`CapabilityContract`),
+      // 중복은 호출의 지문이(`ActionFingerprint`), 쓰기는 승인이, 완료는 수령증이
+      // 정한다 — 지시로 옮긴 규칙은 **매 호출에 돈을 내면서도 지켜질지 모른다**
+      // (실측 2026-09-16: `<<<completed>>>`를 받고도 모델은 없던 전송을 말했다).
       return common + """
 
-        List every capability the request needs, in order, using only names from \
-        <<<tools>>>. Read before writing. When a later step needs a value an \
-        earlier step produces, leave that value out: it is filled from the \
-        receipt, and a value you write there would be invented.
-
-        **Ask before planning a write.** When the request is missing a value only \
-        the user can give - who to send it to, which item, when - return an empty \
-        step list and name that value in `needs`. Never plan a send, reply, or \
-        create with a guessed recipient, identifier, or time.
-
-        <<<request>>> is the current message and it wins over <<<recent>>>: when \
-        it corrects an earlier time, name, or topic, plan for the corrected one \
-        and drop the wrong value.
+        List the capabilities to run, in order, using only names from <<<tools>>>. \
+        Read before writing. Leave out any value an earlier step produces: it is \
+        filled from that step's receipt. Name a value only the user can give in \
+        `needs`.
         """
     case .reviewing:
       // 재계획은 없앴다(PCC는 차례당 계획 1회). 이 단계가 값을 요구받으면 공통
@@ -263,8 +260,8 @@ public enum TurnInstructions {
 
         Answer the request itself. For a question, the first sentence states the \
         answer - the actual name, date, number, or fact. A title or a description \
-        of the source is not an answer. When work was performed, say what was \
-        done using the values in the receipt, not the values you asked for.
+        of the source is not an answer. When work was performed, state the values \
+        from the receipt, not the values you asked for.
 
         Answer the message in <<<request>>>, never an earlier one. Write as a \
         person speaks, in the language of the request, and never mention data, \

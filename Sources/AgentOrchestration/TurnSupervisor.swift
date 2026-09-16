@@ -9,6 +9,16 @@ public struct SupervisorRequest: Sendable {
   public let profile: DynamicTurnProfile
   public let conversationID: String?
   public let accountID: String
+
+  public init(
+    context: CompiledConversationContext, profile: DynamicTurnProfile,
+    conversationID: String?, accountID: String
+  ) {
+    self.context = context
+    self.profile = profile
+    self.conversationID = conversationID
+    self.accountID = accountID
+  }
 }
 
 /// 감독자 한 번의 결과. **모델 가용성에 묶이지 않은 값**이다.
@@ -29,6 +39,11 @@ public typealias TurnSupervising = @MainActor (SupervisorRequest) async -> Super
 public struct FinalizationStep: Sendable {
   public let answer: FinalAnswer
   public let receipt: ModelInvocationReceipt
+
+  public init(answer: FinalAnswer, receipt: ModelInvocationReceipt) {
+    self.answer = answer
+    self.receipt = receipt
+  }
 }
 
 /// 답을 쓰는 자리를 대신 세우는 문.
@@ -118,6 +133,12 @@ public struct TurnSupervisor: Sendable {
           )
           continue
         }
+        // **미지원은 시도가 아니다.** PCC를 부르기 전에 막힌 실패는 부른 적이
+        // 없으므로 영수증도 그렇게 적는다(§36).
+        if reason == ModelFailureClassifier.unsupportedReason {
+          return .failure(
+            Self.unsupported(profile: profile, context: context, started: started))
+        }
         Self.log.error(
           "supervisor failed phase=\(profile.phase.rawValue, privacy: .public) reason=\(reason, privacy: .public)"
         )
@@ -150,6 +171,10 @@ public struct TurnSupervisor: Sendable {
   }
 
   /// 이 기기에서는 에이전트를 열 수 없다. **기기 모델이 계획을 대신 쓰지 않는다.**
+  ///
+  /// 영수증에 `pccAttempted`를 적지 않는다 — 부르기 전에 막은 것은 시도가 아니고,
+  /// 시도로 적으면 처리 위치가 `pccAttemptedButFallbackLocal`이 되어 화면이
+  /// "클라우드에 보냈다가 기기로 돌아왔다"는 **거짓**을 말한다(§36).
   private static func unsupported(
     profile: DynamicTurnProfile, context: CompiledConversationContext, started: Date
   ) -> Failure {
@@ -157,10 +182,19 @@ public struct TurnSupervisor: Sendable {
     return Failure(
       disposition: .surfaceFailure,
       reason: ModelFailureClassifier.unsupportedReason,
-      receipt: receipt(
-        profile: profile, completed: false,
-        fallbackReason: ModelFailureClassifier.unsupportedReason, context: context,
-        started: started))
+      receipt: ModelInvocationReceipt(
+        phase: profile.phase,
+        purpose: AdmissionJob.conversationPlan.rawValue,
+        requestedBackend: .privateCloud,
+        resolvedBackend: .privateCloud,
+        pccAttempted: false,
+        pccCompleted: false,
+        onDeviceAttempted: false,
+        onDeviceCompleted: false,
+        fallbackReason: ModelFailureClassifier.unsupportedReason,
+        inputCharacters: context.estimatedCharacters,
+        latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1_000),
+        waitedMilliseconds: 0))
   }
 
   private static func receipt(

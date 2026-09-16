@@ -93,7 +93,11 @@ public struct CapabilityID: Hashable, Sendable, Codable, CustomStringConvertible
     switch self {
     case .memorySearch, .memoryRead, .contentRead, .recordingRead, .artifactFind, .artifactRead,
       .calendarSearch, .remindersSearch, .peopleResolve, .contactsRead,
-      .mailSearch, .mailRead, .chatSearch, .chatRead, .webSearch, .webRead:
+      .mailSearch, .mailRead, .chatSearch, .chatRead, .webSearch, .webRead,
+      // 요약은 **부작용이 없다.** 분류가 없던 동안 `.interactive`로 떨어져,
+      // "약속한 쓰기"로 세어지고 완료 집합에는 들지 못해 모든 요약 차례가
+      // `partial`로 닫혔다(실기 2026-09-16 `unkept:text.summarize`).
+      .textSummarize:
       return .readOnly
     case .memorySave, .contentIngest, .contentSummarize, .webFetch,
       .calendarCreate, .calendarUpdate, .calendarDelete,

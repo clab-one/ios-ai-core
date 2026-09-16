@@ -168,6 +168,11 @@ public final class TurnRuntime {
     public var scope: CapabilityScope
     /// 이 되돌이가 실행할 남은 단계.
     public var steps: [PlannedStep] = []
+    /// 계획이 약속한 **부작용**. 수령증이 없으면 그 차례는 끝난 것이 아니다.
+    ///
+    /// 이 값이 없던 동안, 모델이 `mail.send`를 계획에서 빼먹고도 답에
+    /// `"보냈습니다"`를 썼다(실기 2026-09-16). 완료 표시는 수령증에서만 나온다.
+    public var plannedWrites: Set<CapabilityID> = []
     public var pendingApprovalID: UUID?
     /// 조사 전 알려진 누락값. 성공한 관찰이 없으면 조회 실패가 질문을 덮지 않는다.
     public var investigationNeeds: String?
@@ -433,6 +438,12 @@ public final class TurnRuntime {
       case .work(let steps):
         state.steps = steps
         state.stepOrigin = .modelPlan
+        // 완료 집합과 **같은 술어**로 센다. 한쪽만 넓으면 부작용이 아닌 단계가
+        // 영원히 미이행으로 남는다(실기 2026-09-16: 요약이 그렇게 걸렸다).
+        state.plannedWrites = Set(
+          steps.map(\.capability).filter {
+            $0.executionClass == .localWrite || $0.executionClass == .remoteWrite
+          })
       case .complete:
         return await finalizeAndPresent(state)
       case .needsUser(let key):
@@ -1337,6 +1348,17 @@ public final class TurnRuntime {
       // 오류 화면이 된다(사용자 지시 2026-09-15: siri처럼 주고받아야 한다).
       await converse(state)
       return
+    }
+    // **약속한 부작용이 일어났는가.** 계획이 전송·생성을 담았는데 수령증이 없으면
+    // 그 차례는 완료가 아니다 — 이 검사가 없던 동안 모델이 계획에서 전송을
+    // 빼먹고도 답에 "보냈습니다"를 썼다(실기 2026-09-16).
+    let unkept = state.plannedWrites.subtracting(state.ledger.completedWrites)
+    if !unkept.isEmpty {
+      state.incomplete = true
+      if state.telemetry.fallbackReason.isEmpty {
+        state.telemetry.fallbackReason =
+          "unkept:\(unkept.map(\.rawValue).sorted().joined(separator: "+"))"
+      }
     }
     emit(.finalizing, state)
 
