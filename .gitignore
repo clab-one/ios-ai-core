@@ -1,0 +1,11 @@
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+Package.resolved
+
+# Local tool indexes — derived, never source.
+.zvec-grep/
+.codegraph/
