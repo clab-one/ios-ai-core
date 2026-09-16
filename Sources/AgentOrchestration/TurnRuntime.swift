@@ -1314,14 +1314,35 @@ public final class TurnRuntime {
         return scheme == "http" || scheme == "https"
       }
     guard var choice = ranked.first else { return nil }
+    // **후보 집합을 남긴다.** 고른 줄만 보면 "잘못 골랐다"와 "고를 것이 없었다"를
+    // 가를 수 없다 — 질의가 모호해 애플 페이지가 후보에 아예 없던 차례를
+    // 선택기의 실패로 읽게 된다(실기 2026-09-17 P02).
+    Self.log.info(
+      """
+      web.read candidates=\(ranked.count, privacy: .public) \
+      scores=\(ranked.prefix(5).map(\.score).map(String.init).joined(separator: ","), privacy: .public) \
+      hosts=\(ranked.prefix(5).compactMap { URL(string: $0.url)?.host }.joined(separator: ","), privacy: .public) \
+      ambiguous=\(SearchCandidateSelector.isAmbiguous(ranked, informed: !context.isEmpty), privacy: .public)
+      """)
     // 점수가 갈렸으면 기기 모델을 부르지 않는다 — 비용만 늘린다. 갈리지 않은
-    // 경우(0점·동점)는 흔하다: 한국어 문장과 영문 제목은 낱말이 맞지 않는다.
-    if SearchCandidateSelector.isAmbiguous(ranked),
-      let picked = await SearchCandidateChoice().pick(
+    // 경우는 흔하다: 0점(한국어 문장 대 영문 제목), 동점, 그리고 **사적 맥락이
+    // 하나도 맞지 않은 1위**(질의의 약어만 맞은 줄).
+    if SearchCandidateSelector.isAmbiguous(ranked, informed: !context.isEmpty) {
+      switch await SearchCandidateChoice().pick(
         from: ranked, query: state.input, context: context)
-    {
-      choice = picked
-      state.telemetry.localSelections += 1
+      {
+      case .picked(let picked):
+        choice = picked
+        state.telemetry.localSelections += 1
+      case .none:
+        // **고를 것이 없다고 답했다.** 읽지 않는다 — 사용자가 묻지 않은 페이지를
+        // "최신 웹 내용"으로 말하는 것보다 웹에서 찾지 못했다고 말하는 것이 맞다.
+        state.telemetry.localSelections += 1
+        Self.log.info("web.read declined reason=noRelevantCandidate")
+        return nil
+      case .unavailable:
+        break
+      }
     }
     guard
       case .success(let arguments) = CapabilityContract.normalize(

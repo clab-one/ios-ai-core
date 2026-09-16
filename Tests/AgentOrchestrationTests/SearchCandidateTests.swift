@@ -47,6 +47,39 @@ final class SearchCandidateTests: XCTestCase {
       "사적 맥락이 후보를 고르지 못했다")
   }
 
+  /// **약어만 맞은 1위는 고른 것이 아니다.**
+  ///
+  /// 실기 P02가 받은 후보 집합이다(2026-09-17): `"PCC"` 다섯 줄이 식료품
+  /// 협동조합·교구청·문화원이었고 애플 페이지는 하나도 없었다. 어떤 랭킹도 없는
+  /// 것을 고를 수는 없으므로, 이 상태는 **고르지 못했다**로 읽혀야 한다.
+  func testAcronymOnlyWinnerCountsAsUndecided() {
+    let rows = [
+      CapabilitySourceRow(
+        title: "PCC Weekly Specials | PCC Community Markets",
+        subtitle: "This week's deals at your co-op.",
+        identifier: "https://www.pccmarkets.com/departments/weekly-specials/"),
+      CapabilitySourceRow(
+        title: "Official Pointe Coupee Parish Government",
+        identifier: "https://www.pcparish.org/"),
+      CapabilitySourceRow(
+        title: "Philippine Cultural Center of Virginia",
+        identifier: "https://philippineculturalcenter.org/"),
+    ]
+    let memo =
+      "PCC 메모: 애플의 Private Cloud Compute는 서버 추론을 검증 가능하게 만든다."
+    let ranked = SearchCandidateSelector.rank(
+      rows, query: "내 기록의 PCC 메모와 최신 웹 내용 비교", context: [memo])
+
+    XCTAssertGreaterThan(ranked.first?.score ?? 0, 0, "약어가 맞아 점수 자체는 있다")
+    XCTAssertEqual(ranked.first?.contextScore, 0, "사적 맥락에서 온 점수가 있을 수 없다")
+    XCTAssertTrue(
+      SearchCandidateSelector.isAmbiguous(ranked, informed: true),
+      "약어만 맞은 1위를 고른 것으로 읽었다")
+    XCTAssertFalse(
+      SearchCandidateSelector.isAmbiguous(ranked),
+      "맥락을 넘기지 않았다면 그 판단의 근거도 없다")
+  }
+
   /// 아는 것이 없으면 **공급자 순서를 지킨다.** 점수가 같을 때 순서를 흔들면
   /// 공급자의 순위라는 정보를 버리고 그 자리에 아무 규칙도 놓지 않는 것이다.
   func testProviderOrderSurvivesEqualScores() {

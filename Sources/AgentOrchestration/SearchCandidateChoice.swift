@@ -4,10 +4,16 @@ import OSLog
 
 /// 기기 모델이 고른 후보 하나. **번호만** 받는다 — 글을 받으면 그 글이 어느
 /// 후보인지 다시 맞춰야 하고, 맞추지 못한 답은 조용히 1위로 떨어진다.
+///
+/// `0`이 있는 이유: 고를 것이 없는 후보 집합이 실제로 온다. `"PCC"`로 찾은 다섯
+/// 줄이 식료품 협동조합·교구청·문화원이었을 때(실기 2026-09-17 P02) 그중 하나를
+/// 읽으면 차례는 사용자가 묻지 않은 페이지를 "최신 웹 내용"으로 말한다.
 @available(iOS 26.0, *)
 @Generable
 struct ChosenSearchCandidate {
-  @Guide(description: "number of the one result that best answers the request")
+  @Guide(
+    description: "number of the one result that best answers the request, or 0 when none of them is about it"
+  )
   let choice: Int
 }
 
@@ -38,14 +44,22 @@ struct SearchCandidateChoice: Sendable {
     self.model = model
   }
 
-  /// 고른 후보. **못 고르면 nil이고, 그때 결정적 1위가 남는다** — 모델이 답하지
-  /// 못한 것을 실패로 만들지 않는다.
+  /// 고른 결과. **사유를 나눠 든다** — "고를 것이 없다"와 "묻지 못했다"는 다른
+  /// 사실이고, 둘을 nil 하나로 접으면 모델의 거절이 조용히 1위 읽기가 된다.
+  enum Choice: Sendable, Equatable {
+    case picked(SearchCandidateSelector.Candidate)
+    /// 후보 중에 이 요청에 답할 것이 없다. **읽지 않는다.**
+    case none
+    /// 기기 모델이 없거나 답하지 못했다. 결정적 1위가 남는다.
+    case unavailable
+  }
+
   func pick(
     from ranked: [SearchCandidateSelector.Candidate], query: String, context: [String]
-  ) async -> SearchCandidateSelector.Candidate? {
-    guard case .available = model.availability else { return nil }
+  ) async -> Choice {
+    guard case .available = model.availability else { return .unavailable }
     let candidates = Array(ranked.prefix(Self.considered))
-    guard candidates.count > 1 else { return nil }
+    guard candidates.count > 1 else { return .unavailable }
 
     let listing = candidates.enumerated()
       .map { index, candidate in
@@ -84,19 +98,22 @@ struct SearchCandidateChoice: Sendable {
           options: GenerationOptions(sampling: .greedy, maximumResponseTokens: 16))
       }
       let choice = response.content.choice
-      guard choice >= 1, choice <= candidates.count else {
-        Self.log.info("candidate selection out of range=\(choice, privacy: .public)")
-        return nil
-      }
+      let latency = Int(Date().timeIntervalSince(started) * 1_000)
       Self.log.info(
         """
         candidate selection choice=\(choice, privacy: .public)/\(candidates.count, privacy: .public) \
-        ms=\(Int(Date().timeIntervalSince(started) * 1_000), privacy: .public)
+        ms=\(latency, privacy: .public)
         """)
-      return candidates[choice - 1]
+      // **0은 답이다.** 고를 것이 없다고 말한 것이므로 1위로 떨어지지 않는다.
+      if choice == 0 { return Choice.none }
+      guard choice >= 1, choice <= candidates.count else {
+        // 범위 밖은 답이 아니다. 묻지 못한 것으로 본다.
+        return .unavailable
+      }
+      return .picked(candidates[choice - 1])
     } catch {
       Self.log.info("candidate selection unavailable")
-      return nil
+      return .unavailable
     }
   }
 }

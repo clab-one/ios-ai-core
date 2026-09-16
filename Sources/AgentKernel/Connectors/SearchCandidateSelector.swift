@@ -23,6 +23,15 @@ public enum SearchCandidateSelector {
   public struct Candidate: Sendable, Equatable {
     public let row: CapabilitySourceRow
     public let score: Int
+    /// 그중 **사적 맥락에서 온 점수.**
+    ///
+    /// 이 값을 따로 드는 이유는 약어다. `"PCC"`는 애플의 낱말이 아니고
+    /// (`PCC Community Markets`·`Pointe Coupée Parish`), 질의에 그 세 글자가 있으면
+    /// 어느 후보나 점수를 받는다. 내 기록의 낱말(`Private Cloud Compute`)이 하나도
+    /// 맞지 않았다면 그 후보는 **질의의 약어만 맞은 것**이고, 그때 1위라는 사실은
+    /// 아무것도 말하지 않는다(실기 2026-09-17 P02: 후보 다섯 줄에 애플 페이지가
+    /// 하나도 없었다).
+    public let contextScore: Int
 
     public var url: String { row.identifier }
   }
@@ -54,7 +63,8 @@ public enum SearchCandidateSelector {
   public static func rank(
     _ rows: [CapabilitySourceRow], query: String, context: [String] = []
   ) -> [Candidate] {
-    let wanted = terms(query).union(context.flatMap { terms($0) })
+    let asked = terms(query)
+    let known = Set(context.flatMap { terms($0) }).subtracting(asked)
     var bestByHost: [String: Candidate] = [:]
     var order: [String] = []
 
@@ -62,7 +72,9 @@ public enum SearchCandidateSelector {
       guard let url = URL(string: row.identifier), let host = url.host?.lowercased(),
         !isUnreadable(url)
       else { continue }
-      let candidate = Candidate(row: row, score: score(row, terms: wanted))
+      let fromContext = score(row, terms: known)
+      let candidate = Candidate(
+        row: row, score: score(row, terms: asked) + fromContext, contextScore: fromContext)
       // 한 사이트가 다섯 줄을 차지하면 다른 후보를 볼 기회가 없어진다. 그 사이트의
       // **가장 잘 맞는 줄** 하나만 남긴다.
       if let existing = bestByHost[host] {
@@ -85,12 +97,22 @@ public enum SearchCandidateSelector {
 
   /// 결정적 점수로 **고르지 못했는가.**
   ///
-  /// 둘이다: 아무 낱말도 맞지 않았거나(0점), 1위와 2위가 같은 점수다. 그때 기기
-  /// 모델에게 묻는 것이 값어치가 있다 — 점수가 갈렸으면 모델을 부르는 것은 비용만
-  /// 늘린다.
-  public static func isAmbiguous(_ ranked: [Candidate]) -> Bool {
+  /// 셋이다:
+  ///
+  /// 1. 아무 낱말도 맞지 않았다(0점).
+  /// 2. 1위와 2위가 같은 점수다.
+  /// 3. 사적 맥락이 있었는데 1위가 그 맥락에서 점수를 하나도 받지 못했다. 그 1위는
+  ///    **질의의 약어만 맞은 줄**이다 — `"PCC"`로 찾은 식료품 협동조합의 특가
+  ///    페이지가 그것이다(실기 2026-09-17 P02).
+  ///
+  /// 그때 기기 모델에게 묻는 것이 값어치가 있다. 점수가 갈렸으면 모델을 부르는
+  /// 것은 비용만 늘린다.
+  ///
+  /// - Parameter informed: 사적 맥락을 넘겨 점수를 냈는가.
+  public static func isAmbiguous(_ ranked: [Candidate], informed: Bool = false) -> Bool {
     guard let first = ranked.first else { return false }
     if first.score == 0 { return true }
+    if informed, first.contextScore == 0 { return true }
     guard let second = ranked.dropFirst().first else { return false }
     return first.score == second.score
   }
@@ -114,9 +136,23 @@ public enum SearchCandidateSelector {
 
   private static func weight(_ term: String, in candidate: Set<String>) -> Int {
     if candidate.contains(term) { return exactBonus }
-    // 조사·복합어. `"애플"`은 `"애플이"` 안에 있고 `"compute"`는 `"computing"` 안에 있다.
-    if candidate.contains(where: { $0.contains(term) || term.contains($0) }) { return 1 }
+    if candidate.contains(where: { overlaps(term, $0) }) { return 1 }
     return 0
+  }
+
+  /// 한쪽이 다른 쪽 안에 있는가. 조사와 복합어를 위한 비교다 — `"애플"`은
+  /// `"애플이"` 안에 있고 `"compute"`는 `"computing"` 안에 있다.
+  ///
+  /// 짧은 라틴 낱말은 이 비교에서 뺀다. `co-op`의 `co`가 `compute`에 들어맞고
+  /// (시험 실측) 그 한 글자 겹침이 "내 기록과 관련 있다"는 신호로 세어졌다 —
+  /// 두 글자 영문은 기능어이고, 그 기능어는 아무 후보에나 있다. 정확히 맞는
+  /// 낱말은 길이와 무관하게 위에서 이미 세어진다.
+  static func overlaps(_ term: String, _ candidate: String) -> Bool {
+    let shorter = term.count <= candidate.count ? term : candidate
+    let longer = term.count <= candidate.count ? candidate : term
+    guard longer.contains(shorter) else { return false }
+    // 한글 두 글자는 낱말이다(`애플`·`검증`). 라틴 두세 글자는 아니다.
+    return shorter.allSatisfy(\.isASCII) ? shorter.count >= 4 : shorter.count >= 2
   }
 
   /// 글을 낱말로. 영문은 소문자로, 한국어는 붙어 오는 조사를 떼지 않는다 —
