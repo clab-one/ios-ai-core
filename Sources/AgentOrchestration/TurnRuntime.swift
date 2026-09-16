@@ -1045,8 +1045,19 @@ public final class TurnRuntime {
     let receipts = ledger.receipts
     guard let receipt = receipts.last(where: { $0.capability == observation.capability }) else { return nil }
     let rows = CapabilitySourceRow.rows(in: receipt.details)
-    // Thread reads contain root+replies of one already selected thread, not alternative targets.
-    guard rows.count <= 1 || receipt.capability == .chatRead else { return nil }
+    // 후보가 여럿인 수령증에서 대상을 **고르지 않는다** — 잘못 고른 대상에 일어난
+    // 일은 되돌릴 수 없다. 두 예외가 있고, 둘 다 "여러 줄이 여러 대상이 아니다":
+    //
+    // - `chat.read`: 이미 고른 한 스레드의 뿌리와 답글이다.
+    // - `web.search`: 같은 질문에 대한 서로 다른 출처이고 **순위가 곧 판단**이다.
+    //   고르는 일은 기기에서 끝난다(§14) — 결과 목록을 PCC에 보여 주고 "무엇을
+    //   열까"를 되묻지 않는다. 그리고 읽기는 부작용이 없다(`readOnly`).
+    //
+    // 이 예외가 없던 동안 `web.search → web.read`는 **한 번도 이어지지 않았다**:
+    // 결과가 둘 이상이면 이 자리가 nil을 내고 차례는 주소를 되물었다.
+    guard rows.count <= 1 || receipt.capability == .chatRead
+      || receipt.capability == .webSearch
+    else { return nil }
     if receipt.capability == .mailSearch || receipt.capability == .chatSearch {
       let bindings = Set(receipts.filter { $0.capability == receipt.capability }.flatMap { $0.sources.map { $0.binding } })
       guard bindings.count <= 1 else { return nil }

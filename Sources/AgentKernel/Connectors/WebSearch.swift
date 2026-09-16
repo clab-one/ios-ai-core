@@ -1,67 +1,11 @@
 import Foundation
 
-/// 웹 검색 공급자 설정. **공급자 이름이 능력에 들어가지 않는다** —
-/// `web.search`는 "웹에서 찾는다"의 이름이고, 어느 서비스로 찾는지는 설정이 정한다.
-///
-/// 값이 없으면 그 능력은 **등록되지 않는다**(연결 안 된 서비스와 같은 취급).
-/// 키를 코드에 넣지 않는 이유는 연결 설정과 같다 — 저장소에 적힌 비밀은 비밀이 아니다.
-public struct WebSearchConfiguration: Sendable {
-  public let endpoint: URL
-  /// 질의를 실을 쿼리 인자 이름(`q`·`query`).
-  public let queryParameter: String
-  /// 인증 헤더 이름과 값. 헤더가 아니라 쿼리로 키를 받는 공급자는
-  /// `keyParameter`를 쓴다 — 어느 쪽이든 **URL 로그에 남지 않도록** 헤더를 먼저 쓴다.
-  public let keyHeader: String?
-  public let keyParameter: String?
-  public let key: String
-
-  public init(
-    endpoint: URL, queryParameter: String = "q", keyHeader: String? = nil,
-    keyParameter: String? = nil, key: String
-  ) {
-    self.endpoint = endpoint
-    self.queryParameter = queryParameter
-    self.keyHeader = keyHeader
-    self.keyParameter = keyParameter
-    self.key = key
-  }
-
-  /// 번들에서 읽는다. 하나라도 없으면 nil이고, 그때 `web.search`는 없는 능력이다.
-  public static func fromBundle(_ bundle: Bundle = .main) -> WebSearchConfiguration? {
-    func string(_ key: String) -> String? {
-      guard let value = bundle.object(forInfoDictionaryKey: key) as? String,
-        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      else { return nil }
-      return value
-    }
-    guard let raw = string("JSWebSearchEndpoint"), let endpoint = URL(string: raw),
-      let key = string("JSWebSearchAPIKey")
-    else { return nil }
-    return WebSearchConfiguration(
-      endpoint: endpoint,
-      queryParameter: string("JSWebSearchQueryParameter") ?? "q",
-      keyHeader: string("JSWebSearchAPIKeyHeader"),
-      keyParameter: string("JSWebSearchAPIKeyParameter"),
-      key: key)
-  }
-
-  public func request(query: String, limit: Int) -> URLRequest? {
-    var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
-    var items = components?.queryItems ?? []
-    items.append(URLQueryItem(name: queryParameter, value: query))
-    items.append(URLQueryItem(name: "count", value: String(limit)))
-    if let keyParameter { items.append(URLQueryItem(name: keyParameter, value: key)) }
-    components?.queryItems = items
-    guard let url = components?.url else { return nil }
-    var request = URLRequest(url: url)
-    request.timeoutInterval = 15
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
-    if let keyHeader { request.setValue(key, forHTTPHeaderField: keyHeader) }
-    return request
-  }
-}
-
 /// 검색 결과 한 줄.
+///
+/// **기기가 고르고 PCC는 고르지 않는다.** 검색 결과 열 건을 PCC에 보여 주고
+/// "무엇을 열까"를 묻는 구조는 이 저장소의 방향과 반대다 — 주소를 고르는 일은
+/// 기기에서 끝나고(`ResolvableArgument.url`), PCC는 그 뒤에 만들어진 작은 근거만
+/// 본다.
 public struct WebSearchResult: Sendable, Hashable {
   public let title: String
   public let url: String
@@ -74,74 +18,81 @@ public struct WebSearchResult: Sendable, Hashable {
   }
 }
 
-/// 공급자의 JSON에서 결과 줄을 **모양으로** 찾는다.
+/// 웹에서 찾는 **한 가지 방법**.
 ///
-/// 공급자마다 감싸는 이름이 다르다(`web.results`·`organic`·`webPages.value`). 그
-/// 이름들을 목록으로 들고 있으면 공급자를 하나 바꿀 때마다 이 파일을 고쳐야 하고,
-/// 목록에 없는 공급자는 조용히 0건이 된다.
+/// 공급자 이름이 능력에 들어가지 않는다 — `web.search`는 "웹에서 찾는다"의
+/// 이름이고, 어느 서비스로 찾는지는 이 구현이 정한다.
 ///
-/// 그래서 이름이 아니라 **모양**을 찾는다: 제목처럼 생긴 칸과 주소처럼 생긴 칸을
-/// 가진 객체의 배열. 그 판정은 결정론적이고, 낯선 공급자에서도 성립한다.
-public enum WebSearchResultParser {
-  private static let titleKeys = ["title", "name", "heading"]
-  private static let urlKeys = ["url", "link", "href", "displayUrl", "display_url"]
-  private static let snippetKeys = [
-    "description", "snippet", "content", "text", "excerpt", "summary",
-  ]
+/// 열쇠를 요구하지 않는 것이 이 자리의 요건이다. 예전에는 번들에서 API 키를 읽는
+/// 설정 하나가 있었고(`WebSearchConfiguration`), 그 값이 없는 앱에서 `web.search`는
+/// 아예 없는 능력이었다 — 그리고 그 설정을 쓰는 구현은 끝내 없었다.
+public protocol WebSearchEngine: Sendable {
+  /// 로그와 계측에 남을 이름. **질의는 담지 않는다** — 사용자 글이다.
+  var name: String { get }
+  func search(query: String, limit: Int) async throws -> [WebSearchResult]
+}
 
-  public static func parse(_ data: Data, limit: Int) -> [WebSearchResult] {
-    guard let root = try? JSONSerialization.jsonObject(with: data) else { return [] }
-    var found: [WebSearchResult] = []
-    collect(root, into: &found, limit: limit)
-    return Array(found.prefix(limit))
+/// 찾지 못했다. **사유를 나눠 든다** — 없는 것과 막힌 것은 다른 사실이다.
+public enum WebSearchError: Error, Sendable, Equatable {
+  /// 어느 엔진도 답하지 못했다.
+  case noEngineAnswered
+  case malformedResponse
+  /// 공급자가 사람인지 물었다. **우회하지 않는다** — 다음 공급자로 간다.
+  case challenged
+  case rejected(status: Int)
+}
+
+/// 엔진 여러 개를 **순서대로** 쓴다.
+///
+/// 하나가 막히면 다음으로 간다. 막힘을 우회하지 않는 이유는 그것이 자동화 차단을
+/// 무력화하는 구조이기 때문이다 — 다른 문을 두는 것과 같은 문을 부수는 것은 다르다.
+public struct WebSearchBroker: Sendable {
+  private static let log = AgentHost.logger("web-search")
+
+  public let engines: [any WebSearchEngine]
+
+  public init(engines: [any WebSearchEngine]) {
+    self.engines = engines
   }
 
-  private static func collect(
-    _ node: Any, into found: inout [WebSearchResult], limit: Int
-  ) {
-    guard found.count < limit else { return }
-    switch node {
-    case let array as [Any]:
-      // 배열의 원소가 결과 모양이면 그 배열이 결과 목록이다.
-      for element in array {
-        guard found.count < limit else { return }
-        if let object = element as? [String: Any], let result = result(from: object) {
-          found.append(result)
-        } else {
-          collect(element, into: &found, limit: limit)
+  /// 코어가 싣는 순서. 둘 다 열쇠가 필요 없다.
+  ///
+  /// 실측 2026-09-17: `html.duckduckgo.com`은 User-Agent가 없으면 202 challenge를
+  /// 돌려주고, iPhone UA로는 200에 결과 열 건을 돌려준다. `www.startpage.com`은
+  /// POST를 307로 돌려보내고 `www.mojeek.com`은 JavaScript challenge를 세운다 —
+  /// 그래서 그 둘은 싣지 않았다. 헤드리스 브라우저를 iOS에 들이는 선택은 이 저장소의
+  /// 무게와 맞지 않는다.
+  public static var standard: WebSearchBroker {
+    WebSearchBroker(engines: [DuckDuckGoHTMLSearch(), DuckDuckGoLiteSearch()])
+  }
+
+  /// **"없다"와 "못 물었다"를 구별한다.**
+  ///
+  /// 한 곳이라도 답했다면 결과 0건은 관찰된 사실이고, 그 사실은 화면이 말해야
+  /// 한다. 아무도 답하지 못했으면 그것은 실패다 — 그때 0건을 돌려주면 앱이
+  /// "찾지 못했어요"라고 **거짓을** 말한다.
+  public func search(query: String, limit: Int) async throws -> [WebSearchResult] {
+    var answered = false
+    var failure: any Error = WebSearchError.noEngineAnswered
+    for engine in engines {
+      do {
+        let results = try await engine.search(query: query, limit: limit)
+        answered = true
+        guard results.isEmpty else {
+          Self.log.info(
+            """
+            web.search engine=\(engine.name, privacy: .public) \
+            results=\(results.count, privacy: .public)
+            """)
+          return results
         }
-      }
-    case let object as [String: Any]:
-      // 결정론적 순서로 걷는다 — 사전의 순서는 실행마다 다르고, 그러면 같은
-      // 응답이 실행마다 다른 결과 순서를 낸다.
-      for key in object.keys.sorted() {
-        guard found.count < limit else { return }
-        if let value = object[key] { collect(value, into: &found, limit: limit) }
-      }
-    default:
-      return
-    }
-  }
-
-  private static func result(from object: [String: Any]) -> WebSearchResult? {
-    guard let url = value(in: object, keys: urlKeys),
-      url.hasPrefix("http"),
-      let title = value(in: object, keys: titleKeys)
-    else { return nil }
-    return WebSearchResult(
-      title: title, url: url, snippet: value(in: object, keys: snippetKeys) ?? "")
-  }
-
-  private static func value(in object: [String: Any], keys: [String]) -> String? {
-    for key in keys {
-      guard let match = object.first(where: { $0.key.caseInsensitiveCompare(key) == .orderedSame })
-      else { continue }
-      if let text = match.value as? String,
-        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      {
-        return text
+      } catch {
+        failure = error
+        Self.log.error(
+          "web.search engine=\(engine.name, privacy: .public) failed")
       }
     }
-    return nil
+    guard answered else { throw failure }
+    return []
   }
 }
