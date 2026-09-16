@@ -100,13 +100,13 @@ public final class TurnRuntime {
     return created
   }
 
-  /// 실제 감독자. 모델을 쓸 수 없는 기기에서는 처분만 돌려준다 — 그 처분이
-  /// 결정론 구제로 가는 길이다.
+  /// 실제 감독자. PCC를 쓸 수 없는 기기에서는 **미지원 처분**을 돌려준다 —
+  /// 기기 모델이 계획을 대신 쓰지 않는다.
   private static let liveSupervising: TurnSupervising = { request in
     guard #available(iOS 26.0, *) else {
       return .failed(
-        disposition: .useDeterministicRescue,
-        reason: ModelFailureClassifier.unavailableReason,
+        disposition: .surfaceFailure,
+        reason: ModelFailureClassifier.unsupportedReason,
         TurnRuntime.unavailableReceipt(request.profile))
     }
     switch await TurnSupervisor().decide(
@@ -124,7 +124,7 @@ public final class TurnRuntime {
   private static let liveFinalizing: TurnFinalizing = { context, profile in
     guard #available(iOS 26.0, *) else {
       return FinalizationStep(
-        answer: .unavailable(reason: ModelFailureClassifier.unavailableReason),
+        answer: .unavailable(reason: ModelFailureClassifier.unsupportedReason),
         receipt: TurnRuntime.unavailableReceipt(profile))
     }
     let outcome = await TurnFinalizer().finalize(context, profile: profile)
@@ -153,7 +153,6 @@ public final class TurnRuntime {
     public let input: String
     public let conversation: String?
     public let account: String
-    public let sketch: IntentSketch
     public let context: TurnContextSnapshot
     /// 사용자가 이 문장과 함께 건넨 기록. 손에 들려 준 대상이다(§24).
     public let attachedItemIDs: [String]
@@ -162,11 +161,11 @@ public final class TurnRuntime {
     /// 그중 읽기를 낸 것. 첨부가 여럿이면 **모두** 읽는다 - 한 장만 읽고 답하면
     /// 나머지 장은 없는 것이 된다.
     public var attachmentReads: Set<String> = []
+    /// 이 차례에 모델이 본 툴 집합. 실행 검증이 이 집합으로 자른다.
+    ///
+    /// 규칙이 만들던 **구제 단계**(`rescue`)는 없앴다 — 계획은 모델의 일이고,
+    /// 규칙이 대신 세운 계획은 사용자가 말하지 않은 일을 한다.
     public var scope: CapabilityScope
-    /// 규칙이 만들어 둔 **구제 단계.** 모델이 고른 계획이 실행 중에 막히면
-    /// (채울 수 없는 자리, 실패한 단계) 사용자에게 되묻기 전에 이것을 쓴다.
-    /// 한 번만 쓴다 — 구제가 또 실패하면 그때는 사실을 말한다.
-    public var rescue: [PlannedStep]
     /// 이 되돌이가 실행할 남은 단계.
     public var steps: [PlannedStep] = []
     public var pendingApprovalID: UUID?
@@ -176,7 +175,6 @@ public final class TurnRuntime {
     public var ledger: TurnExecutionLedger
     public var evidence: EvidenceCompiler.Compiled = .empty
     public var usage = ModelUsageLog()
-    public var budget = PCCBudget()
     public let extractionBudget = LocalExtractionBudget()
     /// 값 뽑기가 입장 줄에서 기다린 시간의 **차례 누적**. 영수증이 없는 목적이라
     /// 사용 기록에서 계산할 수 없다 — 여기서 더한다(§12 PR 6).
@@ -194,7 +192,6 @@ public final class TurnRuntime {
     public var invariantApplied = false
     /// 감독을 PCC가 했는가. 답을 누가 써야 하는지의 근거다(§19).
     public var pccSupervised = false
-    public var usedDeterministic = false
     /// 이미 **똑같이** 실행한 호출. 열쇠는 능력 이름 + 인자 지문이다.
     ///
     /// 능력 이름만으로 세면 한 차례에서 채널이 다른 두 `chat.read`가 한 호출로
@@ -210,13 +207,6 @@ public final class TurnRuntime {
     /// "아무 웹 읽기나 있으면 통과"는 모델이 딴 페이지를 성공적으로 읽은 경우에
     /// 속는다.
     public var readURLs: Set<String> = []
-    /// 이 차례에서 모델을 쓸 수 없다고 확인됐는가.
-    ///
-    /// 확인된 뒤에 감독자를 또 부르지 않는다. 부르면 되돌이마다 PCC 호출 한 번과
-    /// 기기 모델 호출 한 번이 실패로 더 쌓이고(실측: 한 검색 차례가 PCC 세 번을
-    /// 태우고 5.4초를 썼다), 그 비용으로 얻는 것이 없다 — 규칙이 이미 답을
-    /// 알고 있어서 구제로 내려온 길이다.
-    public var modelUnusable = false
   }
 
   /// 단계를 다 돌고 난 결과.
@@ -329,19 +319,19 @@ public final class TurnRuntime {
     activeRequestID = requestID
     defer { activeRequestID = nil }
     eventSequence = 0
-    let sketch = IntentSketcher(now: { context.referenceTime }, calendar: context.calendar).sketch(input)
-    var scope = CapabilityScope.compile(sketch, registered: registered)
-    if archivedItemID != nil { scope = scope.removing(.memorySave) }
-    // 구제도 같은 규칙을 지킨다. 이미 보관된 제출에 규칙이 저장을 또 내면
-    // 모델을 쓸 수 없는 기기에서 기록이 두 건 남는다.
-    let rescue = Self.deterministicRescue(
-      input, registered: registered, now: context.referenceTime, calendar: context.calendar)
-      .filter { archivedItemID == nil || $0.capability != .memorySave }
+    // **등록된 툴 전부를 모델에게 보여 준다.** 문장을 규칙으로 읽어 영역을
+    // 좁히던 스케치(`IntentSketch`)는 없앴다 — 규칙이 잘못 읽은 순간 사용자가
+    // 말한 일을 모델이 할 방법이 사라지고, 그 실패는 "모델이 못 했다"로 보인다.
+    //
+    // 이미 보관된 제출에 저장이 겹치는 것은 **가시성이 아니라 멱등**이 막는다:
+    // 저장 호출의 열쇠는 정규화된 본문 지문이므로(`ActionFingerprint.call`) 같은
+    // 글은 두 번째 호출에서 새 기록을 만들지 않는다.
+    let scope = CapabilityScope.compile(registered: registered)
 
     var state = TurnState(
       requestID: requestID, input: input, conversation: conversation,
-      account: account, sketch: sketch, context: context, attachedItemIDs: attachedItemIDs,
-      scope: scope, rescue: rescue,
+      account: account, context: context, attachedItemIDs: attachedItemIDs,
+      scope: scope,
       ledger: TurnExecutionLedger(requestID: requestID), startedAt: now())
     emit(.analyzing, state)
     // 정본 사용자 차례와 실행 record를 잇는다. 여기서의 실패는 읽기를 막지 않는다 —
@@ -353,7 +343,7 @@ public final class TurnRuntime {
     // "하지 못했어요"가 아니라 **연결이 없다**고 말한다 — 이 자리가 그냥 실패로
     // 접히던 동안, 연결이 없는 기기의 모든 요청이 `model.unavailable`로 끝났다
     // (실측 2026-09-14: `tools=0 latency=1`). 모델은 부른 적조차 없었다.
-    guard !scope.isEmpty || !rescue.isEmpty else {
+    guard !scope.isEmpty else {
       state.telemetry.fallbackReason = "noCapability"
       await finish(state, phase: .failed, reason: "noCapability")
       return
@@ -380,7 +370,6 @@ public final class TurnRuntime {
       state.performed.insert(ActionFingerprint.call(approval.request.capability, approval.request.arguments, binding: approval.request.binding))
       state.toolExecutions += 1
       state.lastProgressIteration = state.iteration
-      state.budget.recordProgress()
       emit(.capabilityCompleted(approval.request.capability, receipt), state)
       await advance(state)
     case .cancelled:
@@ -499,10 +488,6 @@ public final class TurnRuntime {
         break
       }
 
-      // 4) 모델을 쓸 수 없다고 이미 확인됐으면 더 묻지 않는다. 구제가 남긴
-      //    수령증으로 답을 만든다.
-      guard !state.modelUnusable else { break }
-
       // 5) 감독자에게 묻는다.
       switch await decide(&state) {
       case .work(let steps):
@@ -513,16 +498,6 @@ public final class TurnRuntime {
       case .needsUser(let key):
         await finish(state, phase: .awaitingUser, needs: key)
         return
-      case .rescue:
-        // 규칙이 아는 길이 있다. 모델 사정으로 답할 수 있는 요청을 접지 않는다.
-        // **이미 성공한 단계는 그 길에서 걷어낸다** — 구제는 못 한 일을 하는
-        // 길이고, 한 일을 또 하는 길이 아니다.
-        state.steps = Self.pending(state.rescue, performed: state.performed)
-        state.rescue = []
-        state.usedDeterministic = true
-        state.stepOrigin = .userExplicit
-        state.modelUnusable = true
-        state.telemetry.profile = "deterministic"
       case .stop(let reason):
         // 근거를 이미 모았으면 그것으로 답한다 — 감독이 멈춘 것이 회수한 것을
         // 지우지 않는다.
@@ -544,7 +519,6 @@ public final class TurnRuntime {
     case work([PlannedStep])
     case complete
     case needsUser(String)
-    case rescue
     case stop(reason: String)
   }
 
@@ -560,19 +534,13 @@ public final class TurnRuntime {
     // 같은 열쇠로 막히고, 다른 인자는 다른 일이다. 감독자는 무엇이 끝났는지를
     // `<<<completed>>>` 구획으로 본다.
     let scope = state.scope
-    guard !scope.isEmpty else {
-      return state.rescue.isEmpty ? .complete : .rescue
-    }
+    guard !scope.isEmpty else { return .complete }
 
-    var target = ModelTarget.preferred
-    let purpose: PCCBudget.Purpose = state.iteration == 0 ? .planning : .replanning
-    if target == .privateCloud, !state.budget.consume(purpose) {
-      target = .onDevice
-      state.telemetry.fallbackReason = "budget"
-    }
+    // 오케스트레이션은 **언제나 PCC**다. 예산으로 기기 모델에 내려서던 길
+    // (`PCCBudget`)은 없앴다 — 사용자가 말한 일을 다른 품질로 몰래 처리하는
+    // 길이었고, 그때 계측의 `backend` 칸도 갈라졌다.
     let profile = DynamicTurnProfile.supervising(
-      phase: phase, target: target, scope: scope, iteration: state.iteration,
-      sketch: state.sketch)
+      phase: phase, target: .privateCloud, scope: scope, iteration: state.iteration)
     let context = ConversationContextCompiler().compile(
       profile: profile,
       userMessage: state.input,
@@ -601,23 +569,13 @@ public final class TurnRuntime {
       if let reason = receipt.fallbackReason {
         state.telemetry.fallbackReason = reason
       }
-      // **route-only shadow 평가**(§12 PR 4). PCC가 control로 남고, 같은 질문에서
-      // 규칙이 무엇을 골랐을지를 나란히 적는다 — 공급자를 부르지도, 쓰기를
-      // 실행하지도 않는다. 좁은 fast path는 이 비교가 쌓인 뒤 flag로 연다.
-      if state.telemetry.shadowAgreement.isEmpty {
-        let shadow = state.rescue.map(\.capability.rawValue).sorted()
-        let chosen = decision.plan.steps.map(\.capability.rawValue).sorted()
-        state.telemetry.shadowRoute = shadow.joined(separator: "+")
-        state.telemetry.shadowAgreement =
-          shadow.isEmpty ? "none" : (shadow == chosen ? "match" : "differs")
-      }
       if let needs = decision.plan.needs {
         let reads = investigationSteps(decision.plan.steps, in: state)
         if !reads.isEmpty {
           state.investigationNeeds = needs
           return .work(reads)
         }
-        return state.rescue.isEmpty ? .needsUser(needs) : .rescue
+        return .needsUser(needs)
       }
       guard decision.hasWork else {
         // **아무것도 실행하지 않은 차례를 모델의 말로 닫지 않는다**(§24).
@@ -626,7 +584,7 @@ public final class TurnRuntime {
         // `complete`를 냈고, 규칙이 답을 아는 요청이 빈손으로 끝났다. 회수한
         // 것이 하나도 없는데 끝났다고 말하면, 그것은 끝난 것이 아니다.
         if state.ledger.hasReceipts, decision.status == .complete { return .complete }
-        return state.rescue.isEmpty ? .complete : .rescue
+        return .complete
       }
       return .work(decision.plan.steps)
     case .failed(let disposition, let reason, let receipt):
@@ -636,11 +594,13 @@ public final class TurnRuntime {
       case .surfaceFailure:
         // 안전 판정은 우회하지 않는다(§37).
         return .stop(reason: reason)
-      case .retryOnDevice, .useDeterministicRescue:
-        if state.rescue.isEmpty, !state.ledger.hasReceipts, let needs = state.investigationNeeds {
+      case .retry:
+        // 감독자가 이미 같은 요청을 한 번 더 냈다. 그래도 답이 없으면 **사실을
+        // 말한다** — 규칙이 만든 계획으로 갈아타지 않는다.
+        if !state.ledger.hasReceipts, let needs = state.investigationNeeds {
           return .needsUser(needs)
         }
-        return state.rescue.isEmpty ? .stop(reason: reason) : .rescue
+        return .stop(reason: reason)
       }
     }
   }
@@ -824,17 +784,8 @@ public final class TurnRuntime {
         return .drained
       }
       guard var arguments = resolve(&step, in: state) else {
-        if !state.rescue.isEmpty {
-          var fallback = Self.pending(state.rescue, performed: state.performed)
-          fallback.append(step)
-          fallback.append(contentsOf: state.steps)
-          state.steps = fallback
-          state.rescue = []
-          state.usedDeterministic = true
-          state.telemetry.profile = "deterministic"
-          state.telemetry.fallbackReason = "rescue:\(step.unresolved.first ?? "value")"
-          continue
-        }
+        // 채울 수 없는 자리가 있으면 **되묻는다.** 규칙이 만든 다른 길로 갈아타지
+        // 않는다 — 사용자가 말한 일과 다른 일을 하게 된다.
         return .stopped(
           phase: .awaitingUser, needs: step.unresolved.first ?? "value", reason: nil)
       }
@@ -921,7 +872,6 @@ public final class TurnRuntime {
         state.performed.insert(identity)
         state.lastProgressIteration = state.iteration
         state.unsuccessfulToolExecutions = 0
-        state.budget.recordProgress()
         // 읽은 주소는 불변식이 본다. 어댑터가 무엇을 영수증에 담는지와 무관하게
         // **우리가 보낸 인자**가 근거다.
         if step.capability == .webRead || step.capability == .webFetch,
@@ -982,16 +932,7 @@ public final class TurnRuntime {
             continue
           }
         }
-        // 모델이 고른 툴이 실패했고 규칙이 아는 길이 남아 있으면 그 길로 간다.
-        if !state.rescue.isEmpty {
-          state.steps = Self.pending(state.rescue, performed: state.performed)
-          state.rescue = []
-          state.usedDeterministic = true
-          state.stepOrigin = .userExplicit
-          state.telemetry.profile = "deterministic"
-          state.telemetry.fallbackReason = "rescue:\(reason)"
-          continue
-        }
+        // 모델이 고른 툴이 실패했다. 규칙이 아는 길로 갈아타지 않는다.
         // 기존 근거나 조사 전 누락값을 읽기 실패 한 건으로 버리지 않는다.
         if state.ledger.hasReceipts
           || (step.capability.executionClass == .readOnly && state.investigationNeeds != nil)
@@ -1217,8 +1158,8 @@ public final class TurnRuntime {
   /// 문맥이 커지고, 이 자리의 목적은 "하나도 읽지 않는 일"을 막는 것이다.
   private static func recordReadStep(_ state: TurnState) -> PlannedStep? {
     guard !state.recordReadApplied else { return nil }
-    // 무언가를 찾거나 읽으려는 문장에만 적용한다. 저장·생성 요청은 읽을 이유가 없다.
-    guard !state.sketch.operations.isDisjoint(with: [.search, .read]) else { return nil }
+    // 찾은 것이 있는데 하나도 읽지 않는 일을 막는 자리다. 문장을 규칙으로 읽어
+    // 조건을 달지 않는다 — 검색 수령증이 있다는 사실이 곧 읽을 것이 있다는 뜻이다.
     guard
       let hit = state.ledger.receipts.last(where: {
         $0.capability == .memorySearch || $0.capability == .artifactFind
@@ -1245,8 +1186,9 @@ public final class TurnRuntime {
   }
 
   private static func urlInvariantStep(_ state: TurnState) -> PlannedStep? {
-    guard !state.invariantApplied, let url = state.sketch.explicitURL else { return nil }
-    guard state.sketch.operations.contains(.read) else { return nil }
+    guard !state.invariantApplied,
+      let url = LinkText.firstExplicitURL(in: state.input)
+    else { return nil }
     guard state.scope.contains(.webRead) else { return nil }
     // **그 주소**를 읽었는가. 아무 웹 읽기나 있으면 통과하던 동안, 모델이 딴
     // 페이지를 성공적으로 읽은 차례가 사용자가 준 주소를 끝내 읽지 않았다.
@@ -1298,24 +1240,6 @@ public final class TurnRuntime {
       return arguments["threadTS"]?.textValue.map { $0 == source.id } ?? true
     default: return false
     }
-  }
-
-  /// 규칙이 만드는 구제 단계. **모델을 쓸 수 없는 기기·순간의 대역이다.**
-  private static func deterministicRescue(
-    _ input: String, registered: Set<CapabilityID>, now: Date, calendar: Calendar
-  ) -> [PlannedStep] {
-    // **업무 정리 질문은 공급자 하나의 의도가 아니다**(§12 PR 4). 어느 영역을
-    // 봐야 하는지가 곧 계획이고, 그 단계들은 전부 읽기 전용이라 함께 돌 수 있다.
-    if let scope = WorkObservationScope.detect(input) {
-      let steps = scope.steps(available: registered, now: now, calendar: calendar)
-      if !steps.isEmpty { return steps }
-    }
-    let router = LocalIntentRouter(available: registered, now: { now }, calendar: calendar)
-    guard case .action(let capability, var arguments) = router.route(input) else {
-      return []
-    }
-    if capability == .memorySave { arguments["text"] = .text(input) }
-    return [PlannedStep(capability: capability, arguments: arguments)]
   }
 
   // MARK: 닫기
@@ -1405,16 +1329,8 @@ public final class TurnRuntime {
     state.answerRequired = needsAnswer
 
     if needsAnswer, !state.evidence.evidence.isEmpty {
-      var target = DynamicTurnProfile.finalizerTarget(
-        evidence: state.evidence.evidence,
-        sourceCount: state.evidence.readSources.count,
-        pccSupervised: state.pccSupervised,
-        budget: state.budget)
-      if target == .privateCloud, !state.budget.consume(.finalizing) {
-        target = .onDevice
-        state.telemetry.fallbackReason = "budget"
-      }
-      let profile = DynamicTurnProfile.finalizing(target: target)
+      // 답도 PCC가 쓴다. 근거 크기로 모델을 갈아타지 않는다.
+      let profile = DynamicTurnProfile.finalizing(target: .privateCloud)
       let context = ConversationContextCompiler().compile(
         profile: profile,
         userMessage: state.input,
@@ -1478,21 +1394,8 @@ public final class TurnRuntime {
   /// 말하지 않는다 — 읽은 것이 없으면 아는 것도 없다.
   private func converse(_ initial: TurnState) async {
     var state = initial
-    // 모델을 쓸 수 없다고 이미 확인된 차례에는 지어낼 말이 없다. 그 사실을 말한다.
-    guard !state.modelUnusable else {
-      await finish(
-        state, phase: .failed,
-        reason: state.telemetry.fallbackReason.isEmpty
-          ? "noPlan" : state.telemetry.fallbackReason)
-      return
-    }
     emit(.finalizing, state)
-    var target = ModelTarget.preferred
-    if target == .privateCloud, !state.budget.consume(.finalizing) {
-      target = .onDevice
-      state.telemetry.fallbackReason = "budget"
-    }
-    let profile = DynamicTurnProfile.conversing(target: target)
+    let profile = DynamicTurnProfile.conversing(target: .privateCloud)
     let context = ConversationContextCompiler().compile(
       profile: profile, userMessage: state.input, recentTurns: state.context.recentMessages,
       now: state.context.referenceTime,

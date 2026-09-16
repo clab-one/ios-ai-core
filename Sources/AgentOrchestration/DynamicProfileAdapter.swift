@@ -67,37 +67,42 @@ public enum DynamicProfileAdapter {
     }
   }
 
-  /// 이 단계의 세션.
+  /// 오케스트레이션 세션. **PCC 하나다.**
   ///
-  /// **세션을 단계 사이에 물려주지 않는다.** 그것이 §18(프로파일이 바뀔 때 이력이
-  /// 통째로 따라가는 문제)에 대한 이 앱의 답이다: 물려줄 이력이 없으면 새어 나갈
-  /// 이력도 없다. 각 호출은 그 단계의 지시와, 그 단계가 실을 자격이 있는 문맥만
-  /// 들고 새로 선다(`ContextPolicy`).
+  /// 기기 모델로 내려서는 길을 여기 두지 않는다 — 계획과 답을 다른 품질의
+  /// 모델이 몰래 대신 쓰면, 사용자는 자기 요청이 어느 모델을 지났는지 알 수
+  /// 없고 계측의 `backend` 칸도 거짓이 된다.
   ///
-  /// 그래서 `historyTransform`은 쓰지 않는다 — 변환할 이력 자체를 만들지 않는다.
-  public static func session(
-    for profile: DynamicTurnProfile, instructions: String,
-    onDeviceModel: SystemLanguageModel
+  /// **세션을 단계 사이에 물려주지 않는다.** 프로파일이 바뀔 때 이력이 통째로
+  /// 따라가는 문제(§18)에 대한 답이다: 물려줄 이력이 없으면 새어 나갈 이력도
+  /// 없다. 각 호출은 그 단계의 지시와, 그 단계가 실을 자격이 있는 문맥만 들고
+  /// 새로 선다(`ContextPolicy`). 그래서 `historyTransform`은 쓰지 않는다.
+  @available(iOS 27.0, *)
+  public static func privateCloudSession(
+    instructions: String
   ) throws -> LanguageModelSession {
-    if profile.modelTarget == .privateCloud, #available(iOS 27.0, *),
-      PrivateCloudComputeAccess.isUsable()
-    {
-      return LanguageModelSession(
-        model: PrivateCloudComputeLanguageModel(), instructions: instructions)
+    guard PrivateCloudComputeAccess.isUsable() else {
+      throw AgentModelUnavailable.privateCloudUnsupported
     }
-    guard case .available = onDeviceModel.availability else {
-      throw ActionError.unsupported(.memorySearch)
-    }
-    return LanguageModelSession(model: onDeviceModel, instructions: instructions)
+    return LanguageModelSession(
+      model: PrivateCloudComputeLanguageModel(), instructions: instructions)
   }
 
-  /// 이 세션이 실제로 어느 모델로 섰는가. 요청과 결과가 다를 수 있고(권한·가용성),
-  /// 처리 위치 고지는 **실제 값**을 말해야 한다.
-  public static func resolvedTarget(for profile: DynamicTurnProfile) -> ModelTarget {
-    guard profile.modelTarget == .privateCloud else { return .onDevice }
-    if #available(iOS 27.0, *), PrivateCloudComputeAccess.isUsable() {
-      return .privateCloud
+  /// 툴이 기기에서 쓸 세션(근거 추출·요약). 오케스트레이션은 이 문을 쓰지 않는다.
+  public static func onDeviceSession(
+    instructions: String, model: SystemLanguageModel
+  ) throws -> LanguageModelSession {
+    guard case .available = model.availability else {
+      throw AgentModelUnavailable.onDeviceUnavailable
     }
-    return .onDevice
+    return LanguageModelSession(model: model, instructions: instructions)
   }
+}
+
+/// 부를 모델이 없다. **오류가 아니라 환경의 사실**이므로 사유를 나눠 든다.
+public enum AgentModelUnavailable: Error, Sendable, Equatable {
+  /// 이 기기·계정·서명으로는 PCC를 쓸 수 없다. 에이전트는 **열리지 않는다**.
+  case privateCloudUnsupported
+  /// 기기 모델 자산이 없다. 툴의 지역 처리가 불가능하다.
+  case onDeviceUnavailable
 }

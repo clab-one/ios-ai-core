@@ -56,151 +56,111 @@ public enum FinalAnswer: Sendable, Equatable {
 /// `<<<tools>>>` 구획이 아예 서지 않는다. 세 겹 모두 값이다 — 주석이 아니다.
 @available(iOS 26.0, *)
 public struct TurnFinalizer: Sendable {
-  private static let log = Logger(
-    subsystem: "dev.hyunminkim.justsend", category: "orchestrator")
+  private static let log = AgentHost.logger("orchestrator")
 
-  public let onDeviceModel: SystemLanguageModel
-
-  public init(onDeviceModel: SystemLanguageModel = SystemLanguageModel.default) {
-    self.onDeviceModel = onDeviceModel
-  }
+  public init() {}
 
   public struct Outcome: Sendable {
     public let answer: FinalAnswer
     public let receipt: ModelInvocationReceipt
   }
 
-  /// 답 한 벌. **PCC가 실패하면 기기 모델로 내려선다** — 감독과 같은 규칙이고,
-  /// 같은 분류기를 쓴다. 근거가 있는데 답만 못 써서 차례가 빈손으로 끝나면
-  /// 사용자는 읽은 것도 받지 못한다.
+  /// 답 한 벌. **PCC가 쓴다.**
+  ///
+  /// 일시적 실패는 한 번 더 낸다. 그래도 못 쓰면 답이 아니라 `unavailable`을
+  /// 돌려주고, 화면은 그 사유로 상태 한 줄을 세운다 — 회수한 것의 제목을 답으로
+  /// 올리지 않는다. 기기 모델이 대신 쓰지도 않는다: 근거를 PCC 문맥으로 세운
+  /// 차례를 다른 모델이 닫으면 답과 근거가 어긋난다(§19).
   public func finalize(
     _ context: CompiledConversationContext, profile: DynamicTurnProfile
   ) async -> Outcome {
     let started = Date()
-    let requested = profile.modelTarget
-    var resolved = DynamicProfileAdapter.resolvedTarget(for: profile)
-    var fallbackReason: String?
-
-    // 기다린 시간은 **실패에도 남는다**(독립 검토 지적) — 상자를 호출 밖에 둔다.
-    let wait = AdmissionWait()
-    let generated: GeneratedFinalAnswer
-    do {
-      generated = try await respond(
-        context: context, profile: profile, target: resolved, wait: wait)
-    } catch {
-      let reason = ModelFailureClassifier.reason(for: error)
-      let disposition = ModelFailureClassifier.disposition(for: error, backend: resolved)
-      guard disposition == .retryOnDevice else {
+    guard #available(iOS 27.0, *) else {
+      let reason = ModelFailureClassifier.unsupportedReason
+      Self.log.error("finalizer unsupported reason=\(reason, privacy: .public)")
+      return Outcome(
+        answer: .unavailable(reason: reason),
+        receipt: Self.receipt(
+          profile: profile, completed: false, fallbackReason: reason, context: context,
+          started: started))
+    }
+    var retried = false
+    while true {
+      let generated: GeneratedFinalAnswer
+      do {
+        generated = try await respond(context: context, profile: profile)
+      } catch {
+        let reason = ModelFailureClassifier.reason(for: error)
+        if ModelFailureClassifier.disposition(for: error) == .retry, !retried {
+          retried = true
+          Self.log.error("finalizer retrying reason=\(reason, privacy: .public)")
+          continue
+        }
         Self.log.error("finalizer failed reason=\(reason, privacy: .public)")
         return Outcome(
           answer: .unavailable(reason: reason),
           receipt: Self.receipt(
-            profile: profile, requested: requested, resolved: resolved,
-            completed: false, fallbackReason: reason, context: context,
-            started: started, waited: wait.milliseconds))
+            profile: profile, completed: false, fallbackReason: reason,
+            context: context, started: started))
       }
-      do {
-        generated = try await respond(
-          context: context, profile: profile, target: .onDevice, wait: wait)
-        fallbackReason = "pcc.\(reason)"
-        resolved = .onDevice
-      } catch {
-        let retryReason = ModelFailureClassifier.reason(for: error)
-        return Outcome(
-          answer: .unavailable(reason: retryReason),
-          receipt: Self.receipt(
-            profile: profile, requested: requested, resolved: .onDevice,
-            completed: false, fallbackReason: retryReason, context: context,
-            started: started, waited: wait.milliseconds))
-      }
-    }
 
-    let headline = generated.headline.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !headline.isEmpty else {
+      let headline = generated.headline.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !headline.isEmpty else {
+        return Outcome(
+          answer: .unavailable(reason: "empty"),
+          receipt: Self.receipt(
+            profile: profile, completed: false, fallbackReason: "empty",
+            context: context, started: started))
+      }
+      let points = generated.points
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
       return Outcome(
-        answer: .unavailable(reason: "empty"),
+        answer: .written(
+          headline: headline, points: points,
+          // 번호는 1부터다(문맥이 그렇게 세운다). 범위를 벗어난 번호는 버린다 —
+          // 모델이 센 것과 문맥에 실린 것이 어긋나면 그 번호는 아무것도 가리키지
+          // 않는다.
+          relevant: generated.relevant.filter { $0 > 0 }, backend: .privateCloud),
         receipt: Self.receipt(
-          profile: profile, requested: requested, resolved: resolved, completed: false,
-          fallbackReason: "empty", context: context, started: started,
-          waited: wait.milliseconds))
+          profile: profile, completed: true, fallbackReason: retried ? "retried" : nil,
+          context: context, started: started))
     }
-    let points = generated.points
-      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-      .filter { !$0.isEmpty }
-    return Outcome(
-      answer: .written(
-        headline: headline, points: points,
-        // 번호는 1부터다(문맥이 그렇게 세운다). 범위를 벗어난 번호는 버린다 —
-        // 모델이 센 것과 문맥에 실린 것이 어긋나면 그 번호는 아무것도 가리키지
-        // 않는다.
-        relevant: generated.relevant.filter { $0 > 0 }, backend: resolved),
-      receipt: Self.receipt(
-        profile: profile, requested: requested, resolved: resolved, completed: true,
-        fallbackReason: fallbackReason, context: context, started: started,
-        waited: wait.milliseconds))
   }
 
+  @available(iOS 27.0, *)
   private func respond(
     context: CompiledConversationContext,
-    profile: DynamicTurnProfile,
-    target: ModelTarget,
-    wait: AdmissionWait
+    profile: DynamicTurnProfile
   ) async throws -> GeneratedFinalAnswer {
-    let resolvedProfile = profile.retargeted(to: target)
-    let session = try DynamicProfileAdapter.session(
-      for: resolvedProfile, instructions: context.instructions,
-      onDeviceModel: onDeviceModel)
-    let options = DynamicProfileAdapter.generationOptions(for: resolvedProfile)
-    if target == .privateCloud {
-      if #available(iOS 27.0, *) {
-        return try await session.respond(
-          to: context.prompt, generating: GeneratedFinalAnswer.self, options: options,
-          contextOptions: DynamicProfileAdapter.contextOptions(for: resolvedProfile)
-        ).content
-      }
-      return try await session.respond(
-        to: context.prompt, generating: GeneratedFinalAnswer.self, options: options
-      ).content
-    }
-    // 답 쓰기는 계획과 **같은 줄에 서고 이름은 다르다** — 같은 기기 모델을 쥐지만
-    // 지표에서 갈라져야 어느 목적이 줄을 오래 쥐었는지 말할 수 있다.
-    return try await ModelAdmission.withAdmission(
-      for: .conversationAnswer, admitted: { wait.record($0) }
-    ) {
-      if #available(iOS 27.0, *) {
-        return try await session.respond(
-          to: context.prompt, generating: GeneratedFinalAnswer.self, options: options,
-          contextOptions: DynamicProfileAdapter.contextOptions(for: resolvedProfile)
-        ).content
-      }
-      return try await session.respond(
-        to: context.prompt, generating: GeneratedFinalAnswer.self, options: options
-      ).content
-    }
+    let session = try DynamicProfileAdapter.privateCloudSession(
+      instructions: context.instructions)
+    let options = DynamicProfileAdapter.generationOptions(for: profile)
+    return try await session.respond(
+      to: context.prompt, generating: GeneratedFinalAnswer.self, options: options,
+      contextOptions: DynamicProfileAdapter.contextOptions(for: profile)
+    ).content
   }
 
   private static func receipt(
     profile: DynamicTurnProfile,
-    requested: ModelTarget,
-    resolved: ModelTarget,
     completed: Bool,
     fallbackReason: String?,
     context: CompiledConversationContext,
-    started: Date,
-    waited: Int = 0
+    started: Date
   ) -> ModelInvocationReceipt {
     ModelInvocationReceipt(
       phase: .finalizing,
       purpose: AdmissionJob.conversationAnswer.rawValue,
-      requestedBackend: requested,
-      resolvedBackend: resolved,
-      pccAttempted: requested == .privateCloud,
-      pccCompleted: completed && resolved == .privateCloud,
-      onDeviceAttempted: resolved == .onDevice,
-      onDeviceCompleted: completed && resolved == .onDevice,
+      requestedBackend: .privateCloud,
+      resolvedBackend: .privateCloud,
+      pccAttempted: true,
+      pccCompleted: completed,
+      onDeviceAttempted: false,
+      onDeviceCompleted: false,
       fallbackReason: fallbackReason,
       inputCharacters: context.estimatedCharacters,
       latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1_000),
-      waitedMilliseconds: waited)
+      waitedMilliseconds: 0)
   }
 }

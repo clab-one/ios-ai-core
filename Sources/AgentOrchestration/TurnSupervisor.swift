@@ -54,16 +54,11 @@ public typealias TurnFinalizing = @MainActor (
 /// 하나이고, 그 결정이 실제로 도는지는 `ActionDispatcher`가 정한다.
 @available(iOS 26.0, *)
 public struct TurnSupervisor: Sendable {
-  private static let log = Logger(
-    subsystem: "dev.hyunminkim.justsend", category: "orchestrator")
+  private static let log = AgentHost.logger("orchestrator")
 
-  public let onDeviceModel: SystemLanguageModel
+  public init() {}
 
-  public init(onDeviceModel: SystemLanguageModel = SystemLanguageModel.default) {
-    self.onDeviceModel = onDeviceModel
-  }
-
-  /// 한 되돌이의 결과와 **그것을 만든 모델**.
+  /// 한 되돌이의 결과와 그것을 만든 호출의 영수증.
   public struct Outcome: Sendable {
     public let decision: TurnDecision
     public let receipt: ModelInvocationReceipt
@@ -77,10 +72,11 @@ public struct TurnSupervisor: Sendable {
     public let receipt: ModelInvocationReceipt
   }
 
-  /// 다음에 무엇을 부를지 정한다.
+  /// 다음에 무엇을 부를지 정한다. **PCC가 정한다.**
   ///
-  /// **PCC가 실패하면 기기 모델로 내려선다** — 단, 처분이 그것을 허락할 때만.
-  /// 가드레일과 거절은 인프라 실패가 아니므로 우회하지 않는다.
+  /// 일시적 실패(rate limit·timeout)는 같은 요청을 **한 번 더** 낸다. 가드레일과
+  /// 거절은 인프라 실패가 아니라 판단이므로 다시 내지 않는다 — 같은 요청을 다른
+  /// 모델이나 다른 경로로 우회하는 구조는 안전 장치를 무력화하는 구조다.
   public func decide(
     _ context: CompiledConversationContext,
     profile: DynamicTurnProfile,
@@ -88,23 +84,40 @@ public struct TurnSupervisor: Sendable {
     accountID: String
   ) async -> Result<Outcome, Failure> {
     let started = Date()
-    let requested = profile.modelTarget
-    var resolved = DynamicProfileAdapter.resolvedTarget(for: profile)
-    var fallbackReason: String?
-
-    // 기다린 시간은 **실패에도 남는다.** 상자를 호출 밖에 두는 이유다 — 안에서
-    // 만들면 던진 호출의 대기 시간이 사라지고, 지표는 "기다리지 않고 실패했다"는
-    // 거짓을 말한다(독립 검토 지적).
-    let wait = AdmissionWait()
-    let generated: GeneratedTurnDecision
-    do {
-      generated = try await respond(
-        context: context, profile: profile, target: resolved, wait: wait)
-    } catch {
-      let reason = ModelFailureClassifier.reason(for: error)
-      let disposition = ModelFailureClassifier.disposition(
-        for: error, backend: resolved)
-      guard disposition == .retryOnDevice else {
+    guard #available(iOS 27.0, *) else {
+      return .failure(Self.unsupported(profile: profile, context: context, started: started))
+    }
+    var retried = false
+    while true {
+      do {
+        let generated = try await respond(context: context, profile: profile)
+        let decision = ActionPlanValidator.validate(
+          generated, allowed: profile.scope.sorted, conversationID: conversationID,
+          accountID: accountID, calendar: context.calendar)
+        Self.log.info(
+          """
+          supervisor phase=\(profile.phase.rawValue, privacy: .public) \
+          status=\(decision.status.rawValue, privacy: .public) \
+          steps=\(decision.plan.steps.count, privacy: .public) \
+          retried=\(retried, privacy: .public)
+          """)
+        return .success(
+          Outcome(
+            decision: decision,
+            receipt: Self.receipt(
+              profile: profile, completed: true,
+              fallbackReason: retried ? "retried" : nil, context: context,
+              started: started)))
+      } catch {
+        let reason = ModelFailureClassifier.reason(for: error)
+        let disposition = ModelFailureClassifier.disposition(for: error)
+        if disposition == .retry, !retried {
+          retried = true
+          Self.log.error(
+            "supervisor retrying phase=\(profile.phase.rawValue, privacy: .public) reason=\(reason, privacy: .public)"
+          )
+          continue
+        }
         Self.log.error(
           "supervisor failed phase=\(profile.phase.rawValue, privacy: .public) reason=\(reason, privacy: .public)"
         )
@@ -112,116 +125,64 @@ public struct TurnSupervisor: Sendable {
           Failure(
             disposition: disposition, reason: reason,
             receipt: Self.receipt(
-              profile: profile, requested: requested, resolved: resolved,
-              completed: false, fallbackReason: reason, context: context,
-              started: started, waited: wait.milliseconds)))
-      }
-      // 일시적 실패. 기기 모델로 같은 일을 한 번 더.
-      Self.log.error("supervisor cloud failed; retrying on device")
-      do {
-        generated = try await respond(
-          context: context, profile: profile, target: .onDevice, wait: wait)
-        fallbackReason = "pcc.\(reason)"
-        resolved = .onDevice
-      } catch {
-        let retryReason = ModelFailureClassifier.reason(for: error)
-        return .failure(
-          Failure(
-            disposition: ModelFailureClassifier.disposition(
-              for: error, backend: .onDevice),
-            reason: retryReason,
-            receipt: Self.receipt(
-              profile: profile, requested: requested, resolved: .onDevice,
-              completed: false, fallbackReason: retryReason, context: context,
-              started: started, waited: wait.milliseconds)))
+              profile: profile, completed: false, fallbackReason: reason,
+              context: context, started: started)))
       }
     }
-
-    let decision = ActionPlanValidator.validate(
-      generated, allowed: profile.scope.sorted, conversationID: conversationID,
-      accountID: accountID, calendar: context.calendar)
-    Self.log.info(
-      """
-      supervisor phase=\(profile.phase.rawValue, privacy: .public) \
-      backend=\(resolved.rawValue, privacy: .public) \
-      status=\(decision.status.rawValue, privacy: .public) \
-      steps=\(decision.plan.steps.count, privacy: .public)
-      """)
-    return .success(
-      Outcome(
-        decision: decision,
-        receipt: Self.receipt(
-          profile: profile, requested: requested, resolved: resolved, completed: true,
-          fallbackReason: fallbackReason, context: context, started: started,
-          waited: wait.milliseconds)))
   }
 
   // MARK: 호출
 
+  @available(iOS 27.0, *)
   private func respond(
     context: CompiledConversationContext,
-    profile: DynamicTurnProfile,
-    target: ModelTarget,
-    wait: AdmissionWait
+    profile: DynamicTurnProfile
   ) async throws -> GeneratedTurnDecision {
-    let resolvedProfile = profile.retargeted(to: target)
-    let session = try DynamicProfileAdapter.session(
-      for: resolvedProfile, instructions: context.instructions,
-      onDeviceModel: onDeviceModel)
-    let options = DynamicProfileAdapter.generationOptions(for: resolvedProfile)
-    if target == .privateCloud {
-      // 클라우드 호출은 기기 대기열을 지나지 않는다 — 기기 모델을 붙잡지 않으므로
-      // 입장 제어의 대상이 아니다. 기다린 시간이 0인 것은 사실이다.
-      if #available(iOS 27.0, *) {
-        return try await session.respond(
-          to: context.prompt, generating: GeneratedTurnDecision.self, options: options,
-          contextOptions: DynamicProfileAdapter.contextOptions(for: resolvedProfile)
-        ).content
-      }
-      return try await session.respond(
-        to: context.prompt, generating: GeneratedTurnDecision.self, options: options
-      ).content
-    }
-    // 기기 모델 실행은 기존 입장 대기열을 지난다 — 발열·저전력에서 요약과
-    // 계획이 동시에 돌면 둘 다 느려진다. **기다린 시간을 받아 적는다**(§12 PR 6).
-    return try await ModelAdmission.withAdmission(
-      for: .conversationPlan, admitted: { wait.record($0) }
-    ) {
-      if #available(iOS 27.0, *) {
-        return try await session.respond(
-          to: context.prompt, generating: GeneratedTurnDecision.self, options: options,
-          contextOptions: DynamicProfileAdapter.contextOptions(for: resolvedProfile)
-        ).content
-      }
-      return try await session.respond(
-        to: context.prompt, generating: GeneratedTurnDecision.self, options: options
-      ).content
-    }
+    let session = try DynamicProfileAdapter.privateCloudSession(
+      instructions: context.instructions)
+    let options = DynamicProfileAdapter.generationOptions(for: profile)
+    // PCC 호출은 기기 대기열을 지나지 않는다 — 기기 모델을 붙잡지 않으므로
+    // 입장 제어의 대상이 아니다. 기다린 시간이 0인 것은 사실이다.
+    return try await session.respond(
+      to: context.prompt, generating: GeneratedTurnDecision.self, options: options,
+      contextOptions: DynamicProfileAdapter.contextOptions(for: profile)
+    ).content
+  }
+
+  /// 이 기기에서는 에이전트를 열 수 없다. **기기 모델이 계획을 대신 쓰지 않는다.**
+  private static func unsupported(
+    profile: DynamicTurnProfile, context: CompiledConversationContext, started: Date
+  ) -> Failure {
+    log.error("supervisor unsupported reason=pcc.unsupported")
+    return Failure(
+      disposition: .surfaceFailure,
+      reason: ModelFailureClassifier.unsupportedReason,
+      receipt: receipt(
+        profile: profile, completed: false,
+        fallbackReason: ModelFailureClassifier.unsupportedReason, context: context,
+        started: started))
   }
 
   private static func receipt(
     profile: DynamicTurnProfile,
-    requested: ModelTarget,
-    resolved: ModelTarget,
     completed: Bool,
     fallbackReason: String?,
     context: CompiledConversationContext,
-    started: Date,
-    waited: Int = 0
+    started: Date
   ) -> ModelInvocationReceipt {
     ModelInvocationReceipt(
       phase: profile.phase,
       purpose: AdmissionJob.conversationPlan.rawValue,
-      requestedBackend: requested,
-      resolvedBackend: resolved,
+      requestedBackend: .privateCloud,
+      resolvedBackend: .privateCloud,
       // **부르려 했는가**가 처리 위치 고지의 근거다(§36). 고른 순간 참이 된다.
-      pccAttempted: requested == .privateCloud,
-      pccCompleted: completed && resolved == .privateCloud,
-      onDeviceAttempted: resolved == .onDevice,
-      onDeviceCompleted: completed && resolved == .onDevice,
+      pccAttempted: true,
+      pccCompleted: completed,
+      onDeviceAttempted: false,
+      onDeviceCompleted: false,
       fallbackReason: fallbackReason,
       inputCharacters: context.estimatedCharacters,
       latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1_000),
-      waitedMilliseconds: waited)
+      waitedMilliseconds: 0)
   }
 }

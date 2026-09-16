@@ -138,17 +138,60 @@ public struct CapabilityContract: Sendable, Hashable {
   }
 }
 
+/// 등록된 툴 계약이 놓이는 자리.
+///
+/// 열쇠마다 마지막 등록이 이긴다 — 호스트가 코어의 기본 계약을 자기 것으로
+/// 덮어쓸 수 있어야 한다(같은 능력을 다른 인자로 구현한 툴).
+final class ContractRegistry: @unchecked Sendable {
+  private let lock = NSLock()
+  private var contracts: [CapabilityID: CapabilityContract]
+
+  init(seed: [CapabilityContract]) {
+    contracts = Dictionary(seed.map { ($0.capability, $0) }, uniquingKeysWith: { _, last in last })
+  }
+
+  func register(_ added: [CapabilityContract]) {
+    lock.lock()
+    for contract in added { contracts[contract.capability] = contract }
+    lock.unlock()
+  }
+
+  func contract(for capability: CapabilityID) -> CapabilityContract? {
+    lock.lock()
+    defer { lock.unlock() }
+    return contracts[capability]
+  }
+
+  func snapshot() -> [CapabilityID: CapabilityContract] {
+    lock.lock()
+    defer { lock.unlock() }
+    return contracts
+  }
+}
+
 extension CapabilityContract {
-  /// 모든 능력의 계약. **여기 없는 능력은 실행되지 않는다.**
+  /// 실행 가능한 툴의 계약 전부. **여기 없는 능력은 실행되지 않는다.**
   ///
   /// 공급자 이름이 없다는 점에 주의한다 — `mail.send`의 계약은 Gmail의 계약이
   /// 아니고 "메일을 보낸다"의 계약이다. 공급자별 칸(`provider`)은 어느 계정으로
   /// 갈지를 사용자가 지정한 경우에만 쓰이는 선택 칸이다.
-  public static let all: [CapabilityID: CapabilityContract] = Dictionary(
-    uniqueKeysWithValues: declared.map { ($0.capability, $0) })
+  private static let registry = ContractRegistry(seed: coreShipped)
+
+  /// 호스트가 자기 툴의 계약을 등록한다. 부팅에서 한 번 부른다
+  /// (`AgentRuntimeConfiguration.apply()`가 대신 부른다).
+  ///
+  /// 등록하지 않은 툴은 손(`CapabilityHandler`)이 있어도 실행되지 않는다 —
+  /// 계약 없는 인자는 검사할 수 없고, 검사하지 않은 인자를 공급자 API로
+  /// 흘리는 것이 이 코어가 막는 일이다.
+  public static func register(_ contracts: [CapabilityContract]) {
+    registry.register(contracts)
+  }
+
+  /// 지금 등록된 계약. 호스트가 "손은 있는데 계약이 없는 툴"을 잡는 근거다.
+  public static var registered: [CapabilityID: CapabilityContract] { registry.snapshot() }
 
   public static func contract(for capability: CapabilityID) -> CapabilityContract? {
-    all[capability]
+    registry.contract(for: capability)
   }
 
   /// 이 요청이 실행 가능한가. 통과하면 정규화된 인자를 돌려준다.
@@ -166,83 +209,15 @@ extension CapabilityContract {
   ]
   private static let providerChoice: [Argument] = [Argument("provider")]
 
-  private static let declared: [CapabilityContract] = [
-    // MARK: 기존 JustSend 경로
-    CapabilityContract(
-      .memorySearch, required: [Argument("query")], optional: searchPaging),
-    CapabilityContract(.memorySave, required: [Argument("text")]),
-    CapabilityContract(.memoryRead, required: [Argument("itemID")]),
-    CapabilityContract(
-      .contentIngest, required: [Argument("url")], optional: [Argument("title")]),
-    CapabilityContract(.contentRead, required: [Argument("itemID")]),
-    CapabilityContract(.contentSummarize, required: [Argument("itemID")]),
-    CapabilityContract(.recordingStart),
-    CapabilityContract(.recordingStop),
-    CapabilityContract(.recordingRead, required: [Argument("itemID")]),
-    CapabilityContract(
-      .artifactFind, required: [Argument("query")], optional: searchPaging),
-    CapabilityContract(.artifactRead, required: [Argument("itemID")]),
-    // 무엇을 공유할지 없으면 발행하지 않는다 — 앱이 최근 기록을 골라 공개하면
-    // 그것은 사용자가 지시한 공개가 아니다.
-    CapabilityContract(.sharePublish, required: [Argument("itemID")]),
-    CapabilityContract(.shareRevoke, required: [Argument("itemID")]),
-
-    // MARK: Apple 기본 앱
-    CapabilityContract(
-      .calendarSearch,
-      optional: [
-        Argument("query"), Argument("start", .timestamp), Argument("end", .timestamp),
-      ]),
-    CapabilityContract(
-      .calendarCreate,
-      required: [Argument("title"), Argument("start", .timestamp)],
-      optional: [
-        Argument("end", .timestamp), Argument("location"), Argument("notes"),
-      ]),
-    CapabilityContract(
-      .calendarUpdate,
-      required: [Argument("eventID")],
-      optional: [
-        Argument("title"), Argument("start", .timestamp), Argument("end", .timestamp),
-        Argument("location"),
-      ]),
-    CapabilityContract(.calendarDelete, required: [Argument("eventID")]),
-    CapabilityContract(
-      .remindersSearch,
-      optional: [Argument("query"), Argument("includeCompleted", .flag)]),
-    CapabilityContract(
-      .remindersCreate,
-      required: [Argument("title")],
-      optional: [
-        Argument("due", .timestamp), Argument("hasClockTime", .flag), Argument("notes"),
-      ]),
-    // 제목만으로 하나가 확정되는 경우가 있어 식별자를 강제하지 않는다. 여럿이
-    // 잡히면 어댑터가 `ambiguous`로 멈춘다(`AppleRemindersCapability.resolve`).
-    CapabilityContract(
-      .remindersUpdate,
-      optional: [
-        Argument("reminderID"), Argument("title"), Argument("due", .timestamp),
-        Argument("notes"),
-      ]),
-    CapabilityContract(
-      .remindersComplete, optional: [Argument("reminderID"), Argument("title")]),
-    CapabilityContract(
-      .remindersDelete, optional: [Argument("reminderID"), Argument("title")]),
-    CapabilityContract(.peopleResolve, required: [Argument("name")]),
-    CapabilityContract(.contactsRead, required: [Argument("name")]),
-    CapabilityContract(
-      .contactsCreate,
-      required: [Argument("givenName")],
-      optional: [
-        Argument("familyName"), Argument("organization"), Argument("email"),
-        Argument("phone"),
-      ]),
-    CapabilityContract(
-      .contactsUpdate,
-      required: [Argument("contactID")],
-      optional: [Argument("organization"), Argument("email"), Argument("phone")]),
-
-    // MARK: 외부 서비스
+  /// 코어가 **직접 싣는 툴**의 계약. 메일·채팅·웹 커넥터는 이 저장소 안에 구현이
+  /// 있으므로(`Connectors/`) 그 계약도 여기 있다.
+  ///
+  /// 호스트의 툴(기록·보관함·캘린더·연락처 등)은 **호스트가 등록한다**
+  /// (`CapabilityContract.register`). 그 계약을 코어에 적어 두면 코어가 자기가
+  /// 구현하지도 않은 툴의 인자 규칙을 소유하게 되고, 호스트가 툴을 하나 더
+  /// 만들 때마다 코어를 고쳐야 한다.
+  public static let coreShipped: [CapabilityContract] = [
+    // MARK: 외부 서비스 (코어의 커넥터)
     CapabilityContract(
       .mailSearch, required: [Argument("query")],
       optional: searchPaging + providerChoice

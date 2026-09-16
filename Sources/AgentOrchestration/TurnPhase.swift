@@ -66,14 +66,13 @@ public enum ModelTarget: String, Sendable, Hashable {
   case onDevice
   case privateCloud
 
-  /// 지금 이 기기에서 실제로 쓸 수 있는 대상. 권한 없이 PCC 세션을 만들면
-  /// 프레임워크가 `fatalError`로 프로세스를 끝낸다(`PrivateCloudComputeAccess`).
-  public static var preferred: ModelTarget {
-    if #available(iOS 27.0, *), PrivateCloudComputeAccess.isUsable() {
-      return .privateCloud
-    }
-    return .onDevice
-  }
+  /// 오케스트레이션은 **언제나 `privateCloud`**다. 기기 모델은 툴이 자기 일을
+  /// 할 때 쓰는 자리이고(`EvidenceCompiler`·호스트 툴), 계획·답을 대신 쓰지
+  /// 않는다 — 두 모델이 같은 차례를 나눠 맡으면 답이 근거와 어긋난다.
+  ///
+  /// PCC를 쓸 수 없는 기기·계정에서는 차례를 열지 않고 **미지원을 고지한다**
+  /// (`PrivateCloudComputeAccess.isUsable()`). 권한 없이 세션을 만들면
+  /// 프레임워크가 `fatalError`로 프로세스를 끝낸다.
 }
 
 /// 예전 이름. 화면과 계측이 이 낱말로 값을 비교한다(`usedOnDeviceModel`).
@@ -118,8 +117,7 @@ public struct DynamicTurnProfile: Sendable, Equatable {
 
   /// 계획·재계획의 설정. 도구를 고르는 일이므로 범위가 실린다.
   public static func supervising(
-    phase: TurnPhase, target: ModelTarget, scope: CapabilityScope, iteration: Int,
-    sketch: IntentSketch
+    phase: TurnPhase, target: ModelTarget, scope: CapabilityScope, iteration: Int
   ) -> DynamicTurnProfile {
     DynamicTurnProfile(
       phase: phase,
@@ -128,16 +126,9 @@ public struct DynamicTurnProfile: Sendable, Equatable {
       scope: scope,
       contextPolicy: iteration == 0 ? .requestOnly : .requestAndEvidence,
       toolCalling: .allowed,
-      maximumResponseTokens: Self.responseTokens(for: sketch))
-  }
-
-  /// 답의 크기. **문장이 정한다.**
-  ///
-  /// 한 영역 한 동작인 요청의 계획은 한 단계짜리다 — 넉넉한 상한은 지연으로만
-  /// 돌아온다. 여러 영역이 섞였거나 되물을 값이 있을 법한 문장은 네 단계까지
-  /// 나올 수 있고(§30), 그때 잘린 산출은 계획 전체를 버리게 만든다.
-  public static func responseTokens(for sketch: IntentSketch) -> Int {
-    sketch.complexity == .composite || sketch.ambiguity == .underspecified ? 320 : 200
+      // 툴 전체가 보이므로 계획이 길어질 수 있다. 잘린 산출은 계획 전체를
+      // 버리게 만들므로 상한은 넉넉한 쪽으로 고정한다(§30).
+      maximumResponseTokens: 320)
   }
 
   /// 답을 쓰는 설정. **도구가 닫혀 있다.**
@@ -179,26 +170,9 @@ public struct DynamicTurnProfile: Sendable, Equatable {
       maximumResponseTokens: maximumResponseTokens)
   }
 
-  /// 답을 **어느 모델이 쓸 것인가.**
-  ///
-  /// 근거가 작고 한 출처에서 왔으면 기기 모델이 더 빠르다. 감독이 PCC에서
-  /// 돌았으면 그 판단을 뒤집는다 — 같은 차례를 두 모델이 나눠 맡으면 답이
-  /// 근거와 어긋나고, PCC가 참여한 차례는 PCC가 닫아야 한다(§19).
-  ///
-  /// 이 규칙이 `TurnFinalizer` 밖에 있는 이유는 자동화가 같은 규칙을 쓰기
-  /// 때문이다(감독자 없이, 크기와 출처 수만으로).
-  public static let cloudCharacterThreshold = 2_400
-
-  public static func finalizerTarget(
-    evidence: [Evidence], sourceCount: Int, pccSupervised: Bool, budget: PCCBudget
-  ) -> ModelTarget {
-    guard budget.remaining > 0 else { return .onDevice }
-    let characters = evidence.reduce(0) { $0 + $1.forModelContext().count }
-    let wantsCloud =
-      pccSupervised || sourceCount > 1 || characters > cloudCharacterThreshold
-    guard wantsCloud else { return .onDevice }
-    return ModelTarget.preferred
-  }
+  /// 답도 PCC가 쓴다. 근거 크기로 모델을 갈아타던 규칙(`cloudCharacterThreshold`,
+  /// `finalizerTarget`)은 없앴다 — 한 차례를 두 모델이 나눠 맡으면 답이 근거와
+  /// 어긋나고, 그 경계에서 "PCC가 답했다"는 계측이 거짓이 된다.
 
   /// 이 단계가 쓸 지시. **사용자 문장은 여기 들어가지 않는다** — 바깥에서 온
   /// 글은 지시 평면에 서지 못한다(`UntrustedText`).
