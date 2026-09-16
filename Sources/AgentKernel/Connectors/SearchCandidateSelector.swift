@@ -1,0 +1,133 @@
+import Foundation
+
+/// 검색이 돌려준 줄 **중 어느 것을 읽을지 기기에서 고른다.**
+///
+/// 고르는 일을 PCC에게 묻지 않는 이유는 두 가지다. 후보 다섯 줄을 문맥에 실으면
+/// 계획 호출이 그만큼 커지고(제목·스니펫·주소 다섯 벌), 그 선택은 **사적인 맥락이
+/// 가장 잘 아는 일**이다 — 내 기록에 `Private Cloud Compute` 메모가 있다는 사실은
+/// 공개 웹에 보내지 않고도 후보를 고르는 데 쓸 수 있다.
+///
+/// ## 왜 필요한가 (실기 2026-09-17, iPad, 실제 PCC)
+///
+/// `"내 기록에 있는 PCC 메모와 최신 웹 내용을 비교해줘"`가 공급자 1위를 읽었고,
+/// 그 1위는 `Pointe Coupée Parish Government`의 연락처 페이지였다. `PCC`는 애플의
+/// 낱말이 아니고, 검색 공급자는 우리 사용자의 맥락을 모른다. 그런데 **우리는 안다** —
+/// 그 차례가 방금 읽은 사적 기록에 `Private Cloud Compute`가 적혀 있었다.
+///
+/// ## 경계
+///
+/// 사적 맥락은 **점수 계산에만** 쓰인다. 공개 웹으로 나가는 것은 질의뿐이고
+/// (`web.search`), 이 자리는 이미 받아 온 줄들을 기기에서 다시 세우는 일이다.
+public enum SearchCandidateSelector {
+  /// 점수가 붙은 후보 하나.
+  public struct Candidate: Sendable, Equatable {
+    public let row: CapabilitySourceRow
+    public let score: Int
+
+    public var url: String { row.identifier }
+  }
+
+  /// 제목이 맞은 것은 부제가 맞은 것보다 강한 신호다. 스니펫은 공급자가 질의에
+  /// 맞춰 잘라 낸 글이라 어느 후보에서나 질의 낱말이 보인다.
+  static let titleWeight = 3
+  static let snippetWeight = 1
+  /// 낱말이 **그대로** 맞은 것과 안에 들어 있는 것. 한국어는 조사가 붙어
+  /// (`애플이`·`메모와`) 정확히 맞는 일이 드물다 — 포함도 신호로 세되 더 약하게 센다.
+  static let exactBonus = 2
+
+  /// 기기에서 읽을 수 없는 문서는 후보가 아니다. `web.read`가 글이 아닌 것을
+  /// 거절하므로(`ContentFetchError.unsupportedType`) 이 줄을 고르면 그 차례는
+  /// 읽기 실패로 끝난다 — 벌점이 아니라 **제외**다.
+  static let unreadableExtensions = [
+    ".pdf", ".zip", ".dmg", ".pkg", ".mp4", ".mov", ".mp3", ".png", ".jpg", ".jpeg",
+    ".gif", ".svg", ".xls", ".xlsx", ".doc", ".docx", ".ppt", ".pptx",
+  ]
+
+  /// 후보를 점수 순으로. **같은 점수는 공급자 순서를 지킨다** — 공급자의 순위도
+  /// 정보이고, 우리가 아는 것이 없을 때 그 정보를 버릴 이유가 없다.
+  ///
+  /// - Parameters:
+  ///   - rows: `web.search`가 돌려준 줄. `identifier`가 주소다.
+  ///   - query: 사용자가 말한 문장. 계획이 만든 질의보다 이 값이 넓다.
+  ///   - context: 이 차례가 기기에서 이미 읽은 **사적 맥락**(내 기록의 제목·본문).
+  ///     공개 웹으로 나가지 않는다.
+  public static func rank(
+    _ rows: [CapabilitySourceRow], query: String, context: [String] = []
+  ) -> [Candidate] {
+    let wanted = terms(query).union(context.flatMap { terms($0) })
+    var bestByHost: [String: Candidate] = [:]
+    var order: [String] = []
+
+    for row in rows {
+      guard let url = URL(string: row.identifier), let host = url.host?.lowercased(),
+        !isUnreadable(url)
+      else { continue }
+      let candidate = Candidate(row: row, score: score(row, terms: wanted))
+      // 한 사이트가 다섯 줄을 차지하면 다른 후보를 볼 기회가 없어진다. 그 사이트의
+      // **가장 잘 맞는 줄** 하나만 남긴다.
+      if let existing = bestByHost[host] {
+        if candidate.score > existing.score { bestByHost[host] = candidate }
+      } else {
+        bestByHost[host] = candidate
+        order.append(host)
+      }
+    }
+
+    let candidates = order.compactMap { bestByHost[$0] }
+    // `sorted(by:)`는 안정 정렬이 아니다. 자리를 함께 들고 정렬해 공급자 순서를 지킨다.
+    return candidates.enumerated()
+      .sorted { left, right in
+        left.element.score == right.element.score
+          ? left.offset < right.offset : left.element.score > right.element.score
+      }
+      .map(\.element)
+  }
+
+  /// 결정적 점수로 **고르지 못했는가.**
+  ///
+  /// 둘이다: 아무 낱말도 맞지 않았거나(0점), 1위와 2위가 같은 점수다. 그때 기기
+  /// 모델에게 묻는 것이 값어치가 있다 — 점수가 갈렸으면 모델을 부르는 것은 비용만
+  /// 늘린다.
+  public static func isAmbiguous(_ ranked: [Candidate]) -> Bool {
+    guard let first = ranked.first else { return false }
+    if first.score == 0 { return true }
+    guard let second = ranked.dropFirst().first else { return false }
+    return first.score == second.score
+  }
+
+  static func isUnreadable(_ url: URL) -> Bool {
+    let path = url.path.lowercased()
+    return unreadableExtensions.contains(where: path.hasSuffix)
+  }
+
+  static func score(_ row: CapabilitySourceRow, terms wanted: Set<String>) -> Int {
+    guard !wanted.isEmpty else { return 0 }
+    let title = terms(row.title)
+    let snippet = terms(row.subtitle)
+    var total = 0
+    for term in wanted {
+      total += weight(term, in: title) * titleWeight
+      total += weight(term, in: snippet) * snippetWeight
+    }
+    return total
+  }
+
+  private static func weight(_ term: String, in candidate: Set<String>) -> Int {
+    if candidate.contains(term) { return exactBonus }
+    // 조사·복합어. `"애플"`은 `"애플이"` 안에 있고 `"compute"`는 `"computing"` 안에 있다.
+    if candidate.contains(where: { $0.contains(term) || term.contains($0) }) { return 1 }
+    return 0
+  }
+
+  /// 글을 낱말로. 영문은 소문자로, 한국어는 붙어 오는 조사를 떼지 않는다 —
+  /// 떼려면 형태소 분석이 필요하고, 포함 비교가 그 일을 대신한다(`weight`).
+  ///
+  /// 한 글자 낱말은 버린다. `"의"`·`"a"`는 어느 후보에나 있어 점수를 평평하게 만든다.
+  static func terms(_ text: String) -> Set<String> {
+    let lowered = text.lowercased()
+    let pieces = lowered.split(whereSeparator: { character in
+      !character.isLetter && !character.isNumber
+    })
+    return Set(pieces.filter { $0.count > 1 }.map(String.init))
+  }
+}

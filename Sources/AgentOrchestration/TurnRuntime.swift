@@ -543,7 +543,7 @@ public final class TurnRuntime {
 
       //    웹도 같다. 검색 결과는 주소와 공급자가 쓴 한 줄이고, 그 줄로 답을 쓰면
       //    열어 보지 않은 페이지에 대해 답한 것이 된다(`searchedPageReadStep`).
-      if let injected = Self.searchedPageReadStep(state) {
+      if let injected = await searchedPageReadStep(&state) {
         state.searchedPageReadApplied = true
         state.steps = [injected]
         state.telemetry.fallbackReason = "invariant:web.read"
@@ -847,7 +847,7 @@ public final class TurnRuntime {
         // 읽기를 **그 단계 앞에** 끼운다. 계획이 끝난 뒤에 메우면 요약과 저장이
         // 이미 지나간 자리이고, 그때 읽은 페이지는 아무 자리도 채우지 못한다.
         if step.unresolved.contains(ResolvableArgument.sourceText.rawValue),
-          let injected = Self.searchedPageReadStep(state)
+          let injected = await searchedPageReadStep(&state)
         {
           state.searchedPageReadApplied = true
           state.steps.insert(contentsOf: [injected, step], at: 0)
@@ -1291,17 +1291,55 @@ public final class TurnRuntime {
   /// `web.search` 하나였고 차례는 다섯 줄을 찾은 뒤 `partial`로 닫혔다 — 근거
   /// 조각은 0개였다. 모델에게 다시 묻지 않고 여기서 메운다: 찾았다는 사실이 곧
   /// 읽을 것이 있다는 뜻이다(`recordReadStep`과 같은 자리).
-  private static func searchedPageReadStep(_ state: TurnState) -> PlannedStep? {
+  private func searchedPageReadStep(_ state: inout TurnState) async -> PlannedStep? {
     guard !state.searchedPageReadApplied else { return nil }
     guard state.scope.contains(.webRead) else { return nil }
-    guard let hit = state.ledger.receipts.last(where: { $0.capability == .webSearch }),
-      let candidate = CapabilitySourceRow.rows(in: hit.details).first?.identifier,
-      let url = URL(string: candidate), url.scheme == "http" || url.scheme == "https",
-      !state.readURLs.contains(candidate),
+    guard let hit = state.ledger.receipts.last(where: { $0.capability == .webSearch })
+    else { return nil }
+    // **어느 줄을 읽을지는 기기가 고른다.** 공급자 1위를 그대로 읽던 동안
+    // `"내 기록의 PCC 메모와 비교해줘"`가 `Pointe Coupée Parish Government`의
+    // 연락처 페이지를 읽었다(실기 2026-09-17, iPad) — `PCC`는 애플의 낱말이 아니고
+    // 공급자는 우리 사용자의 맥락을 모른다. 그 맥락은 기기에 있다.
+    let rows = CapabilitySourceRow.rows(in: hit.details)
+    // **하나라도 읽었으면 끝이다.** 이 자리의 목적은 "찾았는데 하나도 읽지 않는
+    // 일"을 막는 것이고, 후보를 전부 읽는 것이 아니다 — 후보 랭킹을 넣자마자
+    // 계획대로 1위를 읽은 차례가 2위를 한 번 더 읽었다(시험 실측).
+    guard !rows.contains(where: { state.readURLs.contains($0.identifier) }) else {
+      return nil
+    }
+    let context = Self.privateContext(state)
+    let ranked = SearchCandidateSelector.rank(rows, query: state.input, context: context)
+      .filter { candidate in
+        let scheme = URL(string: candidate.url)?.scheme
+        return scheme == "http" || scheme == "https"
+      }
+    guard var choice = ranked.first else { return nil }
+    // 점수가 갈렸으면 기기 모델을 부르지 않는다 — 비용만 늘린다. 갈리지 않은
+    // 경우(0점·동점)는 흔하다: 한국어 문장과 영문 제목은 낱말이 맞지 않는다.
+    if SearchCandidateSelector.isAmbiguous(ranked),
+      let picked = await SearchCandidateChoice().pick(
+        from: ranked, query: state.input, context: context)
+    {
+      choice = picked
+      state.telemetry.localSelections += 1
+    }
+    guard
       case .success(let arguments) = CapabilityContract.normalize(
-        ["url": .text(candidate)], for: .webRead)
+        ["url": .text(choice.url)], for: .webRead)
     else { return nil }
     return PlannedStep(capability: .webRead, arguments: arguments)
+  }
+
+  /// 후보를 고를 때 쓰는 **사적 맥락.** 이 차례가 기기에서 이미 읽은 내 기록이다.
+  ///
+  /// 공개 웹으로 나가지 않는다 — 나간 것은 질의뿐이고(`web.search`), 이 값은 이미
+  /// 받아 온 줄들을 기기에서 다시 세우는 데만 쓰인다.
+  private static func privateContext(_ state: TurnState) -> [String] {
+    state.ledger.receipts
+      .filter { $0.capability.domain == "memory" || $0.capability.domain == "artifact" }
+      .flatMap { CapabilitySourceRow.rows(in: $0.details) }
+      .flatMap { [$0.title, $0.subtitle, $0.body] }
+      .filter { !$0.isEmpty }
   }
 
   private static func urlInvariantStep(_ state: TurnState) -> PlannedStep? {

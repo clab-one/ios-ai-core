@@ -56,6 +56,9 @@ public struct TurnTelemetry: Sendable, Equatable {
   public var supervisorIterations = 0
   /// 기기 모델로 압축한 횟수와 그 분모(§33 Local Compaction Ratio).
   public var localExtractions = 0
+  /// 기기 모델이 검색 후보를 고른 횟수. 점수가 갈리지 않았을 때만 오른다 —
+  /// 이 값이 매 차례 1이면 결정적 점수가 일을 못 하고 있다는 뜻이다.
+  public var localSelections = 0
   public var retrievedRows = 0
   /// 한 차례에서 **함께 보낸 독립 읽기**의 최대 수(§12 PR 4). 이 값이 늘 1이면
   /// fanout이 꺼진 것이고, 그 사실은 지연에만 조용히 나타난다.

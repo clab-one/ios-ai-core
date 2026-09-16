@@ -23,6 +23,9 @@ public struct AdmissionJob: Hashable, Sendable, CustomStringConvertible,
   public static let conversationAnswer = AdmissionJob("conversationAnswer")
   /// 회수한 원문에서 값을 뽑는 단계(`EvidenceCompiler`). 차례당 상한이 따로 있다.
   public static let conversationExtraction = AdmissionJob("conversationExtraction")
+  /// 검색 후보 중 하나를 고르는 단계(`SearchCandidateChoice`). 이름을 나눠야
+  /// "후보를 고르느라 느렸다"와 "요약하느라 느렸다"를 가를 수 있다.
+  public static let candidateSelection = AdmissionJob("candidateSelection")
 }
 
 /// 입장 줄에서 기다린 시간을 **호출자에게 돌려주는** 상자.
