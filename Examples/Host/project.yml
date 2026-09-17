@@ -1,0 +1,67 @@
+# xcodegen 템플릿. `xcodegen --spec project.yml`로 프로젝트를 만든다.
+#
+# Xcode 프로젝트를 손으로 들고 있는 앱은 이 파일에서 **네 자리만** 옮기면 된다:
+# 배포 대상(iOS 26), Swift 언어 모드, 엔타이틀먼트 경로, 패키지 의존성 두 개.
+name: MyAgentApp
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    # 코어와 같은 언어 모드. 코어는 Swift 5 모드로 빌드되고(동시성 의미를 바꾸지
+    # 않으려고) 호스트가 6 모드여도 함께 쓸 수 있지만, 그때 `@MainActor` 클로저
+    # 두 자리(`supervising`·`finalizing`)가 경고에서 오류로 바뀐다.
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    CODE_SIGN_STYLE: Automatic
+    # 실기에서만 PCC가 열린다. 시뮬레이터의 "Sign to Run Locally" 서명은
+    # 엔타이틀먼트를 싣지 않는다(`codesign -d --entitlements`가 빈 dict).
+    DEVELOPMENT_TEAM: YOURTEAMID
+packages:
+  # ① 같은 워크스페이스에 두고 쓰기(포크·수정이 잦은 동안)
+  ios-ai-core:
+    path: ../ios-ai-core
+  # ② 판을 고정해 가져오기(권장). 코어는 원격 의존성이 없으므로 해석이 빠르다.
+  #    포크했으면 url을 자기 포크로 바꾼다.
+  # ios-ai-core:
+  #   url: https://github.com/your-org/ios-ai-core
+  #   exactVersion: 0.1.0
+targets:
+  MyAgentApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    dependencies:
+      # 두 라이브러리를 **둘 다** 넣는다. Kernel만으로는 차례가 돌지 않고,
+      # Orchestration만으로는 능력·계약·수령증 타입이 없다.
+      - package: ios-ai-core
+        product: AgentKernel
+      - package: ios-ai-core
+        product: AgentOrchestration
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.myagentapp
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: My Agent App
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        # PCC 엔타이틀먼트. 이 경로가 비면 계획 단계가 열리지 않는다.
+        CODE_SIGN_ENTITLEMENTS: App/App.entitlements
+        # 아이폰·아이패드. 실측: iPad에서 기기 모델이 `modelNotReady`인 경우가 있고
+        # 원인은 기기 언어 설정이었다.
+        TARGETED_DEVICE_FAMILY: "1,2"
+  # 실제 PCC를 지나는 시험은 **엔타이틀먼트를 든 이 앱**만 돌릴 수 있다.
+  # 코어 저장소의 시험 번들은 일반 XCTest 호스트에서 돌아 PCC를 열지 못한다.
+  MyAgentAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: MyAgentApp
+    settings:
+      base:
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/MyAgentApp.app/MyAgentApp
+        BUNDLE_LOADER: $(TEST_HOST)

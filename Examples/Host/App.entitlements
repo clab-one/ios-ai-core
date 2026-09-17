@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Private Cloud Compute. **이 열쇠가 없으면 이 앱은 에이전트를 열지 못한다** —
+	  오케스트레이터가 PCC 하나이고, 코어는 그 사실을 `AgentRuntime.isSupported`로
+	  먼저 말한다.
+
+	  App ID에 "Access to models on Private Cloud Compute"가 켜져 있어야 서명을
+	  지난다. 켜지지 않은 App ID로 서명하면 **빌드는 되고 실행 중에 프레임워크가
+	  fatalError로 프로세스를 끝낸다**(do/catch로 감쌀 수 없다).
+
+	  그리고 이 값은 `AgentHostIdentity(privateCloudComputeEntitled:)`와 **같아야**
+	  한다. iOS에는 자기 엔타이틀먼트를 읽는 공개 API가 없어서 코어는 호스트가
+	  말한 값을 믿는다 — 두 자리가 갈리면 앱이 죽는다. 그 둘을 대조하는 시험을
+	  호스트가 들고 있어야 한다.
+	-->
+	<key>com.apple.developer.private-cloud-compute</key>
+	<true/>
+</dict>
+</plist>
