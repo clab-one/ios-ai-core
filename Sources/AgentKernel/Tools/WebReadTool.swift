@@ -18,6 +18,8 @@ import Foundation
 /// 글을 PCC에 보내지 않는다. 이 본문은 기기 모델이 사실 몇 줄로 줄이는 재료이고
 /// (`EvidenceCompiler`), 줄이지 못하면 잘린다 — 원문이 문맥에 실리는 경로는 없다.
 public struct WebReadTool: CapabilityHandler {
+  private static let log = AgentHost.logger("web-read")
+
   /// 수령증에 담을 글자 상한.
   ///
   /// 이 값의 근거는 두 소비자다. 기기 모델은 앞 4,000자만 본다
@@ -65,9 +67,22 @@ public struct WebReadTool: CapabilityHandler {
       // 자기 문을 주입한 호스트에게는 이 능력이 그냥 HTTP 클라이언트가 된다 —
       // 그리고 그 주소는 인터넷이 골라 준 주소다.
       let document = try await fetch(policy.vet(url))
-      let text = try Self.text(in: document)
-      let truncated = text.count > Self.characterLimit
-      let body = truncated ? String(text.prefix(Self.characterLimit)) : text
+      let extracted = try Self.text(in: document)
+      let truncated = extracted.text.count > Self.characterLimit
+      let body =
+        truncated ? String(extracted.text.prefix(Self.characterLimit)) : extracted.text
+      // **어느 단계에서 커졌는지 적는다.** 한 줄에 네 숫자다: 받은 바이트, 해독한
+      // 글자, 마크다운 글자, 수령증에 담은 글자. 페이지가 상한에 걸렸을 때
+      // "기사가 길다"와 "메뉴·추천글이 대부분이다"를 이 줄로 가른다.
+      Self.log.info(
+        """
+        web.read host=\(document.url.host ?? "", privacy: .public) \
+        bytes=\(document.bytes.count, privacy: .public) \
+        decoded=\(extracted.decoded, privacy: .public) \
+        markdown=\(extracted.text.count, privacy: .public) \
+        receipt=\(body.count, privacy: .public) \
+        truncated=\(truncated, privacy: .public)
+        """)
 
       return ActionReceipt(
         requestID: request.id, capability: .webRead, summary: "web.read.result",
@@ -94,7 +109,12 @@ public struct WebReadTool: CapabilityHandler {
   }
 
   /// 바이트를 글로. **글이 아닌 것은 글로 읽지 않는다.**
-  static func text(in document: FetchedDocument) throws -> String {
+  ///
+  /// 해독한 글자 수를 함께 돌려주는 이유는 계측이다. 받은 바이트·해독한 글자·
+  /// 마크다운 글자·수령증에 담은 글자가 각각 다른 값이고, 어느 단계에서 커졌는지
+  /// 모르면 상한을 어디에 둘지 말할 수 없다(실기 2026-09-17 P01: 한 페이지가
+  /// 40,000자 상한에 걸려 차례가 `partial`로 닫혔다).
+  static func text(in document: FetchedDocument) throws -> (text: String, decoded: Int) {
     let type = document.mimeType
     let isHTML =
       type.contains("html") || type.contains("xml") || type.isEmpty
@@ -109,7 +129,7 @@ public struct WebReadTool: CapabilityHandler {
     let text = isHTML ? HTMLMarkdown.markdown(fromHTML: raw) : raw
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { throw ContentFetchError.emptyDocument }
-    return trimmed
+    return (trimmed, raw.count)
   }
 
   /// 헤더가 시킨 인코딩으로 먼저 읽고, 실패하면 UTF-8·Latin-1로 내려간다.
