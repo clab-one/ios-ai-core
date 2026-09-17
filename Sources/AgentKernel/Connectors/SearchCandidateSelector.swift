@@ -97,24 +97,25 @@ public enum SearchCandidateSelector {
 
   /// 결정적 점수로 **고르지 못했는가.**
   ///
-  /// 셋이다:
+  /// 둘이다:
   ///
-  /// 1. 아무 낱말도 맞지 않았다(0점).
-  /// 2. 1위와 2위가 같은 점수다.
-  /// 3. 사적 맥락이 있었는데 1위가 그 맥락에서 점수를 하나도 받지 못했다. 그 1위는
+  /// 1. 아무 낱말도 맞지 않았다(0점). 우리가 판단한 것이 없다.
+  /// 2. 사적 맥락이 있었는데 1위가 그 맥락에서 점수를 하나도 받지 못했다. 그 1위는
   ///    **질의의 약어만 맞은 줄**이다 — `"PCC"`로 찾은 식료품 협동조합의 특가
   ///    페이지가 그것이다(실기 2026-09-17 P02).
   ///
-  /// 그때 기기 모델에게 묻는 것이 값어치가 있다. 점수가 갈렸으면 모델을 부르는
-  /// 것은 비용만 늘린다.
+  /// **동점은 여기 없다.** 넣었다가 뺐다: 1위가 양수 점수를 들고 있으면 우리가
+  /// 판단한 것이 있고, 동점의 순서는 공급자 순위가 정한다(이 랭커는 그 순서를
+  /// 안정적으로 보존한다). 동점에 모델을 부르던 동안 결정적 랭킹이 고른 설명글
+  /// 대신 모델이 보도자료를 골랐고 그 차례는 `partial`로 닫혔다(실기 2026-09-17
+  /// P01 run B). 그리고 `localSelections`가 "결정적 점수로 안전하게 읽을 수 없었다"를
+  /// 뜻하게 된다 — 단순 동점이 섞여 있으면 그 뜻이 흐려진다.
   ///
   /// - Parameter informed: 사적 맥락을 넘겨 점수를 냈는가.
   public static func isAmbiguous(_ ranked: [Candidate], informed: Bool = false) -> Bool {
     guard let first = ranked.first else { return false }
     if first.score == 0 { return true }
-    if informed, first.contextScore == 0 { return true }
-    guard let second = ranked.dropFirst().first else { return false }
-    return first.score == second.score
+    return informed && first.contextScore == 0
   }
 
   static func isUnreadable(_ url: URL) -> Bool {

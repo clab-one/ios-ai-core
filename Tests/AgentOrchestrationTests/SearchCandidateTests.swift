@@ -124,16 +124,29 @@ final class SearchCandidateTests: XCTestCase {
     XCTAssertEqual(ranked.first?.url, "https://example.com/pcc")
   }
 
-  /// 1위와 2위가 같은 점수면 **갈리지 않았다.** 그때가 기기 모델에게 물을 자리이고,
-  /// 점수가 갈렸을 때 부르는 것은 비용만 늘린다.
-  func testTieIsAmbiguousAndClearWinnerIsNot() {
+  /// **동점은 갈리지 않은 것이 아니다.** 1위가 양수 점수를 들고 있으면 우리가
+  /// 판단한 것이 있고, 그 순서는 공급자 순위가 정한다.
+  ///
+  /// 동점에 기기 모델을 부르던 동안, 결정적 랭킹이 고른 설명글 대신 모델이
+  /// 보도자료를 골랐고 그 차례는 `partial`로 닫혔다(실기 2026-09-17 P01 run B).
+  func testTieIsNotAmbiguousButZeroScoreIs() {
     let tied = [
       CapabilitySourceRow(title: "Private Cloud Compute", identifier: "https://a.example/"),
       CapabilitySourceRow(title: "private cloud compute", identifier: "https://b.example/"),
     ]
+    let ranked = SearchCandidateSelector.rank(tied, query: "private cloud compute")
+    XCTAssertEqual(ranked.first?.score, ranked.last?.score, "픽스처가 동점이 아니다")
+    XCTAssertFalse(
+      SearchCandidateSelector.isAmbiguous(ranked), "동점을 갈리지 않은 것으로 읽었다")
+
+    let unmatched = [
+      CapabilitySourceRow(title: "날씨", identifier: "https://a.example/"),
+      CapabilitySourceRow(title: "요리", identifier: "https://b.example/"),
+    ]
     XCTAssertTrue(
       SearchCandidateSelector.isAmbiguous(
-        SearchCandidateSelector.rank(tied, query: "private cloud compute")))
+        SearchCandidateSelector.rank(unmatched, query: "private cloud compute")),
+      "0점은 우리가 판단한 것이 없다는 뜻이다")
 
     let decided = [
       CapabilitySourceRow(title: "Private Cloud Compute", identifier: "https://a.example/"),

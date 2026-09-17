@@ -73,6 +73,20 @@ public struct TurnTelemetry: Sendable, Equatable {
   /// 목적별 대기 시간(`conversationPlan=120 conversationAnswer=0` 꼴). 내용 없다.
   public var modelWaitByPurpose: String = ""
   public var latencyMilliseconds = 0
+  /// 런타임이 모델의 계획을 **보정한** 이유(`dependency:web.read`·
+  /// `search:no-relevant-candidate`). 실패가 아니라 정상 경로다 — PCC는 뜻을
+  /// 계획하고 런타임은 그 뜻을 실행 가능한 순서로 낮춘다.
+  public var interventionReason: String = ""
+  /// **완전함을 깎은 사실들.** 마지막에 관측된 수령증에서 계산한다
+  /// (`TurnRuntime.completionReasons`) — 비어 있으면 깎인 것이 없다.
+  ///
+  /// 쓰는 자리를 여러 군데 두지 않는 이유가 이 필드의 역사다. 보정 표시와 실패
+  /// 사유가 한 칸을 나눠 쓰던 동안 `phase=partial fallback=invariant:web.read`가
+  /// 남았고(실기 2026-09-17 P01) 그 줄은 **왜 부분으로 닫혔는지 말하지 않는다** —
+  /// 보정이 사유를 덮었기 때문이다.
+  public var completionReason: String = ""
+  /// **모델·백엔드가 대역으로 내려선** 이유만. 계획 거절·문맥 초과·마감은 이 칸이
+  /// 아니다(`completionReason`).
   public var fallbackReason: String = ""
   public var succeeded = false
   /// 처리 위치. 화면의 접근 영수증이 이 값에서 나온다(§36).
@@ -99,6 +113,8 @@ public struct TurnTelemetry: Sendable, Equatable {
       waitByPurpose=\(modelWaitByPurpose, privacy: .public) \
       location=\(processingLocation.rawValue, privacy: .public) \
       latency=\(latencyMilliseconds, privacy: .public) \
+      intervention=\(interventionReason, privacy: .public) \
+      completion=\(completionReason, privacy: .public) \
       fallback=\(fallbackReason, privacy: .public) ok=\(succeeded, privacy: .public)
       """)
   }

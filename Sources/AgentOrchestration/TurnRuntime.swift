@@ -213,6 +213,12 @@ public final class TurnRuntime {
     public var invariantApplied = false
     /// 찾은 페이지를 읽으라고 **한 번** 냈는가.
     public var searchedPageReadApplied = false
+    /// 차례를 **끝낸 사실들.** 마감·상한·문맥 초과·계약 거절.
+    ///
+    /// 문자열 한 칸에 덮어쓰지 않고 목록으로 드는 이유: 한 차례에 둘 이상 성립한다
+    /// (마감에 걸린 차례가 약속한 쓰기도 못 했다). 마지막에 이 목록과 관측된
+    /// 수령증에서 `completionReason`을 계산한다.
+    public var terminations: [String] = []
     /// 감독을 PCC가 했는가. 답을 누가 써야 하는지의 근거다(§19).
     public var pccSupervised = false
     /// 이미 **똑같이** 실행한 호출. 열쇠는 능력 이름 + 인자 지문이다.
@@ -369,7 +375,7 @@ public final class TurnRuntime {
     guard input.count <= PCCContextBudget.standard.requestCharacters else {
       let refusal = ContextCompilationError.requestTooLarge(
         actual: input.count, limit: PCCContextBudget.standard.requestCharacters)
-      state.telemetry.fallbackReason = refusal.reason
+      state.terminations.append(refusal.reason)
       await finish(state, phase: .failed, reason: refusal.reason)
       return
     }
@@ -379,7 +385,7 @@ public final class TurnRuntime {
     // 접히던 동안, 연결이 없는 기기의 모든 요청이 `model.unavailable`로 끝났다
     // (실측 2026-09-14: `tools=0 latency=1`). 모델은 부른 적조차 없었다.
     guard !scope.isEmpty else {
-      state.telemetry.fallbackReason = "noCapability"
+      state.terminations.append("noCapability")
       await finish(state, phase: .failed, reason: "noCapability")
       return
     }
@@ -518,14 +524,14 @@ public final class TurnRuntime {
           state.attachmentReads.insert(id)
         }
         state.steps = [injected]
-        state.telemetry.fallbackReason = "invariant:memory.read"
+        state.telemetry.interventionReason = "dependency:memory.read"
         continue
       }
 
       if let injected = Self.urlInvariantStep(state) {
         state.invariantApplied = true
         state.steps = [injected]
-        state.telemetry.fallbackReason = "invariant:web.read"
+        state.telemetry.interventionReason = "dependency:web.read"
         continue
       }
 
@@ -537,7 +543,7 @@ public final class TurnRuntime {
       if let injected = Self.recordReadStep(state) {
         state.recordReadApplied = true
         state.steps = [injected]
-        state.telemetry.fallbackReason = "invariant:memory.read"
+        state.telemetry.interventionReason = "dependency:memory.read"
         continue
       }
 
@@ -546,17 +552,17 @@ public final class TurnRuntime {
       if let injected = await searchedPageReadStep(&state) {
         state.searchedPageReadApplied = true
         state.steps = [injected]
-        state.telemetry.fallbackReason = "invariant:web.read"
+        state.telemetry.interventionReason = "dependency:web.read"
         continue
       }
 
       guard ContinuousClock.now < state.executionDeadline else {
-        state.telemetry.fallbackReason = "deadline"
+        state.terminations.append("deadline")
         state.incomplete = true
         break
       }
       guard state.unsuccessfulToolExecutions < TurnLimits.maxUnsuccessfulToolExecutions else {
-        state.telemetry.fallbackReason = "limit:tools"
+        state.terminations.append("limit:tools")
         state.incomplete = true
         break
       }
@@ -834,7 +840,7 @@ public final class TurnRuntime {
       guard ContinuousClock.now < state.executionDeadline,
         state.unsuccessfulToolExecutions < TurnLimits.maxUnsuccessfulToolExecutions
       else {
-        state.telemetry.fallbackReason = "limit:tools"
+        state.terminations.append("limit:tools")
         state.incomplete = true
         state.steps = []
         return .drained
@@ -851,7 +857,7 @@ public final class TurnRuntime {
         {
           state.searchedPageReadApplied = true
           state.steps.insert(contentsOf: [injected, step], at: 0)
-          state.telemetry.fallbackReason = "invariant:web.read"
+          state.telemetry.interventionReason = "dependency:web.read"
           continue
         }
         // 그 밖의 빈 자리는 **되묻는다.** 규칙이 만든 다른 길로 갈아타지 않는다 —
@@ -1338,6 +1344,7 @@ public final class TurnRuntime {
         // **고를 것이 없다고 답했다.** 읽지 않는다 — 사용자가 묻지 않은 페이지를
         // "최신 웹 내용"으로 말하는 것보다 웹에서 찾지 못했다고 말하는 것이 맞다.
         state.telemetry.localSelections += 1
+        state.telemetry.interventionReason = "search:no-relevant-candidate"
         Self.log.info("web.read declined reason=noRelevantCandidate")
         return nil
       case .unavailable:
@@ -1495,13 +1502,11 @@ public final class TurnRuntime {
     // **약속한 부작용이 일어났는가.** 계획이 전송·생성을 담았는데 수령증이 없으면
     // 그 차례는 완료가 아니다 — 이 검사가 없던 동안 모델이 계획에서 전송을
     // 빼먹고도 답에 "보냈습니다"를 썼다(실기 2026-09-16).
-    let unkept = state.plannedWrites.subtracting(state.ledger.completedWrites)
-    if !unkept.isEmpty {
+    // 사유는 여기서 적지 않는다. `finish`가 관측된 사실에서 계산한다
+    // (`completionReasons`) — 여러 자리에서 한 칸에 덮어쓰던 동안 보정 표시가
+    // 실패 사유를 지웠다(실기 2026-09-17 P01).
+    if !state.plannedWrites.subtracting(state.ledger.completedWrites).isEmpty {
       state.incomplete = true
-      if state.telemetry.fallbackReason.isEmpty {
-        state.telemetry.fallbackReason =
-          "unkept:\(unkept.map(\.rawValue).sorted().joined(separator: "+"))"
-      }
     }
     emit(.finalizing, state)
 
@@ -1536,7 +1541,7 @@ public final class TurnRuntime {
       } catch {
         // 효과는 이미 일어났다. 답을 쓰지 못한 사유만 남기고 아래의 호스트 문구로
         // 닫는다 — 자른 문맥으로 PCC를 부르지 않는다.
-        state.telemetry.fallbackReason = error.reason
+        state.terminations.append(error.reason)
         context = nil
       }
       if let context {
@@ -1602,7 +1607,7 @@ public final class TurnRuntime {
         now: state.context.referenceTime,
         calendar: state.context.calendar)
     } catch {
-      state.telemetry.fallbackReason = error.reason
+      state.terminations.append(error.reason)
       await finish(state, phase: .failed, reason: error.reason)
       return
     }
@@ -1738,6 +1743,40 @@ public final class TurnRuntime {
     return title == reference.title || title == reference.subtitle
   }
 
+  /// **완전함을 깎은 사실들.** 비어 있으면 깎인 것이 없다.
+  ///
+  /// 문자열 한 칸에 그때그때 적지 않고 여기서 계산하는 이유: 한 차례에 여러 사실이
+  /// 함께 성립하고, 적는 자리가 여럿이면 뒤에 적는 쪽이 앞을 지운다. 그 구조가
+  /// `phase=partial fallback=invariant:web.read`를 만들었다 — 보정 표시가 사유의
+  /// 자리를 차지했고, 그 줄은 왜 부분으로 닫혔는지 말하지 않았다(실기 2026-09-17 P01).
+  ///
+  /// 근거는 상태가 아니라 **수령증**이다(`Evidence`를 매번 다시 뽑는 것과 같은 방식).
+  private static func completionReasons(
+    _ state: TurnState, phase: ConversationTurnResult.Phase, wroteAnswer: Bool
+  ) -> [String] {
+    var reasons: [String] = []
+    for termination in state.terminations where !reasons.contains(termination) {
+      reasons.append(termination)
+    }
+    // 읽은 범위가 온전하지 않았다. 자른 페이지·못 읽은 본문·끝내지 못한 쪽 넘김.
+    for coverage in state.ledger.receipts.flatMap(\.coverage)
+    where coverage.state != .complete || coverage.truncated {
+      let detail = coverage.reason?.rawValue ?? coverage.state.rawValue
+      let line = "coverage:\(coverage.capability.rawValue):\(detail)"
+      if !reasons.contains(line) { reasons.append(line) }
+    }
+    // 약속한 쓰기가 일어나지 않았다.
+    let unkept = state.plannedWrites.subtracting(state.ledger.completedWrites)
+    if !unkept.isEmpty {
+      reasons.append("unkept:\(unkept.map(\.rawValue).sorted().joined(separator: "+"))")
+    }
+    // 답이 필요한 차례인데 모델이 쓰지 못했다. 상태 문구는 답이 아니다.
+    if state.answerRequired, !wroteAnswer, phase != .awaitingUser {
+      reasons.append("answer:unavailable")
+    }
+    return reasons
+  }
+
   /// 결과를 화면과 저장소에 남긴다. **모든 종료가 이 문을 지난다.**
   private func finish(
     _ initial: TurnState,
@@ -1754,7 +1793,7 @@ public final class TurnRuntime {
       await compileEvidence(&state)
     }
     let terminalReason = reason ?? state.ledger.attempts.last(where: { !$0.succeeded })?.reason
-      ?? state.telemetry.fallbackReason
+      ?? state.terminations.first ?? state.telemetry.fallbackReason
     let interrupted = !eligible(state)
     let confirmedWrites = state.ledger.receipts.filter {
       $0.capability.executionClass == .localWrite || $0.capability.executionClass == .remoteWrite
@@ -1771,7 +1810,7 @@ public final class TurnRuntime {
     case .failed:
       let cause =
         state.ledger.attempts.last(where: { !$0.succeeded })?.reason
-        ?? reason ?? state.telemetry.fallbackReason
+        ?? reason ?? state.terminations.first ?? state.telemetry.fallbackReason
       line = copy.failure(reason: cause)
     case .partial:
       if line.isEmpty {
@@ -1784,9 +1823,12 @@ public final class TurnRuntime {
     case .completed, .working:
       break
     }
-    if let reason, state.telemetry.fallbackReason.isEmpty {
-      state.telemetry.fallbackReason = reason
-    }
+    // **결과가 완료가 아닌 이유를 마지막에 계산한다.** 여러 자리에서 한 칸에
+    // 덮어쓰지 않는다 — 보정 표시(`interventionReason`)가 실패 사유를 지우던
+    // 구조가 `phase=partial fallback=invariant:web.read`를 만들었다.
+    state.telemetry.completionReason = Self.completionReasons(
+      state, phase: phase, wroteAnswer: wroteAnswer
+    ).joined(separator: " ")
 
     state.telemetry.toolCount = state.ledger.attempts.count
     state.telemetry.materialCount = state.evidence.evidence.count

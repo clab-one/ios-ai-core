@@ -125,8 +125,11 @@ final class PCCContextBoundaryTests: XCTestCase {
     XCTAssertEqual(calls.supervising, 0, "예산을 넘긴 지시로 계획을 물었다")
     XCTAssertEqual(calls.finalizing, 0, "예산을 넘긴 지시로 답을 물었다")
     XCTAssertEqual(presented?.phase, .failed)
+    // 문맥 초과는 **모델 대역이 아니다.** 부른 적이 없으므로 대역도 없다 —
+    // 그 사실은 완료를 깎은 사유에 남는다(`completionReason`).
     XCTAssertEqual(
-      presented?.telemetry.fallbackReason, ContextCompilationError.requestTooLargeReason)
+      presented?.telemetry.completionReason, ContextCompilationError.requestTooLargeReason)
+    XCTAssertEqual(presented?.telemetry.fallbackReason, "", "부르지 않은 호출의 대역 사유가 있다")
     XCTAssertEqual(presented?.telemetry.pccCalls, 0)
   }
 

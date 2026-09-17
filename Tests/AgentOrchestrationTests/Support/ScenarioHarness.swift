@@ -271,6 +271,9 @@ final class FixtureTool: CapabilityHandler, @unchecked Sendable {
   let contracts: [CapabilityContract]
   private let lock = NSLock()
   private let answer: @Sendable (ActionRequest) -> [CapabilitySourceRow]
+  /// 이 툴이 남길 **읽은 범위.** 온전하지 않은 읽기를 세우는 자리다 — 자른
+  /// 페이지·못 읽은 본문이 차례의 완전함을 깎는지 이 값으로 본다.
+  private let coverage: @Sendable (ActionRequest) -> [CoverageRecord]
   private var received: [ActionRequest] = []
 
   /// 계약을 **값의 종류까지** 든다. 종류를 적지 않으면 정규화가 `.timestamp`를
@@ -279,6 +282,7 @@ final class FixtureTool: CapabilityHandler, @unchecked Sendable {
     _ capability: CapabilityID,
     required: [CapabilityContract.Argument] = [],
     optional: [CapabilityContract.Argument] = [],
+    coverage: @escaping @Sendable (ActionRequest) -> [CoverageRecord] = { _ in [] },
     rows: @escaping @Sendable (ActionRequest) -> [CapabilitySourceRow]
   ) {
     capabilities = [capability]
@@ -286,6 +290,7 @@ final class FixtureTool: CapabilityHandler, @unchecked Sendable {
       CapabilityContract(capability, required: required, optional: optional)
     ]
     answer = rows
+    self.coverage = coverage
   }
 
   var requests: [ActionRequest] {
@@ -302,7 +307,8 @@ final class FixtureTool: CapabilityHandler, @unchecked Sendable {
     return ActionReceipt(
       requestID: request.id, capability: request.capability,
       summary: "\(request.capability.rawValue).result",
-      details: rows.isEmpty ? [:] : CapabilitySourceRow.detail(rows))
+      details: rows.isEmpty ? [:] : CapabilitySourceRow.detail(rows),
+      coverage: coverage(request))
   }
 }
 
