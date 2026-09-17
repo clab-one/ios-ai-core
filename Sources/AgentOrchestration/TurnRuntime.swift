@@ -29,6 +29,14 @@ import OSLog
 public final class TurnRuntime {
   private static let log = AgentHost.logger("orchestrator")
 
+  /// 찾은 페이지를 읽으려 **시도할 횟수.**
+  ///
+  /// 둘인 이유: 첫 후보가 우리를 거절하는 일이 실제로 일어난다(실기 2026-09-17
+  /// P01: `web.read.rejected`, 그 한 번으로 차례가 근거 0개로 닫혔다). 그러나
+  /// 후보를 전부 훑는 것은 이 자리의 일이 아니다 — 두 번째도 거절하면 그 사실을
+  /// 답에 적는 것이 맞다.
+  static let searchedPageReadLimit = 2
+
   private let dispatcher: ActionDispatcher
   private let emitEvent: @MainActor (TurnEventEnvelope) -> Void
   private var eventSequence: UInt64 = 0
@@ -211,8 +219,14 @@ public final class TurnRuntime {
     public var startedAt: Date
     /// 의미 불변식을 이미 적용했는가. 한 번만 적용한다(§24).
     public var invariantApplied = false
-    /// 찾은 페이지를 읽으라고 **한 번** 냈는가.
-    public var searchedPageReadApplied = false
+    /// `web.read`를 **시도한** 주소. 거절당한 시도도 든다.
+    ///
+    /// `readURLs`와 나눠 둔다: 그쪽은 읽은 주소이고 이쪽은 부른 주소다. 하나로
+    /// 접으면 거절당한 주소가 읽은 것으로 세어지거나, 다음 후보 선택에서 같은
+    /// 주소가 다시 1위가 된다.
+    public var attemptedURLs: Set<String> = []
+    /// 찾은 페이지를 읽으라고 낸 횟수. 거절당한 시도도 센다.
+    public var searchedPageReadAttempts = 0
     /// 차례를 **끝낸 사실들.** 마감·상한·문맥 초과·계약 거절.
     ///
     /// 문자열 한 칸에 덮어쓰지 않고 목록으로 드는 이유: 한 차례에 둘 이상 성립한다
@@ -550,7 +564,7 @@ public final class TurnRuntime {
       //    웹도 같다. 검색 결과는 주소와 공급자가 쓴 한 줄이고, 그 줄로 답을 쓰면
       //    열어 보지 않은 페이지에 대해 답한 것이 된다(`searchedPageReadStep`).
       if let injected = await searchedPageReadStep(&state) {
-        state.searchedPageReadApplied = true
+        state.searchedPageReadAttempts += 1
         state.steps = [injected]
         state.telemetry.interventionReason = "dependency:web.read"
         continue
@@ -855,7 +869,7 @@ public final class TurnRuntime {
         if step.unresolved.contains(ResolvableArgument.sourceText.rawValue),
           let injected = await searchedPageReadStep(&state)
         {
-          state.searchedPageReadApplied = true
+          state.searchedPageReadAttempts += 1
           state.steps.insert(contentsOf: [injected, step], at: 0)
           state.telemetry.interventionReason = "dependency:web.read"
           continue
@@ -923,6 +937,17 @@ public final class TurnRuntime {
       {
         state.toolExecutions -= 1
         return .stopped(phase: .failed, needs: nil, reason: "checkpointUnavailable")
+      }
+      // **시도한 주소를 적는다.** 성공만 적으면 거절당한 주소가 다음 후보 선택에서
+      // 다시 1위가 되고, 같은 인자의 재주입은 지문 중복으로 걸러져 차례는 아무것도
+      // 읽지 못한 채 끝난다(실기 2026-09-17 P01 `web.read.rejected`).
+      //
+      // `readURLs`와 나눠 두는 이유: 그 값은 "그 주소를 **읽었는가**"이고, 실패한
+      // 시도를 거기에 넣으면 사용자가 준 주소를 못 읽은 차례가 읽은 것으로 통과한다.
+      if step.capability == .webRead || step.capability == .webFetch,
+        let url = arguments["url"]?.textValue
+      {
+        state.attemptedURLs.insert(url)
       }
       // 함께 보낸 읽기의 결과가 이미 있으면 그것을 쓴다. 없으면 지금 보낸다.
       let outcome: ActionOutcome
@@ -1298,26 +1323,32 @@ public final class TurnRuntime {
   /// 조각은 0개였다. 모델에게 다시 묻지 않고 여기서 메운다: 찾았다는 사실이 곧
   /// 읽을 것이 있다는 뜻이다(`recordReadStep`과 같은 자리).
   private func searchedPageReadStep(_ state: inout TurnState) async -> PlannedStep? {
-    guard !state.searchedPageReadApplied else { return nil }
+    guard state.searchedPageReadAttempts < Self.searchedPageReadLimit else { return nil }
     guard state.scope.contains(.webRead) else { return nil }
     guard let hit = state.ledger.receipts.last(where: { $0.capability == .webSearch })
     else { return nil }
+    // **한 장을 읽었으면 끝이다.** 이 자리의 목적은 "찾았는데 하나도 읽지 않는
+    // 일"을 막는 것이고, 후보를 전부 읽는 것이 아니다 — 후보 랭킹을 넣자마자
+    // 계획대로 1위를 읽은 차례가 2위를 한 번 더 읽었다(시험 실측).
+    //
+    // 성공한 수령증으로 판정한다. 시도한 주소로 판정하면 **거절당한 시도**가 읽은
+    // 것으로 세어져 그 차례는 아무것도 읽지 못한 채 끝난다(실기 2026-09-17 P01:
+    // `web.read.rejected` 하나로 차례가 근거 0개로 닫혔다).
+    guard !state.ledger.receipts.contains(where: { $0.capability == .webRead }) else {
+      return nil
+    }
+    let rows = CapabilitySourceRow.rows(in: hit.details)
     // **어느 줄을 읽을지는 기기가 고른다.** 공급자 1위를 그대로 읽던 동안
     // `"내 기록의 PCC 메모와 비교해줘"`가 `Pointe Coupée Parish Government`의
     // 연락처 페이지를 읽었다(실기 2026-09-17, iPad) — `PCC`는 애플의 낱말이 아니고
     // 공급자는 우리 사용자의 맥락을 모른다. 그 맥락은 기기에 있다.
-    let rows = CapabilitySourceRow.rows(in: hit.details)
-    // **하나라도 읽었으면 끝이다.** 이 자리의 목적은 "찾았는데 하나도 읽지 않는
-    // 일"을 막는 것이고, 후보를 전부 읽는 것이 아니다 — 후보 랭킹을 넣자마자
-    // 계획대로 1위를 읽은 차례가 2위를 한 번 더 읽었다(시험 실측).
-    guard !rows.contains(where: { state.readURLs.contains($0.identifier) }) else {
-      return nil
-    }
     let context = Self.privateContext(state)
     let ranked = SearchCandidateSelector.rank(rows, query: state.input, context: context)
       .filter { candidate in
         let scheme = URL(string: candidate.url)?.scheme
-        return scheme == "http" || scheme == "https"
+        guard scheme == "http" || scheme == "https" else { return false }
+        // 이미 시도한 주소는 건너뛴다. 거절한 사이트를 다시 부르지 않는다.
+        return !state.attemptedURLs.contains(candidate.url)
       }
     guard var choice = ranked.first else { return nil }
     // **후보 집합을 남긴다.** 고른 줄만 보면 "잘못 골랐다"와 "고를 것이 없었다"를
@@ -1759,7 +1790,11 @@ public final class TurnRuntime {
       reasons.append(termination)
     }
     // 읽은 범위가 온전하지 않았다. 자른 페이지·못 읽은 본문·끝내지 못한 쪽 넘김.
-    for coverage in state.ledger.receipts.flatMap(\.coverage)
+    //
+    // 원장의 범위를 본다. 수령증에서만 모으면 **실패한 읽기의 범위가 빠진다** —
+    // 실패는 수령증을 남기지 않고 범위만 남기므로(`record(failure:coverage:)`),
+    // 거절당한 읽기가 사유 없이 사라진다(시험 실측).
+    for coverage in state.ledger.coverage
     where coverage.state != .complete || coverage.truncated {
       let detail = coverage.reason?.rawValue ?? coverage.state.rawValue
       let line = "coverage:\(coverage.capability.rawValue):\(detail)"

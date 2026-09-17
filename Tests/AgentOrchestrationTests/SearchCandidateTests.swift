@@ -211,4 +211,86 @@ final class SearchCandidateTests: XCTestCase {
       "https://security.apple.com/blog/private-cloud-compute/",
       "공급자 1위를 읽었다 — 사적 맥락이 선택에 쓰이지 않았다")
   }
+
+  /// **첫 후보가 거절하면 다음 후보를 읽는다.**
+  ///
+  /// 실기 2026-09-17 P01: 고른 페이지가 `web.read.rejected`로 거절했고, 그 한 번으로
+  /// 차례가 근거 0개·`answer:unavailable`로 닫혔다. 검색은 다섯 줄을 들고 있었다.
+  @MainActor
+  func testRefusedCandidateFallsToTheNext() async throws {
+    let read = RefusingReadTool(refusing: "https://refused.example/pcc")
+    let run = await ScenarioRunner.run(
+      GoldenScenario(
+        name: "S02 refused-candidate",
+        input: "PCC 최신 내용 알려줘",
+        scope: [.webSearch, .webRead],
+        plan: [PlannedStep(capability: .webSearch, arguments: ["query": .text("PCC")])],
+        tools: [
+          WebSearchTool(
+            broker: WebSearchBroker(engines: [
+              StubSearchEngine(
+                name: "stub",
+                outcome: .success([
+                  WebSearchResult(
+                    title: "PCC 최신 내용 정리", url: "https://refused.example/pcc",
+                    snippet: "거절하는 사이트"),
+                  WebSearchResult(
+                    title: "PCC 최신", url: "https://ok.example/pcc", snippet: "읽히는 사이트"),
+                ]))
+            ])),
+          read,
+        ],
+        budget: ScenarioBudget(contextBaseline: 500, materials: 2, retrievedRows: 3)))
+
+    XCTAssertEqual(
+      read.attempted,
+      ["https://refused.example/pcc", "https://ok.example/pcc"],
+      "거절당한 뒤 다음 후보를 읽지 않았다")
+    // 두 번 부른 사실이 단계 목록에 남는다 — 첫 번은 실패, 두 번째는 성공이다.
+    XCTAssertEqual(run.executed, ["web.search", "web.read", "web.read"])
+    // **거절은 사실이므로 차례는 부분이다.** 그러나 답의 재료는 실제로 읽은
+    // 페이지에서 나왔다 — 근거가 0개로 닫히던 것과 그 점이 다르다.
+    XCTAssertEqual(run.result?.phase, .partial)
+    let telemetry = try XCTUnwrap(run.result?.telemetry)
+    XCTAssertEqual(telemetry.interventionReason, "dependency:web.read")
+    XCTAssertTrue(
+      telemetry.completionReason.contains("coverage:web.read"),
+      "거절이 사유에 남지 않았다: \(telemetry.completionReason)")
+    XCTAssertGreaterThan(telemetry.materialCount, 0, "읽은 페이지가 근거가 되지 않았다")
+  }
+}
+
+/// 한 주소만 거절하는 읽기 손. 그 거절은 **바깥의 사정**이다(`web.read.rejected`).
+private final class RefusingReadTool: CapabilityHandler, @unchecked Sendable {
+  private let refused: String
+  private let lock = NSLock()
+  private var received: [String] = []
+
+  init(refusing url: String) {
+    refused = url
+  }
+
+  var attempted: [String] {
+    lock.lock()
+    defer { lock.unlock() }
+    return received
+  }
+
+  var capabilities: Set<CapabilityID> { [.webRead] }
+  var contracts: [CapabilityContract] {
+    [CapabilityContract(.webRead, required: [CapabilityContract.Argument("url")])]
+  }
+
+  func perform(_ request: ActionRequest) async throws -> ActionReceipt {
+    let url = request.arguments["url"]?.textValue ?? ""
+    lock.lock()
+    received.append(url)
+    lock.unlock()
+    guard url != refused else { throw ActionError.failed(reason: "web.read.rejected") }
+    return ActionReceipt(
+      requestID: request.id, capability: .webRead, summary: "web.read.result",
+      details: CapabilitySourceRow.detail([
+        CapabilitySourceRow(title: "PCC", body: "검증은 공개된 이미지로만 성립한다.", identifier: url)
+      ]))
+  }
 }
