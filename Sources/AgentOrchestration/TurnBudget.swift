@@ -63,6 +63,27 @@ public struct TurnTelemetry: Sendable, Equatable {
   /// 한 차례에서 **함께 보낸 독립 읽기**의 최대 수(§12 PR 4). 이 값이 늘 1이면
   /// fanout이 꺼진 것이고, 그 사실은 지연에만 조용히 나타난다.
   public var readFanout = 0
+  /// **문맥 압축으로 뺀 근거 조각 수**(`ContextCompaction.swift`). 0이면
+  /// 압축이 필요 없었던 정상 경로다 — ledger의 근거 자체는 지워지지 않고,
+  /// 이번 PCC 호출에 보낸 조각 수만 줄었다.
+  public var compactedEvidenceCount = 0
+  /// **단계별 문맥 크기**(`planning=812 finalizing=2104` 꼴). 설계의 단계별
+  /// 목표치(`AGENT_RUNTIME_DESIGN.ko.md` §ContextBroker)와 대조할 유일한 실측
+  /// 값이다 — `inputCharacters`는 모든 호출의 합이라 어느 단계가 큰지 말하지
+  /// 못한다. 같은 단계를 여러 번 부르면 **가장 큰 호출**을 남긴다: 줄여야 할
+  /// 자리는 평균이 아니라 최대다.
+  public var contextCharactersByPhase: [String: Int] = [:]
+
+  /// 한 단계의 문맥 크기를 적는다. 내용은 담지 않는다 — 글자 수뿐이다.
+  public mutating func record(contextCharacters count: Int, phase: String) {
+    contextCharactersByPhase[phase] = max(contextCharactersByPhase[phase] ?? 0, count)
+  }
+  /// **왜 이 차례가 모델까지 올라갔는가**(`unmatched`·`writeVerb`·`tooLong`·
+  /// `capabilityMissing`·`windowUnknown`). 결정론 문이 잡은 차례는 비어 있다.
+  ///
+  /// 사다리의 각 칸이 자기 판단을 남기지 않으면, 나중에 "왜 PCC를 불렀는가"를
+  /// 답할 수 있는 자리가 한 곳도 없다(설계 §EscalationPolicy).
+  public var escalationReason: String = ""
   /// route-only shadow 평가(`shadowRoute`·`shadowAgreement`)는 없앴다. 규칙이
   /// 골랐을 능력과 모델의 선택을 나란히 적던 값인데, 규칙 라우터 자체를 지웠다.
   /// 기기 모델 **입장 줄에서 기다린** 시간의 합과 목적별 나눔(§12 PR 6).

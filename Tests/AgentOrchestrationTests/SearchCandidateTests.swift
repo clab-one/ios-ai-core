@@ -258,6 +258,49 @@ final class SearchCandidateTests: XCTestCase {
       "거절이 사유에 남지 않았다: \(telemetry.completionReason)")
     XCTAssertGreaterThan(telemetry.materialCount, 0, "읽은 페이지가 근거가 되지 않았다")
   }
+
+  /// **리서치는 여러 장이다.** 계획이 `web.read`를 둘 내면 서로 다른 두 페이지를
+  /// 읽는다 — 자리마다 같은 1위가 채워지던 동안 두 번째 읽기는 지문이 같은
+  /// 호출로 접혀 리서치가 한 장으로 끝났다(실기 2026-09-18, iPhone 15 Pro:
+  /// `"이더리움에 대해 리서치해줘"`가 읽기 1건·근거 1조각으로 닫혔다).
+  @MainActor
+  func testPlannedReadsCoverDifferentPages() async throws {
+    let read = FixtureTool(.webRead, required: [.init("url")]) { request in
+      [
+        CapabilitySourceRow(
+          title: "PCC", body: "검증은 공개된 이미지로만 성립한다.",
+          identifier: request.arguments["url"]?.textValue ?? "")
+      ]
+    }
+    let run = await ScenarioRunner.run(
+      GoldenScenario(
+        name: "S03 research-depth",
+        input: "PCC에 대해 리서치해줘",
+        scope: [.webSearch, .webRead],
+        plan: [
+          PlannedStep(capability: .webSearch, arguments: ["query": .text("PCC")]),
+          PlannedStep(capability: .webRead, arguments: [:], unresolved: ["url"]),
+          PlannedStep(capability: .webRead, arguments: [:], unresolved: ["url"]),
+        ],
+        tools: [
+          WebSearchTool(
+            broker: WebSearchBroker(engines: [
+              StubSearchEngine(
+                name: "stub",
+                outcome: .success(
+                  Self.rows.map {
+                    WebSearchResult(title: $0.title, url: $0.identifier, snippet: $0.subtitle)
+                  }))
+            ])),
+          read,
+        ],
+        budget: ScenarioBudget(contextBaseline: 500, materials: 3, retrievedRows: 8)))
+
+    XCTAssertEqual(run.executed, ["web.search", "web.read", "web.read"])
+    let urls = read.requests.compactMap { $0.arguments["url"]?.textValue }
+    XCTAssertEqual(urls.count, 2, "두 번째 읽기가 돌지 않았다: \(urls)")
+    XCTAssertEqual(Set(urls).count, 2, "같은 주소를 두 번 읽었다: \(urls)")
+  }
 }
 
 /// 한 주소만 거절하는 읽기 손. 그 거절은 **바깥의 사정**이다(`web.read.rejected`).

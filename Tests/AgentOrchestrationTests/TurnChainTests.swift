@@ -55,19 +55,48 @@ final class TurnChainTests: XCTestCase {
     await runtime.run(context(input: "이 페이지 요약해서 steve@example.com에게 보내줘"))
 
     // 요약 툴이 읽은 본문을 받았다 — 원문은 PCC를 지나지 않았다.
-    XCTAssertEqual(model.prompts.count, 1, "요약 툴이 한 번 돌아야 한다")
+    XCTAssertFalse(model.prompts.isEmpty, "요약 툴이 돌지 않았다")
     XCTAssertTrue(
-      model.prompts.first?.contains("이 페이지의 본문") == true,
+      model.prompts.contains { $0.contains("이 페이지의 본문") },
       "앞 단계가 읽은 글이 요약 툴의 입력이 되지 않았다")
 
-    // 전송은 승인 문에서 멈췄고, 그 문에 실린 본문이 **요약**이다.
+    // 전송은 승인 문에서 멈췄고, 그 문에 실린 본문이 **기기가 줄인 글**이다.
+    // 조각 하나짜리 문서의 요약은 요점 줄로 서므로(헤드라인은 문서 제목이 된다)
+    // 보는 것은 **원문이 아니라 요약이 흘렀는가**다.
     let approval = try XCTUnwrap(approvals.first, "되돌릴 수 없는 전송이 승인 없이 지나갔다")
     XCTAssertEqual(approval.request.capability, .mailSend)
-    XCTAssertEqual(
-      approval.preview.body, "요약 세 줄.",
-      "요약이 메시지 본문으로 흐르지 않았다")
+    XCTAssertFalse(approval.preview.body.isEmpty, "본문이 비어 있다")
+    XCTAssertFalse(
+      approval.preview.body.contains("이 페이지의 본문"),
+      "원문이 그대로 본문으로 흘렀다: \(approval.preview.body)")
     XCTAssertEqual(approval.preview.recipient, "steve@example.com")
     XCTAssertTrue(mail.sent.isEmpty, "승인 전에 전송이 일어났다")
+  }
+
+  /// **`compacting`은 짝이 있어야 한다.** 짝이 없으면 "줄이는 중" 표시를 걷어 낼
+  /// 신호가 이벤트 스트림에 없다.
+  func testCompactingIsFollowedByCompacted() async throws {
+    let mail = RecordingMailTool()
+    let dispatcher = await makeDispatcher(tools: [WebReadTool(page: Self.page), mail])
+    let model = ScriptedOnDeviceModel(reply: "요약 세 줄.")
+    await dispatcher.register(SummarizeTool(model: model))
+
+    var events: [TurnEvent] = []
+    let runtime = makeRuntime(
+      dispatcher: dispatcher,
+      plan: [
+        PlannedStep(
+          capability: .webRead, arguments: ["url": .text("https://example.com/a")]),
+      ],
+      onEvent: { events.append($0.event) })
+
+    await runtime.run(context(input: "이 페이지 읽어줘"))
+
+    let compactingIndex = events.firstIndex { if case .compacting = $0 { return true }; return false }
+    let compactedIndex = events.firstIndex { if case .compacted = $0 { return true }; return false }
+    let compacting = try XCTUnwrap(compactingIndex, "compacting이 나지 않았다: \(events)")
+    let compacted = try XCTUnwrap(compactedIndex, "compacted가 나지 않았다: \(events)")
+    XCTAssertLessThan(compacting, compacted, "compacted가 compacting보다 먼저거나 같은 자리에 섰다")
   }
 
   // MARK: 2) 먼저 묻기
@@ -87,9 +116,11 @@ final class TurnChainTests: XCTestCase {
 
     let last = results.last
     XCTAssertEqual(last?.phase, .awaitingUser, "모자란 값을 묻지 않고 차례를 닫았다")
-    XCTAssertEqual(
-      last?.headline, TurnCopy.Key.needs["to"],
-      "무엇이 필요한지 말하지 않았다")
+    // **되물음의 문장은 모델이 쓴다**(`DynamicTurnProfile.asking`). 이 시험의 대역
+    // 답 자리는 `"했어요"`를 돌려주므로 그 줄이 선다 — 문구 표의 열쇠는 모델을
+    // 열지 못한 자리의 대역이고, 그 경로는 호스트 시험이 본다
+    // (`AskedQuestionTurnTests`). 여기서 보는 것은 **묻고 멈췄는가**다.
+    XCTAssertFalse(last?.headline.isEmpty ?? true, "되물음 줄이 비어 있다")
     XCTAssertTrue(mail.sent.isEmpty, "받는 사람을 모르는 채 전송을 시도했다")
   }
 
@@ -111,6 +142,42 @@ final class TurnChainTests: XCTestCase {
     XCTAssertEqual(planCalls, 1, "실행 중에 PCC를 다시 불렀다")
   }
 
+
+  // MARK: 1-b) 멈춤
+
+  /// **사람이 멈추면 차례가 끝난다.**
+  ///
+  /// 실기 2026-09-18(iPhone 15 Pro): 화면의 중지를 누른 웹 검색 차례가 9.2초 뒤
+  /// 답까지 썼다 — `cancelPending`이 승인 대기만 멈추고 도는 차례는 붙잡고
+  /// 있지 않았다. 지금은 도는 일이 자기 task에 담겨 있고, 취소는 그 task를
+  /// 취소한다.
+  func testStopClosesARunningTurn() async throws {
+    let gate = ToolGate()
+    let dispatcher = await makeDispatcher(tools: [GatedTool(gate: gate)])
+    var results: [ConversationTurnResult] = []
+    var events: [TurnEvent] = []
+    let runtime = makeRuntime(
+      dispatcher: dispatcher,
+      plan: [PlannedStep(capability: .webRead, arguments: ["url": .text("https://e.com/a")])],
+      onEvent: { events.append($0.event) },
+      onResult: { results.append($0) })
+
+    let work = Task { await runtime.run(context(input: "천천히 읽어줘")) }
+    await gate.entered()
+    await runtime.cancelPending()
+    await gate.open()
+    await work.value
+
+    XCTAssertEqual(results.last?.phase, .cancelled, "멈춘 차례가 닫히지 않았다")
+    XCTAssertFalse(results.last?.isSynthesizedAnswer ?? true, "멈춘 차례가 답을 썼다")
+    // 이벤트만 보는 화면도 **완료가 아니라 중단**을 알아야 한다.
+    XCTAssertTrue(
+      events.contains { if case .interrupted = $0 { return true }; return false },
+      "이벤트 스트림에 .interrupted가 없다: \(events)")
+    XCTAssertFalse(
+      events.contains { if case .completed = $0 { return true }; return false },
+      "중단된 차례가 이벤트 스트림엔 .completed로 보였다: \(events)")
+  }
   // MARK: 조립
 
   private func context(input: String) -> TurnContextSnapshot {
@@ -161,6 +228,59 @@ final class TurnChainTests: XCTestCase {
     pccAttempted: true, pccCompleted: true, onDeviceAttempted: false,
     onDeviceCompleted: false, fallbackReason: nil, inputCharacters: 0,
     latencyMilliseconds: 0)
+}
+
+/// 시험이 여는 문. 툴이 이 문 앞에 서 있는 동안 차례는 **도는 중**이다.
+private actor ToolGate {
+  private var arrived: CheckedContinuation<Void, Never>?
+  private var released: CheckedContinuation<Void, Never>?
+  private var hasArrived = false
+  private var isOpen = false
+
+  /// 툴이 문 앞에 섰다.
+  func arrive() {
+    hasArrived = true
+    arrived?.resume()
+    arrived = nil
+  }
+
+  /// 툴이 문 앞에 서기를 기다린다.
+  func entered() async {
+    guard !hasArrived else { return }
+    await withCheckedContinuation { arrived = $0 }
+  }
+
+  /// 문을 연다.
+  func open() {
+    isOpen = true
+    released?.resume()
+    released = nil
+  }
+
+  /// 툴이 문이 열리기를 기다린다.
+  func wait() async {
+    guard !isOpen else { return }
+    await withCheckedContinuation { released = $0 }
+  }
+}
+
+/// 문이 열릴 때까지 돌아오지 않는 읽기 툴.
+private struct GatedTool: CapabilityHandler {
+  let gate: ToolGate
+
+  var capabilities: Set<CapabilityID> { [.webRead] }
+
+  func perform(_ request: ActionRequest) async throws -> ActionReceipt {
+    await gate.arrive()
+    await gate.wait()
+    return ActionReceipt(
+      requestID: request.id, capability: .webRead, summary: "읽었어요",
+      details: CapabilitySourceRow.detail([
+        CapabilitySourceRow(
+          title: "예시", subtitle: "e.com", body: "본문",
+          identifier: request.arguments["url"]?.textValue ?? "")
+      ]))
+  }
 }
 
 // MARK: - 대역
@@ -214,7 +334,7 @@ private final class RecordingMailTool: CapabilityHandler, @unchecked Sendable {
 
 /// 기기 모델의 대역. 무엇을 받았는지 적어 둔다 — 원문이 요약 툴까지 왔는지가
 /// 이 시험의 관찰 지점이다.
-private final class ScriptedOnDeviceModel: OnDeviceTextModel, @unchecked Sendable {
+private final class ScriptedOnDeviceModel: OnDeviceTextModel, SummaryModel, @unchecked Sendable {
   private let reply: String
   private let lock = NSLock()
   private var received: [String] = []
@@ -236,6 +356,15 @@ private final class ScriptedOnDeviceModel: OnDeviceTextModel, @unchecked Sendabl
     received.append(prompt)
     lock.unlock()
     return reply
+  }
+
+  func answer(
+    schema: SummarySchema, instructions: String, prompt: String, maximumResponseTokens: Int
+  ) async throws -> Data {
+    lock.lock()
+    received.append(prompt)
+    lock.unlock()
+    return ScriptedSummaryPayload.data(schema: schema, headline: reply)
   }
 }
 
@@ -284,6 +413,12 @@ private final class MemoryActionLedger: ActionLedger, @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return entries[idempotencyKey]
+  }
+
+  func forget(idempotencyKey: String) throws {
+    lock.lock()
+    entries[idempotencyKey] = nil
+    lock.unlock()
   }
 
   func deleteAll(accountID: String) throws {

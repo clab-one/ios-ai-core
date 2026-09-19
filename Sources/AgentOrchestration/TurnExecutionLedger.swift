@@ -26,10 +26,12 @@ public struct BoundReference: Sendable {
     case .channelID, .threadTS: return consumer.domain == "chat"
     case .eventID: return consumer.domain == "calendar"
     case .reminderID: return consumer.domain == "reminders"
+    case .photoID: return consumer.domain == "photos"
     case .itemID: return ["memory", "artifact", "content", "recording", "share"].contains(consumer.domain)
     case .url: return consumer.domain == "web" || consumer.domain == "content"
-    // 줄일 원문은 요약 툴만 받는다.
-    case .sourceText: return consumer == .textSummarize
+    // 옮길 원문도 같은 자리로 온다. 이 표를 요약만 열어 두면 번역 단계는
+    // 원문을 받지 못해 매번 되묻는다.
+    case .sourceText: return consumer == .textSummarize || consumer == .textTranslate
     // 만든 글은 **보내는 능력과 저장**이 받는다.
     //
     // 저장을 뺐던 이유는 "앞 단계의 요약을 몰래 기록으로 만들지 않는다"였다. 그

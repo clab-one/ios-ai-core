@@ -31,11 +31,21 @@ public final class TurnRuntime {
 
   /// 찾은 페이지를 읽으려 **시도할 횟수.**
   ///
-  /// 둘인 이유: 첫 후보가 우리를 거절하는 일이 실제로 일어난다(실기 2026-09-17
-  /// P01: `web.read.rejected`, 그 한 번으로 차례가 근거 0개로 닫혔다). 그러나
-  /// 후보를 전부 훑는 것은 이 자리의 일이 아니다 — 두 번째도 거절하면 그 사실을
-  /// 답에 적는 것이 맞다.
-  static let searchedPageReadLimit = 2
+  /// 첫 후보가 우리를 거절하는 일이 실제로 일어나고(실기 2026-09-17 P01:
+  /// `web.read.rejected`, 그 한 번으로 차례가 근거 0개로 닫혔다), 열린 페이지가
+  /// 글을 한 줄도 주지 않는 일도 일어난다(실기 2026-09-18: `msn.com` 한 장을 읽고
+  /// `"이더리움에 대한 정보를 찾을 수 없어요"`로 닫혔다 — 그 페이지의 글은
+  /// 스크립트가 그린다). 셋이 상한이고, 몇 장을 읽을지는 **모인 사실이** 정한다
+  /// (`researchFactFloor`).
+  static let searchedPageReadLimit = 3
+
+  /// 이만큼 모이면 **읽기를 멈춘다.** 사실 줄의 수다.
+  ///
+  /// 장 수로 멈추면 글 없는 한 장에 만족하고, 장 수를 못 박으면 이미 충분한
+  /// 차례가 두 장을 더 읽는다. 한 조각이 드는 사실은 최대 셋이므로
+  /// (`Evidence.factsPerEvidence`) 이 값은 **한 장으로는 닿지 않는 높이**다 —
+  /// 재료가 좋은 페이지는 두 장에서 멈추고, 메뉴만 있는 페이지는 상한까지 간다.
+  static let researchFactFloor = 4
 
   private let dispatcher: ActionDispatcher
   private let emitEvent: @MainActor (TurnEventEnvelope) -> Void
@@ -45,9 +55,24 @@ public final class TurnRuntime {
   private let present: @MainActor (ConversationTurnResult) -> Void
   /// 상태 문구. 낱말과 언어는 호스트의 것이고, 어느 문구인지는 코어가 정한다.
   private let copy: TurnCopy
+  /// 답을 쓰는 호출에 실리는 **호스트의 말투**(`AgentRuntimeConfiguration.answerVoice`).
+  /// 계획 호출에는 싣지 않는다.
+  private let answerVoice: String?
+  private let responseStreamingEnabled: @MainActor @Sendable () -> Bool
+  private let onResponseSnapshot: @MainActor @Sendable (TurnResponseSnapshot) -> Void
+  private var responseSequence: UInt64 = 0
+  /// 효과가 나갔지만 원장에 못 박히지 않았다는 사유의 이름.
+  /// `ActionReceipt.ledgerUnsettled`가 이 이름으로 차례에 들어온다.
+  static let ledgerUnsettledReason = "effectCommittedLedgerUnsettled"
+  /// **재조정으로 닫는 사유들**(소문자 비교). 디스크가 증명하지 못한 효과다.
+  static let reconcilingReasons = ["sendoutcomeunknown", "effectcommittedledgerunsettled"]
   private let now: () -> Date
   /// 차례의 복구 상태. 없으면 복구 기록을 남기지 않는다(§9.1).
   private let turnRuns: (any TurnRunStore)?
+  /// 실행 journal. 없으면 journal 기반 복구가 없다. 쓰기 실패는 차례를 죽이지 않는다.
+  private let journal: (any AgentRunJournal)?
+  /// run별 transcript sequence. `checkpointRevisions`와 같이 이 액터가 든다.
+  private var journalSequences: [UUID: Int] = [:]
   private let originDeviceID: String
   /// 저장한 상태 판. 늦게 도착한 저장이 앞선 상태를 되돌리지 않게 한다.
   private var checkpointRevisions: [UUID: Int] = [:]
@@ -62,6 +87,8 @@ public final class TurnRuntime {
   private var referenceOwner: TurnContextSnapshot?
   /// 승인을 기다리며 멈춘 차례. 허락을 받으면 **남은 단계부터** 이어 간다.
   private var pendingTurn: TurnState?
+  /// 지금 도는 차례의 일. **사람이 멈출 수 있으려면 붙잡고 있어야 한다.**
+  private var runningWork: Task<Void, Never>?
 
   /// 감독자와 답 쓰는 자리. **기본값은 실제 모델**이고, 시험이 이 문으로 대역을
   /// 세운다 — 시뮬레이터에는 PCC도 기기 모델도 없어서 되돌이 규칙을 실제 모델로는
@@ -74,12 +101,17 @@ public final class TurnRuntime {
     emit: @escaping @MainActor (TurnEventEnvelope) -> Void,
     present: @escaping @MainActor (ConversationTurnResult) -> Void,
     copy: TurnCopy = .keysAsText,
+    answerVoice: String? = nil,
     now: @escaping () -> Date = Date.init,
     supervising: TurnSupervising? = nil,
     finalizing: TurnFinalizing? = nil,
+    responseStreamingEnabled: @escaping @MainActor @Sendable () -> Bool = { false },
+    onResponseSnapshot: @escaping @MainActor @Sendable (TurnResponseSnapshot) -> Void = { _ in },
     /// 차례의 복구 상태 저장소(§9). 없으면 복구 기록을 남기지 않는다 — 조립이
     /// 정본 DB를 세울 수 없는 경우다.
     turnRuns: (any TurnRunStore)? = nil,
+    /// 실행 journal. 없으면 journal 기반 복구가 없다.
+    journal: (any AgentRunJournal)? = nil,
     originDeviceID: String = TurnRuntime.deviceIdentifier,
     isAccountCurrent: @escaping @MainActor (TurnContextSnapshot) -> Bool = {
       $0.accountEpoch == AssistantAccountEpoch.current
@@ -90,11 +122,15 @@ public final class TurnRuntime {
     self.isAccountCurrent = isAccountCurrent
     self.present = present
     self.copy = copy
+    self.answerVoice = answerVoice
     self.now = now
     self.turnRuns = turnRuns
+    self.journal = journal
     self.originDeviceID = originDeviceID
     self.supervising = supervising ?? Self.liveSupervising
     self.finalizing = finalizing ?? Self.liveFinalizing
+    self.responseStreamingEnabled = responseStreamingEnabled
+    self.onResponseSnapshot = onResponseSnapshot
   }
 
   /// 이 기기. 다른 기기에 동기화된 기록이 실행 명령으로 소비되지 않도록 실행
@@ -197,10 +233,17 @@ public final class TurnRuntime {
     /// 이 값이 없던 동안, 모델이 `mail.send`를 계획에서 빼먹고도 답에
     /// `"보냈습니다"`를 썼다(실기 2026-09-16). 완료 표시는 수령증에서만 나온다.
     public var plannedWrites: Set<CapabilityID> = []
+    /// 계획이 **스스로 페이지를 읽겠다고 했는가.**
+    ///
+    /// 이 값이 참이면 몇 장을 읽을지는 계획의 것이다. 거짓이면 검색만 하고 끝낸
+    /// 계획이므로 런타임이 읽기를 메운다 — 그때 몇 장까지 갈지를 `researchFactFloor`
+    /// 가 정한다.
+    public var planReadsPages = false
     public var pendingApprovalID: UUID?
     /// 조사 전 알려진 누락값. 성공한 관찰이 없으면 조회 실패가 질문을 덮지 않는다.
     public var investigationNeeds: String?
     public var stepOrigin: ActionRequest.Origin = .modelPlan
+    public var dialogue: DialogueResolution = .none
     public var ledger: TurnExecutionLedger
     public var evidence: EvidenceCompiler.Compiled = .empty
     public var usage = ModelUsageLog()
@@ -219,6 +262,16 @@ public final class TurnRuntime {
     public var startedAt: Date
     /// 의미 불변식을 이미 적용했는가. 한 번만 적용한다(§24).
     public var invariantApplied = false
+    /// 요약 보정을 이미 한 번 냈는가. 한 차례에 한 번만 잇는다.
+    public var summaryInvariantApplied = false
+    /// 이 차례를 **결정론 문**이 잡았는가(`IntentGate.Route.reason`).
+    ///
+    /// 잡힌 차례의 줄은 답 그 자체다 — 기기 시각으로 만든 창을 달력에 물었고,
+    /// 돌아온 일정이 곧 대답이다. 그래서 그 줄에는 질의 낱말 겹침 판정
+    /// (`overlapping`)을 걸지 않는다: `"오늘 일정 뭐 있어?"`와 `"치과"`는 한
+    /// 글자도 겹치지 않고, 겹침으로 거르면 찾은 일정이 사라진 자리에서 차례가
+    /// 대화 모델을 부른다(실측 2026-09-19, 이 배선의 첫 시험).
+    public var deterministicRoute: String?
     /// `web.read`를 **시도한** 주소. 거절당한 시도도 든다.
     ///
     /// `readURLs`와 나눠 둔다: 그쪽은 읽은 주소이고 이쪽은 부른 주소다. 하나로
@@ -250,6 +303,18 @@ public final class TurnRuntime {
     /// "아무 웹 읽기나 있으면 통과"는 모델이 딴 페이지를 성공적으로 읽은 경우에
     /// 속는다.
     public var readURLs: Set<String> = []
+    /// 모델이 **안전 판정으로 거부했다.**
+    ///
+    /// 우회하지 않는다(§37) — 같은 내용을 어느 모델에도 다시 내지 않는다. 그러나
+    /// 그 시점에 기기가 이미 읽어 둔 것은 사용자의 것이고, 차례를 빈손으로 닫을
+    /// 이유가 아니다(실기 2026-09-17, iPhone: 원천징수영수증 요약이 `fallback
+    /// guardrail`로 `하지 못했어요`가 됐다 — 1,886자를 이미 읽은 뒤였다).
+    /// 이 표시가 서면 남은 일은 **기기 안에서만** 하고, 답 자리에는 거부를 말한다.
+    public var safetyRefused = false
+
+    /// 이 차례가 **바깥에 내려 한 효과들.** 원장 선점 전에 적고, 결과가 오면
+    /// 고친다 — 재시작 뒤 복구가 물어야 할 열쇠가 이 값이다.
+    var effects: [TurnEffectCheckpoint] = []
   }
 
   /// 단계를 다 돌고 난 결과.
@@ -298,7 +363,7 @@ public final class TurnRuntime {
       input: state.input,
       historyCutoff: state.context.historyCutoff,
       pendingStepIdentities: pending,
-      receiptKeys: state.ledger.receipts.map(\.requestID.uuidString),
+      effects: state.effects,
       pendingApprovalFingerprint: approvalFingerprint,
       toolExecutions: state.toolExecutions,
       supervisorIterations: state.telemetry.supervisorIterations,
@@ -316,12 +381,142 @@ public final class TurnRuntime {
     }
   }
 
+  /// journal 쓰기는 차례를 죽이지 않는다 — 원격 쓰기 fail-closed는 persistRun이 맡는다.
+  private func journalRun(_ state: TurnState, status: AgentRunRecord.Status) {
+    guard let journal else { return }
+    do {
+      let sessionID = state.conversation ?? ""
+      try journal.saveSession(
+        AgentSessionRecord(sessionID: sessionID, accountID: state.account))
+      try journal.saveRun(
+        AgentRunRecord(
+          runID: state.requestID.uuidString, sessionID: sessionID, accountID: state.account,
+          accountEpoch: state.context.accountEpoch, status: status,
+          transcriptRevision: checkpointRevisions[state.requestID] ?? 0))
+    } catch {
+      Self.log.error(
+        "agent journal run failed request=\(state.requestID.uuidString, privacy: .public)")
+    }
+  }
+
+  private func journalEntry(
+    _ state: TurnState, role: AgentTranscriptEntry.Role, text: String, toolCallID: String? = nil
+  ) {
+    guard let journal else { return }
+    let next = (journalSequences[state.requestID] ?? 0) + 1
+    journalSequences[state.requestID] = next
+    do {
+      try journal.appendTranscript(
+        AgentTranscriptEntry(
+          runID: state.requestID.uuidString, sequence: next, role: role, text: text,
+          toolCallID: toolCallID))
+    } catch {
+      Self.log.error(
+        "agent journal transcript failed request=\(state.requestID.uuidString, privacy: .public)")
+    }
+  }
+
+  private func journalInvocation(
+    callID: String, _ state: TurnState, capability: CapabilityID, fingerprint: String,
+    invocationState: ToolInvocationRecord.State, arguments: String, receipt: String? = nil,
+    receiptID: String? = nil, effectKey: String? = nil
+  ) {
+    guard let journal else { return }
+    do {
+      try journal.saveToolInvocation(
+        ToolInvocationRecord(
+          callID: callID, runID: state.requestID.uuidString, capability: capability,
+          fingerprint: fingerprint, state: invocationState, receiptID: receiptID,
+          arguments: arguments, receipt: receipt, effectKey: effectKey))
+    } catch {
+      Self.log.error(
+        "agent journal invocation failed request=\(state.requestID.uuidString, privacy: .public)")
+    }
+  }
+
+  /// `ActionValue`는 Codable이므로 새 인코더를 만들지 않고 그대로 JSON으로 적는다.
+  /// secret·토큰·credential은 영속 상태에 두지 않는다(설계 §영속 상태).
+  private static func journalArguments(_ arguments: [String: ActionValue]) -> String {
+    let filtered = arguments.filter { !Self.isSecretArgumentKey($0.key) }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    guard let data = try? encoder.encode(filtered),
+      let text = String(data: data, encoding: .utf8)
+    else { return "" }
+    return text
+  }
+
+  private static func isSecretArgumentKey(_ key: String) -> Bool {
+    let folded = key.lowercased().filter { $0.isLetter || $0.isNumber }
+    return folded.contains("token") || folded.contains("secret") || folded.contains("password")
+      || folded.contains("credential") || folded.contains("authorization")
+      || folded == "apikey" || folded == "bearer" || folded == "binding"
+  }
+
+  private static func journalReceiptJSON(_ receipt: ActionReceipt) -> String? {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    guard let data = try? encoder.encode(receipt) else { return nil }
+    return String(data: data, encoding: .utf8)
+  }
+
+  /// 새 분기를 만들지 않는다. 화면 phase → 복구 status → journal status.
+  private static func journalStatus(
+    for phase: ConversationTurnResult.Phase
+  ) -> AgentRunRecord.Status {
+    AgentRunRecord.Status(rawValue: Self.runStatus(for: phase).rawValue) ?? .failed
+  }
+
+
   private func emit(_ event: TurnEvent, _ state: TurnState) {
     eventSequence &+= 1
     emitEvent(TurnEventEnvelope(
       requestID: state.requestID, accountID: state.account,
       conversationID: state.conversation, accountEpoch: state.context.accountEpoch,
       sequence: eventSequence, event: event))
+  }
+
+  /// 툴의 진행을 이 차례의 사건으로 옮기는 손잡이.
+  ///
+  /// 차례의 신원만 미리 떠 둔다 — 진행은 툴의 작업 안에서 오고, 그 자리에서
+  /// 차례의 상태를 붙잡고 있으면 그 상태가 바뀌는 동안 읽히게 된다.
+  private func progressSink(for state: TurnState) -> ToolProgress.Sink {
+    let requestID = state.requestID
+    let account = state.account
+    let conversation = state.conversation
+    let epoch = state.context.accountEpoch
+    return { [weak self] capability, done, total in
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        self.eventSequence &+= 1
+        self.emitEvent(
+          TurnEventEnvelope(
+            requestID: requestID, accountID: account, conversationID: conversation,
+            accountEpoch: epoch, sequence: self.eventSequence,
+            event: .toolProgress(capability, done: done, total: total)))
+      }
+    }
+  }
+
+  private func responseSink(for state: TurnState) -> ModelResponseStream.Sink? {
+    guard responseStreamingEnabled() else { return nil }
+    let context = state.context
+    return { [weak self] text in
+      guard let self, self.activeRequestID == context.requestID,
+        self.isAccountCurrent(context), !Task.isCancelled
+      else { return }
+      self.responseSequence &+= 1
+      self.onResponseSnapshot(TurnResponseSnapshot(
+        requestID: context.requestID, accountID: context.accountID,
+        conversationID: context.conversationID, sequence: self.responseSequence,
+        text: text))
+    }
+  }
+
+  private func scopedRecentMessages(_ state: TurnState) -> [ConversationMessage] {
+    state.context.recentMessages.filter {
+      $0.accountID == state.account && $0.conversationID == state.conversation
+    }
   }
 
   private func eligible(_ state: TurnState) -> Bool {
@@ -380,6 +575,8 @@ public final class TurnRuntime {
     // 정본 사용자 차례와 실행 record를 잇는다. 여기서의 실패는 읽기를 막지 않는다 —
     // 막는 자리는 원격 쓰기 직전이다(§9.3).
     persistRun(state, status: .running)
+    journalRun(state, status: .running)
+    journalEntry(state, role: .user, text: state.input)
     state.telemetry.profile = "supervised"
 
     // **긴 입력은 PCC 문을 열지 않는다.** 정상 경로는 정본 캡처가 긴 내용을 기록으로
@@ -394,16 +591,17 @@ public final class TurnRuntime {
       return
     }
 
-    // **할 수 있는 일이 하나도 없으면 모델을 부르지 않는다.** 그리고 그때는
-    // "하지 못했어요"가 아니라 **연결이 없다**고 말한다 — 이 자리가 그냥 실패로
-    // 접히던 동안, 연결이 없는 기기의 모든 요청이 `model.unavailable`로 끝났다
-    // (실측 2026-09-14: `tools=0 latency=1`). 모델은 부른 적조차 없었다.
-    guard !scope.isEmpty else {
-      state.terminations.append("noCapability")
-      await finish(state, phase: .failed, reason: "noCapability")
-      return
-    }
-    await advance(state)
+    // A conversation-only host is valid. PCC, not a local intent classifier,
+    // decides whether to answer, ask a question, or request an available tool.
+    // **도는 차례는 멈출 수 있어야 한다.** `advance`를 자기 task에 담는 이유가
+    // 그것이다: `cancelPending`이 그 task를 취소하면 `eligible(state)`를 보는
+    // 모든 자리가 차례를 닫는다(§9). 담지 않았던 동안 화면의 **중지**는
+    // 승인 대기만 멈췄고, 도는 차례는 그대로 끝까지 갔다 — 실기 2026-09-18
+    // (iPhone 15 Pro): 중지를 누른 웹 검색 차례가 9.2초 뒤 답까지 썼다.
+    let work = Task { await self.advance(state) }
+    runningWork = work
+    defer { runningWork = nil }
+    await work.value
   }
 
   /// 승인을 받았다. **남은 단계부터** 이어 간다.
@@ -416,11 +614,28 @@ public final class TurnRuntime {
       approval.request.accountID == state.account,
       approval.request.accountEpoch == state.context.accountEpoch
     else { return }
+    guard activeRequestID == nil else { return }
+    activeRequestID = state.requestID
+    defer { activeRequestID = nil }
     pendingTurn = nil
     state.pendingApprovalID = nil
     let subject = Self.subject(of: approval.request.arguments)
+    let resumeIdentity = ActionFingerprint.call(
+      approval.request.capability, approval.request.arguments, binding: approval.request.binding)
+    let resumeArguments = Self.journalArguments(approval.request.arguments)
+    let resumeEffectKey =
+      approval.request.capability.isRemoteWrite ? approval.request.effectIdentity : nil
     switch outcome {
     case .completed(let receipt):
+      journalInvocation(
+        callID: resumeIdentity, state, capability: approval.request.capability,
+        fingerprint: resumeIdentity, invocationState: .authorized,
+        arguments: resumeArguments, effectKey: resumeEffectKey)
+      journalInvocation(
+        callID: resumeIdentity, state, capability: approval.request.capability,
+        fingerprint: resumeIdentity, invocationState: .completed,
+        arguments: resumeArguments, receipt: Self.journalReceiptJSON(receipt),
+        receiptID: receipt.requestID.uuidString, effectKey: resumeEffectKey)
       state.ledger.record(receipt, subject: subject)
       state.performed.insert(ActionFingerprint.call(approval.request.capability, approval.request.arguments, binding: approval.request.binding))
       state.toolExecutions += 1
@@ -428,10 +643,18 @@ public final class TurnRuntime {
       emit(.capabilityCompleted(approval.request.capability, receipt), state)
       await advance(state)
     case .cancelled:
+      journalInvocation(
+        callID: resumeIdentity, state, capability: approval.request.capability,
+        fingerprint: resumeIdentity, invocationState: .failed,
+        arguments: resumeArguments, effectKey: resumeEffectKey)
       state.ledger.record(
         failure: approval.request.capability, reason: "cancelled", subject: subject)
       await finish(state, phase: .failed, reason: "cancelled")
     default:
+      journalInvocation(
+        callID: resumeIdentity, state, capability: approval.request.capability,
+        fingerprint: resumeIdentity, invocationState: .failed,
+        arguments: resumeArguments, effectKey: resumeEffectKey)
       let reason = Self.name(outcome)
       state.ledger.record(
         failure: approval.request.capability, reason: reason, subject: subject)
@@ -448,6 +671,7 @@ public final class TurnRuntime {
       approval.request.accountEpoch == state.context.accountEpoch
     else { return }
     pendingTurn = nil
+    journalRun(state, status: .cancelled)
     state.pendingApprovalID = nil
     state.ledger.record(
       failure: approval.request.capability, reason: "cancelled",
@@ -455,12 +679,23 @@ public final class TurnRuntime {
     await finish(state, phase: .failed, reason: "cancelled")
   }
 
+  /// 사람이 멈췄다. **승인 대기도, 도는 차례도** 여기서 끝난다.
+  ///
+  /// 종료는 한 문으로만 지난다(`finish`) — 도는 차례는 task를 취소하고, 그
+  /// 차례가 자기 자리에서 `eligible(state)`를 보고 스스로 닫는다. 여기서 결과를
+  /// 따로 세우면 한 차례에 답이 두 줄 선다.
   public func cancelPending(for requestID: UUID? = nil) async {
-    guard let state = pendingTurn,
-      requestID == nil || state.requestID == requestID else { return }
-    pendingTurn = nil
-    if let approvalID = state.pendingApprovalID { await dispatcher.reject(approvalID) }
-    await finish(state, phase: .cancelled, reason: "cancelled")
+    if let state = pendingTurn, requestID == nil || state.requestID == requestID {
+      journalRun(state, status: .cancelled)
+      pendingTurn = nil
+      if let approvalID = state.pendingApprovalID { await dispatcher.reject(approvalID) }
+      await finish(state, phase: .cancelled, reason: "cancelled")
+      return
+    }
+    guard let work = runningWork,
+      requestID == nil || activeRequestID == requestID
+    else { return }
+    work.cancel()
   }
 
   // MARK: 감독 되돌이
@@ -482,7 +717,62 @@ public final class TurnRuntime {
   private func advance(_ initial: TurnState) async {
     var state = initial
 
-    // 1) 계획. 승인에서 돌아온 길은 이미 계획을 들고 있으므로 다시 묻지 않는다.
+    // 1) **손에 들려 준 기록은 계획보다 먼저 읽는다**(§24).
+    //
+    //    읽지 않은 첨부가 남아 있는 동안은 계획을 묻지 않는다. 모델은 방금
+    //    저장된 기록을 볼 수 없으므로 물을 수밖에 없다 — 실기 2026-09-17
+    //    (iPhone, 사용자 지적): 사진을 넣고 `"첨부한 내용을 읽고 알려줘"`를 보낸
+    //    차례가 계획 한 번에 `needs`를 받아 `awaitingUser`("값이 하나 더
+    //    필요해요")로 닫혔고, 방금 저장한 사진은 아무도 읽지 않았다
+    //    (`pcc=1/1 rows=0`). 먼저 읽고, **근거를 들고** 계획을 묻는다.
+    //
+    //    첨부가 여럿이면 **모두** 읽고 나서 묻는다. 한 장만 읽고 계획을 물으면
+    //    나머지 장은 그 계획에 없는 것이 된다.
+    while state.steps.isEmpty, let injected = Self.attachedItemStep(state) {
+      if let id = injected.arguments["itemID"]?.textValue {
+        state.attachmentReads.insert(id)
+      }
+      state.steps = [injected]
+      state.telemetry.interventionReason = "dependency:memory.read"
+      switch await drain(&state) {
+      case .suspended:
+        pendingTurn = state
+        return
+      case .stopped(let phase, let needs, let reason):
+        await finish(state, phase: phase, needs: needs, reason: reason)
+        return
+      case .drained:
+        await compileEvidence(&state)
+      }
+    }
+
+    // 1.5) **결정론으로 끝나는 차례는 계획을 묻지 않는다**(§Intent Gate).
+    //
+    //    `"다음 일정 뭐야?"`에 PCC 계획 호출을 쓰는 것은 이 런타임의 목표와
+    //    반대다(설계 §결정). 문이 잡으면 단계는 기기 시각으로 만든 읽기 하나뿐이고,
+    //    모델은 이 차례에서 한 번도 불리지 않는다. 문이 잡지 못하면 아무 일도
+    //    일어나지 않는다 — 아래 계획 경로가 그대로 돈다.
+    if state.steps.isEmpty, state.iteration == 0 {
+      switch IntentGate.decide(
+        input: state.input, scope: state.scope, now: state.context.referenceTime,
+        calendar: state.context.calendar)
+      {
+      case .route(let routed):
+        state.steps = routed.steps
+        // 결정론 라우터가 사용자의 문장을 그대로 해석한 단계다(`Origin`의 정의).
+        // 자격이 붙는 것은 아니다 — 이 문은 읽기 전용만 통과시킨다.
+        state.stepOrigin = .userExplicit
+        state.deterministicRoute = routed.reason
+        state.telemetry.profile = "deterministic"
+        state.telemetry.interventionReason = "gate:\(routed.reason)"
+      case .escalate(let reason):
+        // **승격에는 이유가 있다**(설계 §EscalationPolicy). 이 값이 비어 있는
+        // PCC 차례는 사다리를 건너뛴 차례이고, 그것은 계측에서 버그로 읽는다.
+        state.telemetry.escalationReason = reason
+      }
+    }
+
+    // 2) 계획. 승인에서 돌아온 길은 이미 계획을 들고 있으므로 다시 묻지 않는다.
     if state.steps.isEmpty, state.iteration == 0 {
       switch await decide(&state) {
       case .work(let steps):
@@ -494,8 +784,21 @@ public final class TurnRuntime {
           steps.map(\.capability).filter {
             $0.executionClass == .localWrite || $0.executionClass == .remoteWrite
           })
+        state.planReadsPages = steps.contains { $0.capability == .webRead }
       case .complete:
-        return await finalizeAndPresent(state)
+        // **계획이 "할 일 없음"이라고 해서 손에 들려 준 대상이 사라지지 않는다.**
+        //
+        // 여기서 바로 조립으로 빠지던 동안, 주소를 주고 요약을 시킨 차례가 도구
+        // 하나 없이 닫혔고 답은 `"요약은 제공된 내용에 포함되어 있지 않습니다"`였다
+        // (실기 2026-09-19, 위키백과 URL + `"요약해줘"`: 같은 대화에서 그 주소를
+        // 앞 차례에 읽었다는 문맥을 보고 감독자가 complete를 냈다). 아래 불변식
+        // 고리를 그대로 지나게 둔다 — 메울 읽기가 없으면 고리는 첫 바퀴에 조립으로
+        // 빠지므로, 할 일이 정말 없는 차례의 행동은 달라지지 않는다.
+        //
+        // **거부는 예외다.** 안전 판정으로 닫힌 차례에 보정을 잇는 것은 거부한
+        // 내용을 다른 모델로 한 번 더 시도하는 일이다(§37) — 그 길은 열지 않는다.
+        if state.safetyRefused { return await finalizeAndPresent(state) }
+        break
       case .needsUser(let key):
         // PCC가 모자란 값을 말했다. **묻고 닫는다** — 사용자의 답은 다음 차례이고,
         // 그 차례의 계획은 답을 문맥으로 받아 완성된 JSON을 낸다.
@@ -507,7 +810,7 @@ public final class TurnRuntime {
       }
     }
 
-    // 2) 순차 실행. 여기서 PCC를 부르지 않는다.
+    // 3) 순차 실행. 여기서 PCC를 부르지 않는다.
     while true {
       guard eligible(state) else {
         await finish(state, phase: .failed, reason: "cancelled")
@@ -526,13 +829,14 @@ public final class TurnRuntime {
         }
       }
 
-      // 3) 의미 불변식. **손에 들려 준 대상은 반드시 읽힌다**(§24) — 모델이
+      // 4) 의미 불변식. **손에 들려 준 대상은 반드시 읽힌다**(§24) — 모델이
       //    엉뚱한 성공 계획을 냈다고 이 요구가 사라지지 않는다. 이 단계들은
       //    규칙이 만드는 계획이 아니라 **빠뜨린 읽기를 메우는 보정**이고, 모델을
       //    다시 부르지 않는다.
       //
-      //    먼저 방금 건넨 기록이다. 사진을 넣고 `"이게 뭐야?"`라고 물으면 답은
-      //    그 사진을 읽어야 나온다 — 보관함 검색으로 비켜 갈 자리를 만들지 않는다.
+      //    첨부는 위의 선행 읽기가 이미 본다. 여기 남겨 두는 이유는 승인에서
+      //    이어 간 길이 그 선행 읽기를 지나지 않기 때문이다 — 그 길의 남은
+      //    첨부는 이 자리에서 읽힌다.
       if let injected = Self.attachedItemStep(state) {
         if let id = injected.arguments["itemID"]?.textValue {
           state.attachmentReads.insert(id)
@@ -562,11 +866,21 @@ public final class TurnRuntime {
       }
 
       //    웹도 같다. 검색 결과는 주소와 공급자가 쓴 한 줄이고, 그 줄로 답을 쓰면
-      //    열어 보지 않은 페이지에 대해 답한 것이 된다(`searchedPageReadStep`).
-      if let injected = await searchedPageReadStep(&state) {
-        state.searchedPageReadAttempts += 1
-        state.steps = [injected]
+      //    열어 보지 않은 페이지에 대해 답한 것이 된다(`searchedPageReadSteps`).
+      let injected = await searchedPageReadSteps(&state)
+      if !injected.isEmpty {
+        state.searchedPageReadAttempts += injected.count
+        state.steps = injected
         state.telemetry.interventionReason = "dependency:web.read"
+        continue
+      }
+
+      //    읽었으면 **요약한다.** 사람이 요약을 말했는데 계획이 읽기에서 끝나면
+      //    화면에 요약문이 서지 않는다(실기 2026-09-19).
+      if let injected = Self.summaryInvariantStep(state) {
+        state.summaryInvariantApplied = true
+        state.steps = [injected]
+        state.telemetry.interventionReason = "dependency:text.summarize"
         continue
       }
 
@@ -596,8 +910,13 @@ public final class TurnRuntime {
   }
 
   private func decide(_ state: inout TurnState) async -> Direction {
-    let phase: TurnPhase = state.iteration == 0 ? .planning : .reviewing
-    emit(state.iteration == 0 ? .planning : .replanning, state)
+    // **회수한 근거가 있으면 이 호출은 관찰 뒤의 판단이다**(§11: observe → decide).
+    //
+    // 되돌이 번호로 갈랐던 동안, 첨부를 먼저 읽은 차례의 첫 호출이 `planning`으로
+    // 나갔고 그 설정은 근거를 싣지 않는다 — 모델은 방금 읽은 사진을 보지 못한 채
+    // "값이 하나 더 필요해요"로 되물었다(실기 2026-09-17, iPhone).
+    let phase: TurnPhase = state.ledger.evidence.isEmpty ? .planning : .reviewing
+    emit(phase == .planning ? .planning : .replanning, state)
 
     // **끝난 일을 범위에서 숨기지 않는다.**
     //
@@ -607,28 +926,36 @@ public final class TurnRuntime {
     // 같은 열쇠로 막히고, 다른 인자는 다른 일이다. 감독자는 무엇이 끝났는지를
     // `<<<completed>>>` 구획으로 본다.
     let scope = state.scope
-    guard !scope.isEmpty else { return .complete }
 
     // 오케스트레이션은 **언제나 PCC**다. 예산으로 기기 모델에 내려서던 길
     // (`PCCBudget`)은 없앴다 — 사용자가 말한 일을 다른 품질로 몰래 처리하는
     // 길이었고, 그때 계측의 `backend` 칸도 갈라졌다.
     let profile = DynamicTurnProfile.supervising(
-      phase: phase, target: .privateCloud, scope: scope, iteration: state.iteration)
+      phase: phase, target: .privateCloud, scope: scope)
     let context: CompiledConversationContext
     do {
-      context = try ConversationContextCompiler().compile(
+      let compacted = try ConversationContextCompiler().compileWithCompaction(
         profile: profile,
         userMessage: state.input,
-        recentTurns: state.context.recentMessages,
+        recentTurns: scopedRecentMessages(state),
         evidence: state.ledger.evidence,
         coverage: state.ledger.coverage,
         anchoredSlots: anchoredSlots(state),
+        heldRecords: state.context.heldRecords,
+        knownFacts: state.context.knownFacts,
         completed: state.ledger.completedDigest(),
+        voice: answerVoice,
         now: state.context.referenceTime,
         calendar: state.context.calendar)
+      context = compacted.context
+      state.telemetry.compactedEvidenceCount += compacted.droppedEvidenceCount
+      // 이 단계가 실제로 실은 글자 수. 설계의 단계별 목표치와 대조하는 값이다.
+      state.telemetry.record(
+        contextCharacters: context.prompt.count, phase: profile.phase.rawValue)
     } catch {
-      // **예산을 넘긴 문맥으로는 부르지 않는다.** 자른 문맥으로 부르면 사용자가
-      // 시킨 일과 다른 일이 계획되고, 그 차이는 어디에도 남지 않는다.
+      // **예산을 넘긴 문맥으로는 부르지 않는다.** 근거를 0개까지 줄여도 여전히
+      // 넘쳤거나, 애초에 근거 문제가 아니었다(`requestTooLarge`/
+      // `instructionsTooLarge`) — 그건 근거 압축으로 가릴 문제가 아니다.
       state.telemetry.fallbackReason = error.reason
       return .stop(reason: error.reason)
     }
@@ -636,15 +963,53 @@ public final class TurnRuntime {
     state.iteration += 1
     state.telemetry.supervisorIterations = state.iteration
 
-    let step = await supervising(
-      SupervisorRequest(
-        context: context, profile: profile, conversationID: state.conversation,
-        accountID: state.account))
+    let request = SupervisorRequest(
+      context: context, profile: profile, conversationID: state.conversation,
+      accountID: state.account)
+    let step = await ModelResponseStream.$sink.withValue(responseSink(for: state)) {
+      await supervising(request)
+    }
     guard eligible(state) else { return .stop(reason: "cancelled") }
     switch step {
     case .decided(let decision, let trail):
       record(trail, in: &state)
       if trail.outcome.pccCompleted { state.pccSupervised = true }
+      switch decision.dialogue {
+      case .none:
+        break
+      case .invalid(let reason):
+        return .stop(reason: reason)
+      case .reply(let text):
+        guard !decision.hasWork, decision.plan.needs == nil else {
+          return .stop(reason: DialogueResolution.invalidDecisionReason)
+        }
+        // Documents and device observations still go through the existing
+        // evidence-backed finalizer. A conversational reply is not a receipt.
+        if state.ledger.hasReceipts { return .complete }
+        if let read = Self.urlInvariantStep(state) {
+          state.invariantApplied = true
+          return .work([read])
+        }
+        // **손에 든 자료를 읽지 않고 대화로 닫지 않는다.** 앞차례에 건넨 문서를
+        // 두고 `"중요한 게 뭐야?"`라고 물은 차례가 `.reply`로 닫히면 그 답은
+        // 문서를 본 적이 없다(제보 재현, REMAINING_WORK.ko.md P0). 주소를 주고
+        // 읽지 않는 일을 막는 `urlInvariantStep`과 같은 자리이고 같은 근거다.
+        if let read = Self.heldRecordStep(state) {
+          if let id = read.arguments["itemID"]?.textValue {
+            state.attachmentReads.insert(id)
+          }
+          state.telemetry.interventionReason = "dependency:memory.read"
+          return .work([read])
+        }
+        state.dialogue = .reply(text)
+        return .complete
+      case .question(let key, let text):
+        guard !decision.hasWork, decision.plan.needs == nil else {
+          return .stop(reason: DialogueResolution.invalidDecisionReason)
+        }
+        state.dialogue = .question(key: key, text: text)
+        return .needsUser(key)
+      }
       if let needs = decision.plan.needs {
         let reads = investigationSteps(decision.plan.steps, in: state)
         if !reads.isEmpty {
@@ -668,7 +1033,20 @@ public final class TurnRuntime {
       state.telemetry.fallbackReason = reason
       switch disposition {
       case .surfaceFailure:
-        // 안전 판정은 우회하지 않는다(§37).
+        // **안전 판정은 우회하지 않는다**(§37) — 같은 내용을 다른 모델에 다시
+        // 내지 않는다. 그러나 그 시점에 기기가 이미 읽어 둔 것은 사용자의 것이고,
+        // 차례를 빈손으로 닫을 이유가 아니다(실기 2026-09-17, iPhone: 원천징수
+        // 영수증 요약이 `fallback guardrail`로 "하지 못했어요"가 됐다 — 1,886자를
+        // 읽은 뒤였다). 남은 일은 **기기 안에서만** 하고, 답 자리에는 거부를 말한다.
+        if ModelFailureClassifier.isSafetyJudgment(reason), !state.safetyRefused,
+          state.ledger.hasReceipts
+        {
+          state.safetyRefused = true
+          state.terminations.append(reason)
+          // Preserve observations already obtained, but do not retry the
+          // refused content with a local generative model.
+          return .complete
+        }
         return .stop(reason: reason)
       case .retry:
         // 감독자가 이미 같은 요청을 한 번 더 냈다. 그래도 답이 없으면 **사실을
@@ -738,15 +1116,19 @@ public final class TurnRuntime {
     return binding
   }
 
-  /// 이 대상에 대해 **우리가 실제로 관측한** revision. 되돌릴 수 없는 동작에만 쓴다.
+  /// 이 대상에 대해 **우리가 실제로 관측한** revision.
   ///
   /// 관측이 여럿이고 값이 갈리면 nil이다 — 어느 것이 지금인지 모르는 상태를
   /// 하나로 고르지 않는다. 공급자가 revision을 주지 않는 경우도 nil이고, 그때는
   /// Dispatcher가 재확인 없이 지나간다(§4.4).
+  ///
+  /// 여는 값은 `targetConsistency`다. `isIrreversible`로 여던 동안 수정은 대상을
+  /// 다시 보지 않았다 — 승인 카드를 보는 사이 다른 앱이 고친 일정을 우리가
+  /// 덮었다(코드 리뷰 2026-09-18 P1).
   private func observedTargetRevision(
     for capability: CapabilityID, arguments: [String: ActionValue], in state: TurnState
   ) -> String? {
-    guard capability.isIrreversible else { return nil }
+    guard capability.targetConsistency == .revisionMustMatch else { return nil }
     let remembered = state.conversation.flatMap { anchors[$0] }?.references.values
       .filter { $0.isValid(in: state.context) }
       .compactMap { $0.source } ?? []
@@ -874,6 +1256,19 @@ public final class TurnRuntime {
           state.telemetry.interventionReason = "dependency:web.read"
           continue
         }
+        // 원문 자리를 채울 **기록**이 대화에 있으면 그것을 읽는다. 사람이
+        // `"요약해줘"`라고만 말했을 때 가리킨 것은 방금 보여 준 그 파일이고,
+        // 그 식별자는 기기가 들고 있다(§24).
+        if step.unresolved.contains(ResolvableArgument.sourceText.rawValue),
+          let injected = Self.heldRecordStep(state)
+        {
+          if let id = injected.arguments["itemID"]?.textValue {
+            state.attachmentReads.insert(id)
+          }
+          state.steps.insert(contentsOf: [injected, step], at: 0)
+          state.telemetry.interventionReason = "dependency:memory.read"
+          continue
+        }
         // 그 밖의 빈 자리는 **되묻는다.** 규칙이 만든 다른 길로 갈아타지 않는다 —
         // 사용자가 말한 일과 다른 일을 하게 된다.
         return .stopped(
@@ -923,7 +1318,10 @@ public final class TurnRuntime {
         // 계획 시점에 관측한 대상의 revision. Dispatcher가 효과 직전에 다시 본다.
         targetRevision: observedTargetRevision(
           for: step.capability, arguments: arguments, in: state))
-      if state.stepOrigin == .userExplicit, step.capability.isIrreversible {
+      // **자격의 문도 권한에서 나온다.** 여기 있던 `isIrreversible`은 사람이
+      // 명시한 일정 생성에 자격을 싣지 않았고(되돌릴 수 있으니), 그래서 그
+      // 단계는 승인 문을 한 번 더 지났다 — 경계는 하나여야 한다.
+      if state.stepOrigin == .userExplicit, step.capability.requiresAuthorization {
         request = request.with(
           authorization: AuthorizationProof.issue(for: request, source: .userInstruction))
       }
@@ -932,11 +1330,20 @@ public final class TurnRuntime {
       // **바깥으로 나가는 쓰기는 기록 없이 나가지 않는다.** 복구 기록을 남길 수
       // 없으면 실행하지 않는다 — 기록 없이 보낸 전송은 다음 재시도에서 두 번째
       // 전송이 된다(§12 PR5 fail closed).
-      if step.capability.isRemoteWrite,
-        !persistRun(state, status: .running, pendingStepIdentity: identity)
-      {
-        state.toolExecutions -= 1
-        return .stopped(phase: .failed, needs: nil, reason: "checkpointUnavailable")
+      //
+      // 적는 것은 **효과의 정체**다(`effectIdentity`). 차례의 id로 적으면 재시작
+      // 뒤의 재전송이 다른 열쇠가 되고, 그 열쇠로는 원장에게 "이미 나갔는가"를
+      // 물을 수 없다(코드 리뷰 2026-09-18 P1).
+      if step.capability.isRemoteWrite {
+        let key = request.effectIdentity
+        state.effects.removeAll { $0.key == key }
+        state.effects.append(
+          TurnEffectCheckpoint(key: key, capability: step.capability, state: .prepared))
+        guard persistRun(state, status: .running, pendingStepIdentity: identity) else {
+          state.effects.removeAll { $0.key == key }
+          state.toolExecutions -= 1
+          return .stopped(phase: .failed, needs: nil, reason: "checkpointUnavailable")
+        }
       }
       // **시도한 주소를 적는다.** 성공만 적으면 거절당한 주소가 다음 후보 선택에서
       // 다시 1위가 되고, 같은 인자의 재주입은 지문 중복으로 걸러져 차례는 아무것도
@@ -950,11 +1357,23 @@ public final class TurnRuntime {
         state.attemptedURLs.insert(url)
       }
       // 함께 보낸 읽기의 결과가 이미 있으면 그것을 쓴다. 없으면 지금 보낸다.
+      //
+      // 보내는 동안 **툴의 진행을 화면으로 흘린다**(`ToolProgress`). 조각마다 기기
+      // 모델을 부르는 요약은 한 단계가 수십 초를 쓰고, 그 동안 아무것도 서지
+      // 않으면 사람은 멈춘 것과 구별할 수 없다(실기 2026-09-17: 131초).
+      // prefetch 결과를 쓰는 경로도 실행된 사실이므로 같은 줄을 남긴다.
+      let encodedArguments = Self.journalArguments(arguments)
+      let effectKey = step.capability.isRemoteWrite ? request.effectIdentity : nil
+      journalInvocation(
+        callID: identity, state, capability: step.capability, fingerprint: identity,
+        invocationState: .running, arguments: encodedArguments, effectKey: effectKey)
       let outcome: ActionOutcome
       if let prefetched = state.prefetchedReads.removeValue(forKey: identity) {
         outcome = prefetched
       } else {
-        outcome = await dispatcher.dispatch(request)
+        outcome = await ToolProgress.withSink(progressSink(for: state)) {
+          await dispatcher.dispatch(request)
+        }
       }
       switch outcome {
       case .completed(let receipt):
@@ -970,6 +1389,13 @@ public final class TurnRuntime {
         {
           state.incomplete = true
         }
+        // **효과는 나갔는데 디스크가 모른다.** 그 차례는 완료가 아니라 재조정이다 —
+        // 사용자가 본 "보냈어요"와 원장의 `pending`이 갈라진 채로 닫으면, 다음
+        // 복구는 그 전송을 결과 불명으로 막으면서 화면은 성공을 말한다
+        // (코드 리뷰 2026-09-18 P1).
+        if receipt.ledgerUnsettled {
+          state.terminations.append(Self.ledgerUnsettledReason)
+        }
         state.performed.insert(identity)
         state.lastProgressIteration = state.iteration
         state.unsuccessfulToolExecutions = 0
@@ -979,6 +1405,32 @@ public final class TurnRuntime {
           let url = arguments["url"]?.textValue
         {
           state.readURLs.insert(url)
+        }
+        // **나간 효과는 디스크에도 나간 것으로 남는다.** 이 저장이 없으면 재시작
+        // 뒤 복구가 그 열쇠를 `prepared`로 읽고, 원장을 한 번 더 물어야 알 수
+        // 있는 것을 "모른다"로 세운다.
+        if step.capability.isRemoteWrite {
+          let key = request.effectIdentity
+          if let index = state.effects.firstIndex(where: { $0.key == key }) {
+            state.effects[index].state = .completed
+          }
+          persistRun(state, status: .running, pendingStepIdentity: identity)
+        }
+        let unknown = receipt.ledgerUnsettled
+        if unknown {
+          journalInvocation(
+            callID: identity, state, capability: step.capability, fingerprint: identity,
+            invocationState: .outcomeUnknown, arguments: encodedArguments,
+            receipt: Self.journalReceiptJSON(receipt), receiptID: receipt.requestID.uuidString,
+            effectKey: effectKey)
+        } else {
+          journalInvocation(
+            callID: identity, state, capability: step.capability, fingerprint: identity,
+            invocationState: .completed, arguments: encodedArguments,
+            receipt: Self.journalReceiptJSON(receipt), receiptID: receipt.requestID.uuidString,
+            effectKey: effectKey)
+          let toolText = receipt.summary.isEmpty ? step.capability.rawValue : receipt.summary
+          journalEntry(state, role: .tool, text: toolText, toolCallID: identity)
         }
         emit(.capabilityCompleted(step.capability, receipt), state)
         // 이 단계의 결과는 여기서 화면에 선다. 뒤에 남은 단계와 마무리 호출을
@@ -1000,6 +1452,10 @@ public final class TurnRuntime {
           state, status: .awaitingApproval,
           pendingStepIdentity: identity,
           approvalFingerprint: ActionFingerprint.arguments(approval.request.arguments))
+        journalInvocation(
+          callID: identity, state, capability: step.capability, fingerprint: identity,
+          invocationState: .proposed, arguments: encodedArguments, effectKey: effectKey)
+        journalRun(state, status: .awaitingApproval)
         emit(.awaitingApproval(approval), state)
         guard eligible(state) else {
           await dispatcher.reject(approval.id)
@@ -1013,10 +1469,18 @@ public final class TurnRuntime {
           subject: Self.subject(of: arguments),
           coverage: Self.failedCoverage(request, state: .cancelled, reason: "cancelled"))
         emit(.capabilityFailed(step.capability, reason: "cancelled"), state)
+        journalInvocation(
+          callID: identity, state, capability: step.capability, fingerprint: identity,
+          invocationState: .failed, arguments: encodedArguments, effectKey: effectKey)
         return .stopped(phase: .failed, needs: nil, reason: "cancelled")
       default:
         state.unsuccessfulToolExecutions += 1
         let reason = Self.name(outcome)
+        let unknownFailure = Self.reconcilingReasons.contains(where: { reason.lowercased().contains($0) })
+        journalInvocation(
+          callID: identity, state, capability: step.capability, fingerprint: identity,
+          invocationState: unknownFailure ? .outcomeUnknown : .failed,
+          arguments: encodedArguments, effectKey: effectKey)
         state.ledger.record(
           failure: step.capability, reason: reason,
           subject: Self.subject(of: arguments),
@@ -1065,15 +1529,59 @@ public final class TurnRuntime {
         ? Self.reference(slot, ledger: state.ledger, context: state.context)
         : remembered[slot]
       guard let reference, reference.isValid(in: state.context), reference.allows(step.capability)
-      else { return nil }
+      else {
+        // **이 대화가 손에 들고 있는 기록**이 그 자리를 채울 수 있다(§24).
+        //
+        // 사람은 `"요약해줘"`·`"이거 뭐야"`라고 말하고 식별자를 말하지 않는다.
+        // 그 자리를 모델이 지어내게 하지도, 사용자에게 되묻게 하지도 않는다 —
+        // 가리킨 대상은 기기가 들고 있다(실기 2026-09-17, iPhone: 첨부 없는 다음
+        // 차례가 "값이 하나 더 필요해요"로 닫혔다).
+        if slot == .itemID, let held = state.context.heldRecords.first {
+          arguments[key] = .text(held.itemID)
+          continue
+        }
+        return nil
+      }
       if let source = reference.source, case .connector(let observed) = source.binding {
         guard binding == nil || binding == observed else { return nil }
         binding = observed
+      }
+      // **같은 주소를 두 번 읽지 않는다.** 계획이 `web.read`를 여럿 내면 자리마다
+      // 같은 1위가 채워지고, 지문이 같은 호출은 접히므로(`ActionFingerprint`)
+      // 리서치는 한 장으로 끝난다. 이미 읽은 주소면 **다음 후보**를 준다.
+      if slot == .url, let picked = reference.value.textValue,
+        state.attemptedURLs.contains(picked)
+      {
+        guard let next = Self.nextSearchedURL(in: state) else { return nil }
+        arguments[key] = .text(next)
+        continue
       }
       arguments[key] = reference.value
     }
     step = PlannedStep(capability: step.capability, arguments: arguments, binding: binding)
     return arguments
+  }
+
+  /// 아직 읽지 않은 **다음 검색 후보**. 순위는 기기가 정한 그 순위다
+  /// (`SearchCandidateSelector`) — 공급자 순서를 그대로 쓰면 두 번째 장이 그
+  /// 공급자가 고른 두 번째가 된다.
+  ///
+  /// 기기 모델을 부르지 않는다. 고르는 판단은 첫 장에서 이미 했고
+  /// (`searchedPageReadStep`), 여기서 하는 일은 그 순위를 따라 내려가는 것뿐이다.
+  private static func nextSearchedURL(
+    in state: TurnState, excluding taken: Set<String>? = nil
+  ) -> String? {
+    guard let hit = state.ledger.receipts.last(where: { $0.capability == .webSearch })
+    else { return nil }
+    let skip = taken ?? state.attemptedURLs
+    let rows = CapabilitySourceRow.rows(in: hit.details)
+    let ranked = SearchCandidateSelector.rank(
+      rows, query: state.input, context: Self.privateContext(state))
+    return ranked.first { candidate in
+      let scheme = URL(string: candidate.url)?.scheme
+      guard scheme == "http" || scheme == "https" else { return false }
+      return !skip.contains(candidate.url)
+    }?.url
   }
 
   private nonisolated static func produces(_ slot: ResolvableArgument, _ capability: CapabilityID) -> Bool {
@@ -1085,6 +1593,7 @@ public final class TurnRuntime {
     case .itemID: return ["memory", "artifact", "content", "recording"].contains(capability.domain)
     case .eventID: return capability.domain == "calendar"
     case .reminderID: return capability.domain == "reminders"
+    case .photoID: return capability == .photosSearch
     case .url: return capability == .webSearch
     // 줄일 원문은 **읽은 것**에서 온다. 검색은 읽기가 아니다: 그 줄은 손잡이이고
     // (`CapabilityContract.RowKind.handle`) 본문 자리가 비어 있다. 제목과 스니펫으로
@@ -1118,8 +1627,10 @@ public final class TurnRuntime {
     //
     // 이 예외가 없던 동안 `web.search → web.read`는 **한 번도 이어지지 않았다**:
     // 결과가 둘 이상이면 이 자리가 nil을 내고 차례는 주소를 되물었다.
+    // - `photos.search`: 목록은 **최신순**이고 읽기는 부작용이 없다. 고르지 않으면
+    //   `"최근 사진 읽어 줘"`가 보관함 식별자를 되묻는다 — 사람이 줄 수 없는 값이다.
     guard rows.count <= 1 || receipt.capability == .chatRead
-      || receipt.capability == .webSearch
+      || receipt.capability == .webSearch || receipt.capability == .photosSearch
     else { return nil }
     if receipt.capability == .mailSearch || receipt.capability == .chatSearch {
       let bindings = Set(receipts.filter { $0.capability == receipt.capability }.flatMap { $0.sources.map { $0.binding } })
@@ -1180,6 +1691,9 @@ public final class TurnRuntime {
       case .reminderID:
         guard receipt.capability.domain == "reminders" else { continue }
         if let id = rows.first?.identifier, !id.isEmpty { return .text(id) }
+      case .photoID:
+        guard receipt.capability == .photosSearch else { continue }
+        if let id = rows.first?.identifier, !id.isEmpty { return .text(id) }
       case .url:
         // 주소는 **검색 결과에서만** 온다. 모델이 채우는 자리가 아니다 —
         // 지어낸 주소는 없는 페이지이거나, 더 나쁘게는 남의 사설망 주소다
@@ -1226,11 +1740,15 @@ public final class TurnRuntime {
   /// 두 번 올라온다.
   private func compileEvidence(_ state: inout TurnState) async {
     guard eligible(state), state.ledger.hasReceipts else { return }
-    if let last = state.ledger.attempts.last?.capability {
-      emit(.compacting(last), state)
+    let compacting = state.ledger.attempts.last?.capability
+    if let compacting {
+      emit(.compacting(compacting), state)
     }
     let compiled = await EvidenceCompiler(query: state.input).compile(
       state.ledger.receipts, budget: state.extractionBudget)
+    if let compacting {
+      emit(.compacted(compacting), state)
+    }
     guard eligible(state) else { return }
     state.evidence = compiled
     state.extractionWaitMilliseconds += compiled.extractionWaitMilliseconds
@@ -1256,6 +1774,42 @@ public final class TurnRuntime {
       .sorted { $0.rawValue < $1.rawValue }
   }
 
+  /// 이 대화가 **손에 들고 있는 기록**을 읽는 단계(§24).
+  ///
+  /// `attachedItemStep`과 나눠 두는 이유: 그쪽은 **이 차례에** 건넨 것이고 언제나
+  /// 읽는다. 이쪽은 앞차례에 건넨 것이고, 계획이 그것을 가리켰거나 채우지 못한
+  /// 자리가 있을 때, 그리고 **대화로 닫히려는 차례**(`.reply`)에도 지난다.
+  ///
+  /// 대화로 닫는 차례까지 넓힌 이유: 앞차례에 건넨 문서를 두고 `"중요한 게
+  /// 뭐야?"`라고 물은 차례가 모델의 `.reply`로 곧장 닫히면 그 답은 문서를 본
+  /// 적이 없다(제보 재현, `REMAINING_WORK.ko.md` P0). 비용은 로컬 읽기 1회 +
+  /// 기기 추출 최대 `EvidenceCompiler.maximumChunksPerRow`회 + PCC 답 1회고,
+  /// 이미 읽은 기록은 `attachmentReads`/`ledger.receipts`가 막아 다시 읽지
+  /// 않는다 — `"고마워"` 한마디가 매번 지난 문서를 되읽지는 않는다. 이 비용을
+  /// 받아들인 이유는 문서를 든 대화의 후속 질문이 근거 없이 닫히는 실패가 이
+  /// 비용보다 크기 때문이다.
+  private static func heldRecordStep(_ state: TurnState) -> PlannedStep? {
+    guard state.scope.contains(.memoryRead) else { return nil }
+    guard
+      let held = state.context.heldRecords.first(where: {
+        !state.attachmentReads.contains($0.itemID)
+      })
+    else { return nil }
+    // 이미 읽은 기록은 다시 읽지 않는다.
+    let alreadyRead = state.ledger.receipts.contains {
+      guard $0.capability == .memoryRead else { return false }
+      if $0.externalID == held.itemID { return true }
+      return CapabilitySourceRow.rows(in: $0.details).first?.identifier == held.itemID
+    }
+    guard !alreadyRead else { return nil }
+    switch CapabilityContract.normalize(["itemID": .text(held.itemID)], for: .memoryRead) {
+    case .success(let arguments):
+      return PlannedStep(capability: .memoryRead, arguments: arguments)
+    case .failure:
+      return nil
+    }
+  }
+
   /// 주소를 주고 읽어 달라고 했는데 그 주소를 읽지 않았다면, 읽는다(§24).
   ///
   /// 이 불변식이 없으면 모델이 낸 "성공한 엉뚱한 계획"이 결정론 구제를 영원히
@@ -1278,6 +1832,47 @@ public final class TurnRuntime {
     case .failure:
       return nil
     }
+  }
+
+  /// **읽어 놓고 요약하지 않는 일을 막는다.**
+  ///
+  /// 사람이 `"요약해줘"`라고 말했는데 계획이 `web.read` 하나로 끝나면, 화면에
+  /// 서는 것은 근거 세 줄로 쓴 모델 문장이고 **요약문은 어디에도 없다**(실기
+  /// 2026-09-19: 위키백과 URL + `"요약해줘"`가 정확히 그렇게 닫혔다). 계획
+  /// 지시문을 늘려 고치는 길은 예산이 이미 한 번 깨진 전례가 있어(`instructionsTooLarge`)
+  /// 택하지 않는다 — 읽은 본문이 있고 사람이 요약을 말했다는 두 사실만으로
+  /// **코드가 다음 단계를 잇는다.** `urlInvariantStep`·`recordReadStep`과 같은
+  /// 자리이고 같은 근거다.
+  ///
+  /// 낱말로 판정하는 것이 여기서 안전한 이유: 이 단계는 읽기 전용 기기 능력이고
+  /// (`text.summarize`는 `.observes`) 바깥을 바꾸지 않는다. 잘못 붙어도 비용은
+  /// 기기 요약 한 번이지, 사용자가 시키지 않은 효과가 아니다.
+  private static func summaryInvariantStep(_ state: TurnState) -> PlannedStep? {
+    guard !state.summaryInvariantApplied, state.scope.contains(.textSummarize) else { return nil }
+    guard Self.asksForSummary(state.input) else { return nil }
+    // 이미 요약·번역 산출물이 있으면 할 일이 없다.
+    guard
+      !state.ledger.receipts.contains(where: {
+        $0.capability == .textSummarize || $0.capability == .textTranslate
+      })
+    else { return nil }
+    guard !state.steps.contains(where: { $0.capability == .textSummarize }) else { return nil }
+    // 줄일 **본문**이 있어야 한다. 읽은 것이 없으면 요약은 지어내기가 된다.
+    let hasBody = state.ledger.receipts.contains { receipt in
+      CapabilitySourceRow.rows(in: receipt.details).contains { !$0.body.isEmpty }
+    }
+    guard hasBody else { return nil }
+    return PlannedStep(
+      capability: .textSummarize, arguments: [:],
+      unresolved: [ResolvableArgument.sourceText.rawValue])
+  }
+
+  /// 사람이 **요약을 말했는가.** 번역은 여기 넣지 않는다 — 도착 언어가 필요하고,
+  /// 그 값을 규칙이 지어내면 사용자가 말하지 않은 언어로 옮긴다.
+  private static func asksForSummary(_ input: String) -> Bool {
+    let lowered = input.lowercased()
+    return ["요약", "정리해", "간추", "summarize", "summary", "tl;dr"]
+      .contains { lowered.contains($0) }
   }
 
   /// 찾은 내 기록을 읽는 단계. **한 차례에 한 번만.**
@@ -1313,7 +1908,33 @@ public final class TurnRuntime {
     }
   }
 
-  /// 찾은 페이지를 읽는 단계. **한 차례에 한 번만.**
+  /// 이 회차에 **함께 보낼** 읽기들.
+  ///
+  /// 보통은 한 장이다. 한 장의 값은 네트워크가 아니라 **기기의 값 뽑기**이고
+  /// (실측 2026-09-18, iPhone 15 Pro: 세 장을 읽은 차례 26.2초 중 읽기는 5초,
+  /// 나머지는 뽑기와 답), 미리 두 장을 잡으면 첫 장으로 충분한 차례가 필요 없는
+  /// 뽑기를 한 번 더 한다.
+  ///
+  /// 앞 장이 **사실을 한 줄도 주지 않았을 때만** 둘을 함께 낸다: 글을 스크립트가
+  /// 그리는 페이지는 다음 장도 그럴 수 있고, 그때 두 번의 기다림을 한 번으로
+  /// 접는다(`prefetchIndependentReads`가 병렬로 보낸다).
+  private func searchedPageReadSteps(_ state: inout TurnState) async -> [PlannedStep] {
+    guard let first = await searchedPageReadStep(&state) else { return [] }
+    let facts = state.evidence.evidence.reduce(0) { $0 + $1.facts.count }
+    guard facts == 0, state.ledger.receipts.contains(where: { $0.capability == .webRead }),
+      state.searchedPageReadAttempts + 2 <= Self.searchedPageReadLimit,
+      let chosen = first.arguments["url"]?.textValue
+    else { return [first] }
+    var taken = state.attemptedURLs
+    taken.insert(chosen)
+    guard let next = Self.nextSearchedURL(in: state, excluding: taken),
+      case .success(let arguments) = CapabilityContract.normalize(
+        ["url": .text(next)], for: .webRead)
+    else { return [first] }
+    return [first, PlannedStep(capability: .webRead, arguments: arguments)]
+  }
+
+  /// 찾은 페이지를 읽는 **한 단계**. 무엇을 읽을지는 여기서 고른다.
   ///
   /// 검색이 돌려주는 줄은 주소와 공급자가 쓴 한 줄뿐이다(`RowKind.handle`). 그
   /// 줄로 답을 쓰면 우리가 **열어 보지 않은 페이지**에 대해 답한 것이 된다.
@@ -1327,15 +1948,20 @@ public final class TurnRuntime {
     guard state.scope.contains(.webRead) else { return nil }
     guard let hit = state.ledger.receipts.last(where: { $0.capability == .webSearch })
     else { return nil }
-    // **한 장을 읽었으면 끝이다.** 이 자리의 목적은 "찾았는데 하나도 읽지 않는
-    // 일"을 막는 것이고, 후보를 전부 읽는 것이 아니다 — 후보 랭킹을 넣자마자
-    // 계획대로 1위를 읽은 차례가 2위를 한 번 더 읽었다(시험 실측).
+    // **읽기를 멈추는 것은 장 수가 아니라 모인 사실이다.** 계획이 스스로 읽기를
+    // 냈다면 깊이는 계획의 것이므로 이 보정은 한 장으로 끝난다. 검색만 하고 끝낸
+    // 계획이면 여기서 메우고, 사실이 모일 때까지 다음 후보로 내려간다 — 한 장으로
+    // 못 박은 동안 `"이더리움에 대해 리서치해줘"`가 글 없는 `msn.com` 한 장을 읽고
+    // `"정보를 찾을 수 없어요"`로 닫혔다(실기 2026-09-18, iPhone 15 Pro).
     //
     // 성공한 수령증으로 판정한다. 시도한 주소로 판정하면 **거절당한 시도**가 읽은
     // 것으로 세어져 그 차례는 아무것도 읽지 못한 채 끝난다(실기 2026-09-17 P01:
     // `web.read.rejected` 하나로 차례가 근거 0개로 닫혔다).
-    guard !state.ledger.receipts.contains(where: { $0.capability == .webRead }) else {
-      return nil
+    let read = state.ledger.receipts.contains { $0.capability == .webRead }
+    if read {
+      guard !state.planReadsPages else { return nil }
+      let facts = state.evidence.evidence.reduce(0) { $0 + $1.facts.count }
+      guard facts < Self.researchFactFloor else { return nil }
     }
     let rows = CapabilitySourceRow.rows(in: hit.details)
     // **어느 줄을 읽을지는 기기가 고른다.** 공급자 1위를 그대로 읽던 동안
@@ -1510,7 +2136,7 @@ public final class TurnRuntime {
       await finish(state, phase: .failed, reason: "cancelled")
       return
     }
-    await compileEvidence(&state)
+    if !state.safetyRefused { await compileEvidence(&state) }
     guard eligible(state) else {
       await finish(state, phase: .cancelled, reason: "cancelled")
       return
@@ -1542,7 +2168,7 @@ public final class TurnRuntime {
     emit(.finalizing, state)
 
     var headline = ""
-    var points: [String] = []
+    var points: [AnswerPoint] = []
     /// 모델이 답을 **썼는가**. 상태 문구로 물러난 차례와 구별한다.
     var wroteAnswer = false
     // 답이 필요한 차례는 **회수한 자료를 합쳐 말해야 하는 차례**와 감독이 PCC로
@@ -1553,22 +2179,42 @@ public final class TurnRuntime {
     let needsAnswer = state.evidence.needsSynthesis || state.pccSupervised
     state.answerRequired = needsAnswer
 
-    if needsAnswer, !state.evidence.evidence.isEmpty {
+    // **요약은 답의 재료가 아니라 답 옆에 서는 글이다.**
+    //
+    // 기기가 조각마다 쓴 요약을 PCC의 재료로 넘기면 두 가지가 일어났다(실기
+    // 2026-09-17, iPhone, 세 번 재현): 근거 압축이 조각 열여섯 개를 여섯 개로
+    // 접었고, 답은 앞차례의 답을 베끼거나 원문 발췌를 요약처럼 세웠다.
+    //
+    // 그래서 요약 수령증이 PCC에 싣는 것은 **무엇을 했는가 한 줄**이다(파일 이름과
+    // 조각 수 — `SummarizeTool`이 그 줄을 만든다). PCC는 그 한 줄로 "…16조각을
+    // 요약했어요"를 쓰고, 요약 본문은 기기에 남아 화면이 그대로 렌더한다
+    // (사용자 지시 2026-09-17). 요약문은 이 문맥을 지나지 않는다.
+
+    // **안전 판정 뒤에는 모델을 다시 부르지 않는다**(§37). 그 자리에 서는 것은
+    // 거부를 말하는 한 줄이고, 기기가 정리한 글은 수령증에 남아 화면이 문서로
+    // 세운다.
+    if needsAnswer, !state.evidence.evidence.isEmpty, !state.safetyRefused {
       // 답도 PCC가 쓴다. 근거 크기로 모델을 갈아타지 않는다.
       let profile = DynamicTurnProfile.finalizing(target: .privateCloud)
       let context: CompiledConversationContext?
       do {
-        context = try ConversationContextCompiler().compile(
+        let compacted = try ConversationContextCompiler().compileWithCompaction(
           profile: profile,
           userMessage: state.input,
-          recentTurns: state.context.recentMessages,
+          recentTurns: scopedRecentMessages(state),
           evidence: state.evidence.evidence,
           coverage: state.ledger.coverage,
           // **고정점을 주지 않는다.** 도구가 닫혀 다음 단계가 없고, 식별자의 쓸모는
           // 다음 단계의 인자 하나뿐이다.
+          knownFacts: state.context.knownFacts,
           completed: state.ledger.completedDigest(),
+          voice: answerVoice,
           now: state.context.referenceTime,
           calendar: state.context.calendar)
+        context = compacted.context
+        state.telemetry.compactedEvidenceCount += compacted.droppedEvidenceCount
+        state.telemetry.record(
+          contextCharacters: compacted.context.prompt.count, phase: profile.phase.rawValue)
       } catch {
         // 효과는 이미 일어났다. 답을 쓰지 못한 사유만 남기고 아래의 호스트 문구로
         // 닫는다 — 자른 문맥으로 PCC를 부르지 않는다.
@@ -1576,12 +2222,14 @@ public final class TurnRuntime {
         context = nil
       }
       if let context {
-        let step = await finalizing(context, profile)
+        let step = await ModelResponseStream.$sink.withValue(responseSink(for: state)) {
+          await finalizing(context, profile)
+        }
         record(step.trail, in: &state)
         switch step.answer {
         case .written(let written, let supporting, let relevant, _):
           headline = written
-          points = Array(supporting.prefix(3))
+          points = Self.clamped(supporting)
           wroteAnswer = true
           // **판정을 통과한 것만 화면에 선다.** 색인이 고른 후보는 추측이고,
           // 추측을 결과로 세우면 사용자가 묻지 않은 것이 답의 자리에 온다
@@ -1591,6 +2239,10 @@ public final class TurnRuntime {
             evidence: state.evidence.evidence, pointedAt: Self.pointedAt(state))
         case .unavailable(let reason):
           state.telemetry.fallbackReason = reason
+          if ModelFailureClassifier.isSafetyJudgment(reason) {
+            state.safetyRefused = true
+            state.terminations.append(reason)
+          }
         }
       }
     }
@@ -1603,13 +2255,48 @@ public final class TurnRuntime {
       //
       // 판정도 없으므로 **지역 판정으로 내려선다** — 질의와 한 조각도 겹치지
       // 않는 후보는 세우지 않는다.
-      state.evidence.references = Self.overlapping(
-        state.evidence.references, evidence: state.evidence.evidence,
-        query: state.input, pointedAt: Self.pointedAt(state))
+      // **결정론 문이 잡은 차례는 거르지 않는다.** 창은 기기 시각이 만들었고
+      // 돌아온 줄이 곧 답이다 — `"오늘 일정 뭐 있어?"`와 `"치과"`는 한 글자도
+      // 겹치지 않으므로, 겹침 판정을 걸면 찾은 일정이 사라진다.
+      if state.deterministicRoute == nil {
+        state.evidence.references = Self.overlapping(
+          state.evidence.references, evidence: state.evidence.evidence,
+          query: state.input, pointedAt: Self.pointedAt(state))
+      }
+
+      // **회수한 것도 없고 바꾼 것도 없다. 그 차례는 대화로 닫는다.**
+      //
+      // 여기까지 온 차례는 도구를 불렀지만 아무것도 돌려받지 못했다(빈 검색).
+      // 그때 상태 한 줄("찾지 못했어요")을 세우면 `"안녕"`의 답이 "찾지
+      // 못했어요"가 된다(실기 2026-09-17, 사용자 지적). 부를 도구가 없던 차례와
+      // 같은 자리다 — 대화 모델은 도구가 닫혀 있고 근거가 없으므로 사용자
+      // 데이터에 대한 사실을 말할 수 없고, 말할 수 있는 것은 대화 그 자체뿐이다.
+      // 결정론 차례는 여기서도 모델로 내려서지 않는다. 물은 것은 대화가 아니라
+      // 달력이고, 비어 있으면 "그 창에 일정이 없다"가 정직한 답이다.
+      if state.deterministicRoute == nil, !state.incomplete, state.evidence.references.isEmpty,
+        state.ledger.completedWrites.isEmpty, !state.safetyRefused {
+        switch await conversed(&state) {
+        case .written(let written, let supporting):
+          await finish(
+            state, phase: .completed, headline: written, points: supporting, wroteAnswer: true)
+          return
+        case .unavailable(let reason):
+          // 대화 모델도 열리지 않았다. 아래의 상태 한 줄로 닫고 **사유를 남긴다** —
+          // 사유 없는 상태 한 줄은 "왜 답이 없는가"를 지운다.
+          if state.telemetry.fallbackReason.isEmpty {
+            state.telemetry.fallbackReason = reason
+          }
+        }
+      }
       headline =
-        state.incomplete
+        state.safetyRefused
+        ? copy.refused()
+        : state.incomplete
         ? copy.partial()
-        : needsAnswer
+        // **결정론 차례는 조회다.** 물은 것이 "무엇이 있는가"이므로 답은 찾았는지
+        // 여부다 — `completed`의 "처리했어요"는 일정이 0건인 조회에 붙으면
+        // 무엇을 했는지도, 무엇이 없는지도 말하지 않는다(실기 2026-09-19).
+        : needsAnswer || state.deterministicRoute != nil
         ? copy.found(hasReferences: !state.evidence.references.isEmpty)
         : copy.completed(
           hasReferences: !state.evidence.references.isEmpty,
@@ -1623,34 +2310,65 @@ public final class TurnRuntime {
 
   /// 도구가 하나도 돌지 않은 차례를 **대화로** 닫는다.
   ///
-  /// 여기서 부르는 모델은 도구가 닫혀 있고 근거도 없다(`conversing`). 그래서 이
-  /// 답이 말할 수 있는 것은 대화 그 자체뿐이고, 사용자 데이터에 대한 사실은
-  /// 말하지 않는다 — 읽은 것이 없으면 아는 것도 없다.
+  /// User-reported context and stable general knowledge are valid conversation
+  /// material. They do not prove access to live records or completion of an action.
+  /// A cached PCC reply closes here without invoking another model.
   private func converse(_ initial: TurnState) async {
     var state = initial
     emit(.finalizing, state)
-    let profile = DynamicTurnProfile.conversing(target: .privateCloud)
+    if case .reply(let text) = state.dialogue {
+      // The first PCC response already contains the conversation answer.
+      // Do not spend a second PCC call or invoke an on-device model here.
+      await finish(state, phase: .completed, headline: text, wroteAnswer: true)
+      return
+    }
+    switch await conversed(&state) {
+    case .written(let written, let supporting):
+      await finish(
+        state, phase: .completed, headline: written, points: supporting, wroteAnswer: true)
+    case .unavailable(let reason):
+      await finish(state, phase: .failed, reason: reason)
+    }
+  }
+
+  /// 대화로 쓴 답. 모델을 열지 못한 자리를 **사유와 함께** 돌려준다 — 부르는
+  /// 쪽이 상태 한 줄로 내려설 수 있어야 한다.
+  private enum ConversedAnswer {
+    case written(String, [AnswerPoint])
+    case unavailable(String)
+  }
+
+  /// 대화 한 줄. `asking`을 주면 **답이 아니라 되물음**을 쓴다(모자란 값의 이름).
+  private func conversed(
+    _ state: inout TurnState, asking value: String? = nil
+  ) async -> ConversedAnswer {
+    let profile =
+      value.map { DynamicTurnProfile.asking($0, target: .privateCloud) }
+      ?? DynamicTurnProfile.conversing(target: .privateCloud)
     let context: CompiledConversationContext
     do {
       context = try ConversationContextCompiler().compile(
         profile: profile, userMessage: state.input,
-        recentTurns: state.context.recentMessages,
+        recentTurns: scopedRecentMessages(state),
+        knownFacts: state.context.knownFacts,
+        voice: answerVoice,
         now: state.context.referenceTime,
         calendar: state.context.calendar)
+      state.telemetry.record(
+        contextCharacters: context.prompt.count, phase: profile.phase.rawValue)
     } catch {
       state.terminations.append(error.reason)
-      await finish(state, phase: .failed, reason: error.reason)
-      return
+      return .unavailable(error.reason)
     }
-    let step = await finalizing(context, profile)
+    let step = await ModelResponseStream.$sink.withValue(responseSink(for: state)) {
+          await finalizing(context, profile)
+        }
     record(step.trail, in: &state)
     switch step.answer {
     case .written(let written, let supporting, _, _):
-      await finish(
-        state, phase: .completed, headline: written,
-        points: Array(supporting.prefix(3)), wroteAnswer: true)
+      return .written(written, Array(supporting.prefix(3)))
     case .unavailable(let reason):
-      await finish(state, phase: .failed, reason: reason)
+      return .unavailable(reason)
     }
   }
 
@@ -1661,9 +2379,14 @@ public final class TurnRuntime {
   /// UUID를 읽는다.
   public static func subject(of arguments: [String: ActionValue]) -> String {
     for key in Self.subjectKeys {
-      guard let value = arguments[key]?.textValue?.trimmingCharacters(
-        in: .whitespacesAndNewlines), !value.isEmpty
+      guard let raw = arguments[key]?.textValue?.trimmingCharacters(
+        in: .whitespacesAndNewlines), !raw.isEmpty
       else { continue }
+      // **자르기 전에 푼다.** 주소는 퍼센트 인코딩으로 오고(`/wiki/%EA%B2%80…`),
+      // 인코딩된 채로 60자에서 자르면 조각난 `%E…`가 남아 어디서도 다시 풀 수
+      // 없다 — 화면에 기계의 글자가 그대로 섰다(실기 2026-09-19).
+      var value = raw
+      while let decoded = value.removingPercentEncoding, decoded != value { value = decoded }
       guard value.count > Self.subjectLimit else { return value }
       return String(value.prefix(Self.subjectLimit)) + "…"
     }
@@ -1819,12 +2542,12 @@ public final class TurnRuntime {
     needs: String? = nil,
     reason: String? = nil,
     headline: String = "",
-    points: [String] = [],
+    points: [AnswerPoint] = [],
     /// 모델이 실제로 답을 썼을 때만 true. 상태 문구는 답이 아니다.
     wroteAnswer: Bool = false
   ) async {
     var state = initial
-    if state.evidence.isEmpty, state.ledger.hasReceipts {
+    if state.evidence.isEmpty, state.ledger.hasReceipts, !state.safetyRefused {
       await compileEvidence(&state)
     }
     let terminalReason = reason ?? state.ledger.attempts.last(where: { !$0.succeeded })?.reason
@@ -1833,7 +2556,11 @@ public final class TurnRuntime {
     let confirmedWrites = state.ledger.receipts.filter {
       $0.capability.executionClass == .localWrite || $0.capability.executionClass == .remoteWrite
     }
-    let phase: ConversationTurnResult.Phase = terminalReason.lowercased().contains("sendoutcomeunknown")
+    // **재조정으로 닫아야 하는 사유들.** 결과를 모르는 전송과, 나갔지만 원장에
+    // 못 박히지 않은 효과다 — 둘 다 "일어났는지 디스크가 증명하지 못한다"이고,
+    // 그 차례를 완료로 닫으면 화면과 정본이 갈라진다.
+    let phase: ConversationTurnResult.Phase =
+      Self.reconcilingReasons.contains(where: { terminalReason.lowercased().contains($0) })
       ? .reconciling : (interrupted ? (confirmedWrites.isEmpty ? .cancelled : .partial) : phase)
     let wroteAnswer = wroteAnswer && !interrupted && (phase == .completed || phase == .partial)
     let points = wroteAnswer ? points : []
@@ -1841,7 +2568,24 @@ public final class TurnRuntime {
       ? confirmedWrites.map { $0.summary }.joined(separator: "\n") : headline
     switch phase {
     case .awaitingUser:
-      line = copy.needs(needs ?? "value")
+      // **되물음도 사람의 말이어야 한다.**
+      //
+      // 모자란 값의 이름은 배선의 낱말이고(`query`·`recipient`), 그 이름에 묶인
+      // 고정 문구는 어떤 요청에도 같은 줄을 세운다 — 실기 2026-09-18에는 `"안녕"`,
+      // `"연락처 알려줘"`, `"신의존재에게 메시지 보내자"`가 모두 `"무엇을
+      // 찾을까요?"`로 닫혔다(사용자 지적). **무엇이 모자란지는 코어가 알고, 그것을
+      // 묻는 문장은 모델이 쓴다.** 모델을 열지 못하면 문구 표로 내려선다.
+      let missing = needs ?? "value"
+      if case .question(let key, let question) = state.dialogue, key == missing {
+        line = question
+      } else {
+        switch await conversed(&state, asking: missing) {
+        case .written(let question, _):
+          line = question
+        case .unavailable:
+          line = copy.needs(missing)
+        }
+      }
     case .failed:
       let cause =
         state.ledger.attempts.last(where: { !$0.succeeded })?.reason
@@ -1931,7 +2675,26 @@ public final class TurnRuntime {
 
     // 종착은 내구성 있는 경계다(§9.3). 결과 불명은 종착이 아니라 재조정 상태다.
     persistRun(state, status: Self.runStatus(for: phase))
-    emit(.completed, state)
+    journalRun(state, status: Self.journalStatus(for: phase))
+    // hidden reasoning은 저장하지 않는다 — 화면에 선 headline/points만.
+    var answer = line
+    if !points.isEmpty {
+      let extra = points.map(\.text).joined(separator: "\n")
+      if !extra.isEmpty {
+        answer = answer.isEmpty ? extra : answer + "\n" + extra
+      }
+    }
+    if !answer.isEmpty {
+      journalEntry(state, role: .assistant, text: answer)
+    }
+    switch phase {
+    case .failed, .reconciling:
+      emit(.failed(reason: line), state)
+    case .cancelled:
+      emit(.interrupted, state)
+    case .completed, .partial, .awaitingUser, .working:
+      emit(.completed, state)
+    }
     present(
       ConversationTurnResult(
         requestID: state.requestID,
@@ -1939,6 +2702,11 @@ public final class TurnRuntime {
         phase: phase,
         headline: line,
         points: points,
+        // 번호 하나가 무엇을 가리키는지 화면이 말할 수 있어야 한다. 순서는 문맥이
+        // 센 순서와 같다(`ConversationContextCompiler.evidenceLimit`).
+        evidenceNames: state.evidence.evidence
+          .prefix(ConversationContextCompiler.evidenceLimit)
+          .map { $0.title ?? $0.source.rawValue },
         isSynthesizedAnswer: wroteAnswer,
         references: state.evidence.references,
         readSources: state.evidence.readSources,
@@ -1969,6 +2737,18 @@ public final class TurnRuntime {
     case .awaitingUser: return .awaitingUser
     case .working: return .running
     }
+  }
+
+  /// 항목의 상한. **산문은 세 줄, 표는 한 장.**
+  ///
+  /// 산문 항목이 길면 답이 점 목록으로 읽힌다(사용자 지적 2026-09-18 "너무
+  /// 형식적"). 그러나 표는 머리·구분선·행으로 이루어진 **한 덩이**이고, 세 줄로
+  /// 자르면 행 하나만 남는다(실기 2026-09-18: 세 모델 비교 표에 M4 한 줄만 섰다).
+  static func clamped(_ points: [AnswerPoint]) -> [AnswerPoint] {
+    let isTable = points.contains {
+      $0.text.trimmingCharacters(in: .whitespaces).hasPrefix("|")
+    }
+    return Array(points.prefix(isTable ? 9 : 3))
   }
 
   public static func name(_ outcome: ActionOutcome) -> String {

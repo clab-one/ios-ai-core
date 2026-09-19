@@ -67,6 +67,7 @@ actor AdmissionGate {
   func run<T>(operation: @Sendable () async throws -> T) async throws -> T {
     try await acquire()
     do {
+      try Task.checkCancellation()
       let value = try await operation()
       release()
       return value
@@ -231,9 +232,11 @@ private struct DeferredAdmission: Error {}
 
 public enum ModelAdmissionError: Error, CustomStringConvertible, Sendable {
   case conditionWaitTimedOut(job: String, timeout: Duration)
+  case deviceConditionsUnsafe(job: String)
 
   public var description: String {
     switch self {
+    case .deviceConditionsUnsafe(let job): return "local inference blocked by device conditions: \(job)"
     case .conditionWaitTimedOut(let job, let timeout):
       return "model admission timed out after \(timeout) while waiting for \(job)"
     }
@@ -295,6 +298,44 @@ public enum ModelAdmission {
       } catch is DeferredAdmission {
         // 줄의 소유권은 이미 놓았다. 줄 밖에서 조건을 다시 보고 같은 요청을 다시 낸다.
         continue
+      }
+    }
+  }
+
+  /// Interactive work uses the SAME serial gate, but never waits 30 seconds for
+  /// a hot device. A cooperative monitor cancels long generation when heat rises.
+  public static func withImmediateAdmission<T: Sendable>(
+    for job: AdmissionJob, allowLowPower: Bool = false,
+    conditions: @escaping @Sendable () async throws -> Void = {},
+    operation: @escaping @Sendable () async throws -> T
+  ) async throws -> T {
+    @Sendable func checkConditions() throws {
+      try Task.checkCancellation()
+      let state = DeviceConditions.current()
+      guard state.thermalState != .serious, state.thermalState != .critical,
+            allowLowPower || !state.lowPowerMode else {
+        throw ModelAdmissionError.deviceConditionsUnsafe(job: job.rawValue)
+      }
+    }
+    try checkConditions()
+    try await conditions()
+    return try await gate.run {
+      try checkConditions()
+      try await conditions()
+      return try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+          while true {
+            try await Task.sleep(for: .milliseconds(250))
+            try checkConditions()
+            try await conditions()
+          }
+        }
+        defer { group.cancelAll() }
+        guard let result = try await group.next() else { throw CancellationError() }
+        // Structured concurrency waits for the cancelled sibling before the
+        // serial lease is released. No second Metal job overlaps cancellation.
+        return result
       }
     }
   }

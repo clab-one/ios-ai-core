@@ -44,6 +44,20 @@ public struct ActionLedgerEntry: Sendable, Hashable {
   }
 }
 
+extension ActionLedgerEntry {
+  /// **같은 효과를 다시 내려는 것인가, 새 뜻인가.**
+  ///
+  /// 원장의 열쇠는 내용에서 나오므로(`ActionRequest.effectIdentity`) 같은 말을
+  /// 두 번 보내려는 사람도 같은 열쇠를 든다. 그 둘을 가르는 값이 시간이다: 방금
+  /// 같은 것을 보냈다면 그것은 재시도이고(앱이 죽었거나 화면을 두 번 눌렀다),
+  /// 여섯 시간 뒤의 같은 문장은 사람이 다시 하려는 말이다.
+  ///
+  /// 짧게 두면 중복 전송이 열리고, 길게 두면 "어제 보낸 것과 같아서 안 보냈다"가
+  /// 된다. 재시도가 사람의 손에서 일어나는 시간(앱 재시작·재입력)을 덮는 가장
+  /// 짧은 값으로 둔다.
+  public static let sameEffectWindow: TimeInterval = 6 * 3600
+}
+
 /// 선점의 결과. **세 가지 답만** 있다.
 public enum ActionLedgerClaim: Sendable, Hashable {
   /// 이 실행은 처음이거나, 앞의 실행이 실패로 확정됐다. 실행해도 된다.
@@ -76,6 +90,10 @@ public protocol ActionLedger: Sendable {
     summary: String, at date: Date
   ) throws
   func entry(idempotencyKey: String) throws -> ActionLedgerEntry?
+  /// 이 열쇠를 **잊는다.** 결과를 모르는 전송(`pending`)은 다음 시도를 영구히
+  /// 막으므로, 사람이 "확인했다"고 말하면 그 줄을 놓아 주어야 한다 — 그러지
+  /// 않으면 같은 문장을 다시는 보낼 수 없다. 부르는 자리는 사람의 확인 뒤다.
+  func forget(idempotencyKey: String) throws
   /// 이 계정의 원장을 **모두** 지운다. 계정 경계에서만 부른다(로그아웃 정리) —
   /// 로그아웃한 계정의 전송 기록을 기기에 남겨 둘 이유가 없다.
   func deleteAll(accountID: String) throws
@@ -93,10 +111,9 @@ extension CapabilityID {
   /// 기기 안의 쓰기(캘린더·미리 알림)는 그 자체로 멱등 검사를 한다
   /// (`AppleCalendarCapability.existingEvent`). 되돌릴 수 없는 것은 바깥으로 나간
   /// 쓰기다 — 보낸 메일은 회수할 수 없고, Slack 메시지는 이미 남이 읽었다.
-  public var isRemoteWrite: Bool {
-    switch domain {
-    case "mail", "chat", "social": writesOutsideTheApp
-    default: false
-    }
-  }
+  ///
+  /// **이 값은 표를 새로 세우지 않는다.** 여기 있던 영역 목록(`mail`·`chat`·
+  /// `social`)이 `CapabilityID.authority`와 어긋나 `share.publish`가 원장 밖으로
+  /// 빠져 있었다(코드 리뷰 2026-09-18 P0). 판정은 한 자리에서만 나온다.
+  public var isRemoteWrite: Bool { authority == .leavesTheDevice }
 }

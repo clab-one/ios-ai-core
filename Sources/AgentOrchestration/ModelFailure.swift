@@ -31,8 +31,24 @@ public enum ModelFailureClassifier {
     classify(error)
   }
 
+  /// 이 사유가 **안전 판정**인가. 우회의 근거가 아니라, 그 뒤로 모델을 더 부르지
+  /// 않아야 한다는 표시다 — 같은 내용을 다른 모델에 다시 내면 그것이 우회다(§37).
+  public static func isSafetyJudgment(_ reason: String) -> Bool {
+    reason == "guardrail" || reason == "refusal"
+  }
+
   /// 로그와 계측에 남길 사유 코드. **원문이나 사용자 글은 담지 않는다.**
   public static func reason(for error: any Error) -> String {
+    if error is CancellationError { return "cancelled" }
+    if let network = error as? URLError {
+      switch network.code {
+      case .cancelled: return "cancelled"
+      case .notConnectedToInternet, .networkConnectionLost, .cannotConnectToHost,
+           .cannotFindHost, .dnsLookupFailed: return "offline"
+      case .timedOut: return "timeout"
+      default: return "failed"
+      }
+    }
     if #available(iOS 27.0, *), let modern = error as? LanguageModelError {
       switch modern {
       case .guardrailViolation: return "guardrail"
@@ -85,6 +101,7 @@ public enum ModelFailureClassifier {
 
   private static func classify(_ error: any Error) -> ModelFailureDisposition {
     switch reason(for: error) {
+    case "cancelled": return .surfaceFailure
     // 안전 판정. 우회 금지.
     case "guardrail", "refusal", "locale", "unsupportedCapability", "unsupportedGuide",
       "unsupportedTranscript":

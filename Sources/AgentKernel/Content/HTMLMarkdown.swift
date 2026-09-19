@@ -270,6 +270,12 @@ public enum HTMLMarkdown {
     private var listItemOpen = false
 
     mutating func take(_ token: Token) {
+      // **사이트의 가구는 글이 아니다.** 위키백과 한 쪽을 통째로 옮기던 동안
+      // 본문 앞에 `둘러보기`·`대문으로 가기` 같은 메뉴가 수백 자 들어왔고, 그
+      // 글자가 요약 조각의 첫 장을 차지해 "이 문서의 홈페이지 주소는 /wiki/…"가
+      // 요약문 1번 항목으로 섰다(실기 2026-09-19). 건너뛰는 영역은 HTML이
+      // 스스로 그렇다고 말한 것들뿐이다 — 사이트 이름으로 거르지 않는다.
+      if skipping { return skip(token) }
       switch token {
       case .text(let text):
         if inPre {
@@ -281,11 +287,54 @@ public enum HTMLMarkdown {
           inline += collapse(text)
         }
       case .open(let name, let attributes):
+        if !inPre, Self.isChrome(name, attributes) {
+          flushBlock()
+          skipTag = name
+          skipNesting = 0
+          return
+        }
         open(name, attributes)
       case .close(let name):
         close(name)
       }
     }
+
+    /// 건너뛰는 중인 영역의 태그와 그 안의 같은 이름 중첩 수. `<pre>`와 같은
+    /// 짝 맞추기다 — 닫히지 않은 태그가 흔하므로 이름으로만 닫는다.
+    private var skipTag = ""
+    private var skipNesting = 0
+    private var skipping: Bool { !skipTag.isEmpty }
+
+    private mutating func skip(_ token: Token) {
+      switch token {
+      case .open(let name, _) where name == skipTag:
+        skipNesting += 1
+      case .close(let name) where name == skipTag:
+        if skipNesting > 0 { skipNesting -= 1 } else { skipTag = "" }
+      default:
+        break
+      }
+    }
+
+    /// 이 요소가 **문서의 가구**인가.
+    ///
+    /// 이름(`nav`·`footer`)과 역할(`role="navigation"`)만 본다. 둘 다 저자가
+    /// "여기는 본문이 아니다"라고 표시한 자리다. `header`는 뺀다 — 문서 제목이
+    /// 거기 있는 판이 있고(위키백과 `mw-body-header`), 제목까지 버리면 읽은 글이
+    /// 이름을 잃는다.
+    static func isChrome(_ name: String, _ attributes: [String: String]) -> Bool {
+      if chromeTags.contains(name) { return true }
+      if let role = attributes["role"]?.lowercased(), chromeRoles.contains(role) { return true }
+      return attributes["aria-hidden"]?.lowercased() == "true"
+    }
+
+    private static let chromeTags: Set<String> = [
+      "nav", "aside", "footer", "form", "dialog", "template", "noscript", "button", "select",
+    ]
+    private static let chromeRoles: Set<String> = [
+      "navigation", "banner", "contentinfo", "search", "complementary", "dialog", "menu",
+      "menubar", "toolbar",
+    ]
 
     private mutating func open(_ name: String, _ attributes: [String: String]) {
       if inPre { return openInsidePre(name, attributes) }

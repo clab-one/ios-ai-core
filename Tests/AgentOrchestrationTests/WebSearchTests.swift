@@ -529,7 +529,7 @@ private struct PageReadTool: CapabilityHandler {
 
 /// 기기 요약기의 대역. **무엇을 받았는지 적어 둔다** — 원문이 여기까지 왔는지가
 /// 관찰 지점이다.
-private final class ScriptedSummarizer: OnDeviceTextModel, @unchecked Sendable {
+private final class ScriptedSummarizer: OnDeviceTextModel, SummaryModel, @unchecked Sendable {
   private let lock = NSLock()
   private let summary: String
   private var prompts: [String] = []
@@ -554,6 +554,15 @@ private final class ScriptedSummarizer: OnDeviceTextModel, @unchecked Sendable {
     lock.unlock()
     return summary
   }
+
+  func answer(
+    schema: SummarySchema, instructions: String, prompt: String, maximumResponseTokens: Int
+  ) async throws -> Data {
+    lock.lock()
+    prompts.append(prompt)
+    lock.unlock()
+    return ScriptedSummaryPayload.data(schema: schema, headline: summary)
+  }
 }
 
 private struct SilentLedger: ActionLedger {
@@ -566,5 +575,6 @@ private struct SilentLedger: ActionLedger {
     summary: String, at date: Date
   ) throws {}
   func entry(idempotencyKey: String) throws -> ActionLedgerEntry? { nil }
+  func forget(idempotencyKey: String) throws {}
   func deleteAll(accountID: String) throws {}
 }

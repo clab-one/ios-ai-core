@@ -14,6 +14,8 @@ public struct FoundationOnDeviceTextModel: OnDeviceTextModel {
     self.model = model
   }
 
+  public var contextWindowTokens: Int { model.contextSize }
+
   public var isAvailable: Bool {
     if case .available = model.availability { return true }
     return false

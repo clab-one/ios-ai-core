@@ -153,6 +153,17 @@ public struct ActionReceipt: Sendable, Hashable, Codable {
   public let completedAt: Date
   public let sources: [SourceReference]
   public let coverage: [CoverageRecord]
+  /// **효과는 나갔는데 원장에 못 박지 못했다.**
+  ///
+  /// 원격 쓰기는 디스크를 지나 선점하고(`ActionLedger.claim`) 끝난 뒤 그 자리에
+  /// 결과를 못 박는다(`settle`). 그 못 박기가 실패하면 열쇠는 `pending`으로
+  /// 남는다 — 두 번 보내지 않는 쪽으로 안전하게 실패하지만, 그 사실을 삼키면
+  /// **사용자가 본 "보냈어요"와 디스크의 진실이 갈라진다**(코드 리뷰 2026-09-18
+  /// P1). 그래서 완료를 완료라고 말하면서 이 칸으로 어긋남을 들고 나온다.
+  ///
+  /// 읽는 쪽은 차례다: 이 값이 참이면 그 차례는 **재조정**으로 닫힌다
+  /// (`ConversationTurnResult.Phase.reconciling`).
+  public let ledgerUnsettled: Bool
 
   public init(
     requestID: UUID,
@@ -161,7 +172,8 @@ public struct ActionReceipt: Sendable, Hashable, Codable {
     summary: String,
     details: [String: ActionValue] = [:],
     completedAt: Date = Date(),
-    sources: [SourceReference] = [], coverage: [CoverageRecord] = []
+    sources: [SourceReference] = [], coverage: [CoverageRecord] = [],
+    ledgerUnsettled: Bool = false
   ) {
     self.requestID = requestID
     self.capability = capability
@@ -171,6 +183,15 @@ public struct ActionReceipt: Sendable, Hashable, Codable {
     self.completedAt = completedAt
     self.sources = sources
     self.coverage = coverage
+    self.ledgerUnsettled = ledgerUnsettled
+  }
+
+  /// 같은 수령증에 **어긋남 표시만** 얹는다.
+  public func unsettled() -> ActionReceipt {
+    ActionReceipt(
+      requestID: requestID, capability: capability, externalID: externalID, summary: summary,
+      details: details, completedAt: completedAt, sources: sources, coverage: coverage,
+      ledgerUnsettled: true)
   }
 }
 
@@ -222,12 +243,29 @@ public struct ActionApprovalPreview: Sendable, Hashable, Codable {
   public let body: String
   public let attachmentCount: Int
   /// 위 칸에 담기지 않은 나머지 인자. 숨기지 않는다.
-  public let extras: [String]
+  ///
+  /// **열쇠와 값을 나눠 담는다.** 하나의 문자열(`"start: Sep 21, 2026 at 11:00"`)로
+  /// 접으면 승인 카드에 개발자의 낱말이 그대로 선다(실기 2026-09-19). 사람이 읽을
+  /// 이름은 화면이 고른다 — 코어는 어느 인자였는지만 말한다.
+  public let extras: [Field]
+
+  /// 이름 붙지 않은 인자 하나.
+  public struct Field: Sendable, Hashable, Codable {
+    /// 계약의 인자 열쇠(`start`·`location`). 화면 문구가 아니다.
+    public let key: String
+    /// 사람이 읽을 수 있게 옮긴 값.
+    public let value: String
+
+    public init(key: String, value: String) {
+      self.key = key
+      self.value = value
+    }
+  }
 
   public init(
     provider: String = "", principal: String = "", workspace: String = "",
     recipient: String = "", thread: String = "", subject: String = "", body: String = "",
-    attachmentCount: Int = 0, extras: [String] = []
+    attachmentCount: Int = 0, extras: [Field] = []
   ) {
     self.provider = provider
     self.principal = principal
@@ -295,18 +333,19 @@ public struct ActionApprovalPreview: Sendable, Hashable, Codable {
     let subjectKeys = ["subject", "title"]
     let bodyKeys = ["body", "text", "message"]
     let consumed = Set(recipientKeys + threadKeys + subjectKeys + bodyKeys + ["provider"])
-    let extras = arguments.keys.sorted().compactMap { key -> String? in
+    let extras = arguments.keys.sorted().compactMap { key -> Field? in
       guard !consumed.contains(key), !Self.opaqueArgumentKeys.contains(key) else {
         return nil
       }
       switch arguments[key] {
       case .text(let value):
-        return value.isEmpty ? nil : "\(key): \(value)"
-      case .number(let value): return "\(key): \(value)"
-      case .flag(let value): return "\(key): \(value)"
+        return value.isEmpty ? nil : Field(key: key, value: value)
+      case .number(let value): return Field(key: key, value: "\(value)")
+      case .flag(let value): return Field(key: key, value: "\(value)")
       case .timestamp(let value):
-        return "\(key): \(value.formatted(date: .abbreviated, time: .shortened))"
-      case .list(let values): return values.isEmpty ? nil : "\(key): \(values.count)"
+        return Field(key: key, value: value.formatted(date: .abbreviated, time: .shortened))
+      case .list(let values):
+        return values.isEmpty ? nil : Field(key: key, value: "\(values.count)")
       case .none: return nil
       }
     }
@@ -330,19 +369,24 @@ public struct ActionApprovalRequest: Sendable, Hashable, Identifiable {
   public let title: String
   /// 승인 문이 보여 주는 대상. 화면이 문구를 입힌다 — 여기서 번역하지 않는다.
   public let preview: ActionApprovalPreview
+  /// **이 실행이 덮는 지금의 값.** 사람이 읽는 줄들이고, 읽을 수 없으면 빈
+  /// 목록이다(`TargetPreviewing`). 카드는 이 값과 바뀔 값을 나란히 세운다 —
+  /// 무엇을 잃는지 보이지 않는 허락은 허락이 아니다.
+  public let before: [String]
   public let isIrreversible: Bool
   public let expiresAt: Date
   public let argumentFingerprint: String
 
   public init(
     id: UUID = UUID(), request: ActionRequest, title: String,
-    preview: ActionApprovalPreview? = nil,
+    preview: ActionApprovalPreview? = nil, before: [String] = [],
     isIrreversible: Bool, expiresAt: Date = Date().addingTimeInterval(300)
   ) {
     self.id = id
     self.request = request
     self.title = title
     self.preview = preview ?? ActionApprovalPreview.make(from: request)
+    self.before = before
     self.isIrreversible = isIrreversible
     self.expiresAt = expiresAt
     self.argumentFingerprint = ActionFingerprint.arguments(request.arguments)

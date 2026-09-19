@@ -146,14 +146,15 @@ public enum EvidenceStrategy: String, Sendable, Hashable {
   case localModelExtraction
 
   /// 이 줄에 맞는 전략.
-  public static func resolve(
-    for row: CapabilitySourceRow, source: Evidence.Source
-  ) -> EvidenceStrategy {
+  ///
+  /// **길이가 판정한다. 출처가 아니다.** 예전에는 내 기록(`memory`·`artifact`)의
+  /// 본문을 "이미 우리 것"이라며 결정론으로 잘랐다. 그 규칙이 맞는 것은 짧은
+  /// 메모뿐이었다: 388,754자 문서를 붙인 차례에서 그 본문은 문장 세 개로 줄었고
+  /// (`factsPerEvidence`), 답은 문서 맨 앞에 대한 이야기가 됐다(실기 2026-09-17,
+  /// iPhone). 첨부·링크·사진·녹음은 바깥에서 온 글이고, 그것을 줄이는 일은
+  /// **기기 모델의 일**이다 — PCC로 올리지 않고, 앞에서 자르지도 않는다.
+  public static func resolve(for row: CapabilitySourceRow) -> EvidenceStrategy {
     guard !row.body.isEmpty else { return .passthrough }
-    guard source.isExternal || source == .content || source == .recording else {
-      // 내 기록의 본문은 이미 우리 것이다. 길면 자르고, 모델을 부르지 않는다.
-      return .deterministicExtraction
-    }
     return row.body.count > Evidence.factLimit
       ? .localModelExtraction : .deterministicExtraction
   }

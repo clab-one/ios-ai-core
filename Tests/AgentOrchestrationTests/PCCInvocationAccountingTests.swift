@@ -109,7 +109,7 @@ final class PCCInvocationAccountingTests: XCTestCase {
 
   func testSupervisorPreflightFailureIsNotAPhysicalCall() async throws {
     let profile = DynamicTurnProfile.supervising(
-      phase: .planning, target: .privateCloud, scope: Self.scope, iteration: 0)
+      phase: .planning, target: .privateCloud, scope: Self.scope)
     let context = try Self.context(profile: profile)
     let result = await TurnSupervisor().decide(
       context, profile: profile, conversationID: "conv", accountID: "acct")
@@ -241,5 +241,6 @@ private struct SilentActionLedger: ActionLedger {
     summary: String, at date: Date
   ) throws {}
   func entry(idempotencyKey: String) throws -> ActionLedgerEntry? { nil }
+  func forget(idempotencyKey: String) throws {}
   func deleteAll(accountID: String) throws {}
 }

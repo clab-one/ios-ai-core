@@ -45,6 +45,58 @@ public struct ContentFetchHostPolicy: Sendable {
     return url
   }
 
+  /// 이름을 **해석해서** 본다. 돌아온 주소 중 하나라도 사설이면 거절이다.
+  ///
+  /// 글자만 보던 문은 `evil.example → A 192.168.0.1`을 통과시켰다(이 파일의
+  /// "막지 못하는 것" 1번, 코드 리뷰 2026-09-18 P1). 이제 요청 전에 이름을 직접
+  /// 해석하고 모든 주소를 위 표로 거른다.
+  ///
+  /// 남는 구멍은 **해석과 연결 사이**다(DNS rebinding·TOCTOU): 소켓이 실제로
+  /// 연결한 주소를 봐야 하고 그 훅이 `URLSession`에 없다. 그 경계는 주석이 아니라
+  /// 값으로 남는다 — 이름이 풀리지 않으면 요청을 내지 않는다
+  /// (`unresolvableHost`), 즉 **증명하지 못한 주소로는 나가지 않는다.**
+  public func vetResolved(_ url: URL) throws -> URL {
+    let target = try vet(url)
+    guard let host = target.host?.lowercased() else { throw ContentFetchError.missingHost }
+    // 주소 표기는 이미 위 표가 판정했다. 다시 해석하지 않는다.
+    if host.contains(":") || Self.octets(host) != nil { return target }
+    guard let addresses = Self.resolve(host) else {
+      throw ContentFetchError.unresolvableHost(host)
+    }
+    for address in addresses where Self.isPrivate(address) {
+      throw ContentFetchError.privateHost(host)
+    }
+    return target
+  }
+
+  /// 이름 하나의 주소 전부. `nil`은 **해석하지 못했다**는 뜻이다(빈 배열과 다르다).
+  ///
+  /// `getaddrinfo`는 막히는 호출이다. 한 번의 웹 읽기에 한 번 도는 비용이고, 그
+  /// 대가로 "이 이름이 어디를 가리키는가"를 요청 전에 안다.
+  static func resolve(_ host: String) -> [String]? {
+    var hints = addrinfo(
+      ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM, ai_protocol: 0,
+      ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+    var list: UnsafeMutablePointer<addrinfo>?
+    guard host.withCString({ getaddrinfo($0, nil, &hints, &list) }) == 0, let list else {
+      return nil
+    }
+    defer { freeaddrinfo(list) }
+    var out: [String] = []
+    var cursor: UnsafeMutablePointer<addrinfo>? = list
+    while let entry = cursor {
+      var text = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+      if getnameinfo(
+        entry.pointee.ai_addr, entry.pointee.ai_addrlen, &text, socklen_t(text.count), nil, 0,
+        NI_NUMERICHOST) == 0
+      {
+        out.append(String(cString: text))
+      }
+      cursor = entry.pointee.ai_next
+    }
+    return out.isEmpty ? nil : out
+  }
+
   /// 이름이든 주소든 **바깥이 아닌 것**을 가린다.
   static func isPrivate(_ host: String) -> Bool {
     if host == "localhost" || host.hasSuffix(".localhost") { return true }
@@ -137,6 +189,8 @@ public enum ContentFetchError: Error, Sendable, Equatable {
   case missingHost
   /// 사설·루프백·링크로컬 주소다. 이 기기의 안쪽을 읽어 주지 않는다.
   case privateHost(String)
+  /// 이름이 풀리지 않았다. **증명하지 못한 주소로는 나가지 않는다.**
+  case unresolvableHost(String)
   /// 리다이렉트가 그 문 밖을 가리켰다. **따라가지 않는다.**
   case redirectRefused(String)
   case rejected(status: Int)
@@ -155,6 +209,7 @@ public enum ContentFetchError: Error, Sendable, Equatable {
     case .credentialsInURL: return "web.read.credentials"
     case .missingHost: return "web.read.host"
     case .privateHost: return "web.read.privateHost"
+    case .unresolvableHost: return "web.read.unresolved"
     case .redirectRefused: return "web.read.redirect"
     case .rejected: return "web.read.rejected"
     case .malformedResponse: return "web.read.malformed"
@@ -231,7 +286,8 @@ public enum ContentFetch {
     let byteLimit = configuration.byteLimit
     let timeout = configuration.timeout
     return { url in
-      let target = try policy.vet(url)
+      // 이름을 **해석해서** 본다 — 글자만 보면 공개 이름이 사설 주소를 가리킬 수 있다.
+      let target = try policy.vetResolved(url)
       var request = URLRequest(url: target)
       request.timeoutInterval = timeout
       // 쿠키를 들고 가지 않는다. 읽기는 익명이어야 한다 — 로그인된 세션으로 읽으면
@@ -242,10 +298,23 @@ public enum ContentFetch {
       request.setValue(
         "text/html,application/xhtml+xml,text/plain;q=0.8", forHTTPHeaderField: "Accept")
 
+      // **받는 동안 보는 문이어야 한다.** 여기 있던 `session.data(for:delegate:)`는
+      // 전송이 **끝난 뒤** 한 덩이로 돌려주는 API이고, 완료 핸들러가 본문을
+      // 소유하므로 `didReceive data:`를 부르지 않는다 — 즉 상한을 세는 코드가
+      // 한 번도 돌지 않았다. 공격자가 흘리는 500 MB는 그대로 메모리에 올라오고
+      // 그 뒤에 "너무 큼"이 됐다(코드 리뷰 2026-09-18 P1).
+      //
+      // 그래서 델리게이트가 본문을 모으는 작업으로 바꾼다. 상한은 덩이마다
+      // 세어지고, 넘는 순간 작업이 끊긴다. 세션을 이 요청 하나로 세우는 이유는
+      // 델리게이트 콜백의 보장이다 — 주입된 세션의 설정(시험의
+      // `protocolClasses`)은 그대로 물려받는다.
       let gate = ContentFetchGate(policy: policy, byteLimit: byteLimit)
+      let fetcher = URLSession(
+        configuration: session.configuration, delegate: gate, delegateQueue: nil)
+      defer { fetcher.finishTasksAndInvalidate() }
       let received: (Data, URLResponse)
       do {
-        received = try await session.data(for: request, delegate: gate)
+        received = try await gate.receive(fetcher.dataTask(with: request))
       } catch {
         // 문에서 끊은 요청은 `URLError.cancelled`로 돌아온다. **끊은 이유가 사실이다.**
         if let refusal = gate.refusal { throw refusal }
@@ -291,6 +360,11 @@ private final class ContentFetchGate: NSObject, URLSessionDataDelegate, @uncheck
   private let byteLimit: Int
   private let lock = NSLock()
   private var recorded: ContentFetchError?
+  /// 지금까지 받은 본문. **자라는 동안** 상한을 본다.
+  private var body = Data()
+  private var continuation: CheckedContinuation<(Data, URLResponse), Error>?
+  /// 콜백이 기다림보다 먼저 올 수 있다. 그 결과를 들고 있다가 건넨다.
+  private var settled: Result<(Data, URLResponse), Error>?
 
   init(policy: ContentFetchHostPolicy, byteLimit: Int) {
     self.policy = policy
@@ -322,7 +396,8 @@ private final class ContentFetchGate: NSObject, URLSessionDataDelegate, @uncheck
       return
     }
     do {
-      _ = try policy.vet(url)
+      // 홉마다 **해석해서** 본다. 302가 가리킨 공개 이름이 사설 주소일 수 있다.
+      _ = try policy.vetResolved(url)
       completionHandler(request)
     } catch let error as ContentFetchError {
       record(error)
@@ -337,12 +412,78 @@ private final class ContentFetchGate: NSObject, URLSessionDataDelegate, @uncheck
     _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
   ) {
-    // 길이를 모르는 응답(chunked)은 여기서 재지 못한다 — 받은 뒤 한 번 더 잰다.
+    // 길이를 아는 응답은 **한 바이트도 받기 전에** 끊는다.
     if response.expectedContentLength > Int64(byteLimit) {
       record(.tooLarge(bytes: Int(response.expectedContentLength)))
       completionHandler(.cancel)
       return
     }
     completionHandler(.allow)
+  }
+
+  /// **받는 동안 센다.** 길이를 모르는 응답(chunked)에서 상한이 뜻을 가지려면
+  /// 여기여야 한다 — 다 받은 뒤에 재던 동안 상한은 자원의 한계가 아니라
+  /// "받아 놓고 거절하는 기준"이었다. 공격자가 500 MB를 흘리면 500 MB가 메모리에
+  /// 올라온 뒤에 "너무 큼"이 됐다(코드 리뷰 2026-09-18 P1).
+  ///
+  /// 지금은 상한을 넘는 순간 작업을 끊는다. 메모리에 남는 최대치는 상한에 마지막
+  /// 덩이 하나를 더한 값이다.
+  func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+    lock.lock()
+    body.append(data)
+    let total = body.count
+    lock.unlock()
+    guard total > byteLimit else { return }
+    record(.tooLarge(bytes: total))
+    dataTask.cancel()
+  }
+
+  /// 작업 하나를 돌리고 본문을 받는다. **본문은 이 델리게이트가 모은다** —
+  /// `URLSession`의 완료 핸들러가 모으면 상한을 세는 자리가 없다.
+  func receive(_ task: URLSessionDataTask) async throws -> (Data, URLResponse) {
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
+        lock.lock()
+        if let settled {
+          lock.unlock()
+          continuation.resume(with: settled)
+          return
+        }
+        self.continuation = continuation
+        lock.unlock()
+        task.resume()
+      }
+    } onCancel: {
+      task.cancel()
+    }
+  }
+
+  /// 작업이 끝났다. **막은 이유가 오류보다 먼저다** — 취소는 그 이유의 결과다.
+  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    let result: Result<(Data, URLResponse), Error>
+    lock.lock()
+    let collected = body
+    let refusal = recorded
+    lock.unlock()
+    if let refusal {
+      result = .failure(refusal)
+    } else if let error {
+      result = .failure(error)
+    } else if let response = task.response {
+      result = .success((collected, response))
+    } else {
+      result = .failure(ContentFetchError.malformedResponse)
+    }
+    finish(result)
+  }
+
+  private func finish(_ result: Result<(Data, URLResponse), Error>) {
+    lock.lock()
+    let waiting = continuation
+    continuation = nil
+    if waiting == nil { settled = result }
+    lock.unlock()
+    waiting?.resume(with: result)
   }
 }

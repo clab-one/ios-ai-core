@@ -104,6 +104,24 @@ public enum ActionFingerprint {
   }
 }
 
+extension ActionRequest {
+  /// 이 요청이 **바깥에 낼 효과의 정체.** 차례가 아니라 내용에서 나온다.
+  ///
+  /// `idempotencyKey`는 `"<차례 id>#<호출>"`이므로 차례에 묶여 있다. 그 값을
+  /// 원장의 열쇠로 쓰던 동안, 앱이 전송 직후 죽고 사용자가 같은 말을 다시 보내면
+  /// **열쇠가 달라져** 같은 메일이 두 번 나갔다(코드 리뷰 2026-09-18 P1). 효과의
+  /// 정체는 차례를 모른다: 어느 계정이 무엇을 어디로 보내는가가 전부다.
+  ///
+  /// 같은 내용을 일부러 두 번 보내는 일은 원장의 시간 창이 가른다
+  /// (`ActionLedgerEntry.sameEffectWindow`) — 방금 같은 것을 보냈다면 그것은
+  /// 재시도이고, 하루 뒤라면 새 뜻이다.
+  public var effectIdentity: String {
+    ActionFingerprint.effect(
+      accountID: accountID,
+      callIdentity: ActionFingerprint.call(capability, arguments, binding: binding))
+  }
+}
+
 /// Propagates the concrete dispatcher request through existing UI adapters.
 public enum ActionExecutionScope {
   @TaskLocal public static var current: ActionRequest?

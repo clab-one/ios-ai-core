@@ -71,8 +71,13 @@ public struct ConversationTurnResult: Sendable {
   public let phase: Phase
   /// 조수의 답 한 줄. 되물을 때는 되묻는 문장이 여기 온다.
   public let headline: String
-  /// 뒷받침하는 항목. 세 줄을 넘기지 않는다.
-  public let points: [String]
+  /// 뒷받침하는 항목. 세 줄을 넘기지 않는다(표는 한 장). 줄마다 **어느 근거에서
+  /// 왔는지**를 들고 있다(`AnswerPoint.evidence`, 1부터).
+  public let points: [AnswerPoint]
+  /// 근거의 **사람이 읽는 이름**을 번호 순으로 든다: `evidenceNames[0]`이 `[1]`이다.
+  /// 화면의 각주가 이 값을 쓴다 — 번호만 보이면 사용자는 여섯 개 중 어느 것이
+  /// 이 문장의 근거인지 알 수 없다.
+  public let evidenceNames: [String]
   /// 이 줄이 **정말 답인가.** 모델이 쓰지 못해 상태 문구로 물러난 차례는 false다.
   ///
   /// 채팅은 이 값이 false면 답의 자리를 세우지 않는다 — 기본 문구가 답으로 서면
@@ -119,7 +124,8 @@ public struct ConversationTurnResult: Sendable {
     request: String,
     phase: Phase,
     headline: String,
-    points: [String],
+    points: [AnswerPoint],
+    evidenceNames: [String] = [],
     isSynthesizedAnswer: Bool = false,
     references: [ToolResultReducer.Reference],
     readSources: [ToolResultReducer.ReadSource],
@@ -137,6 +143,7 @@ public struct ConversationTurnResult: Sendable {
     self.phase = phase
     self.headline = headline
     self.points = points
+    self.evidenceNames = evidenceNames
     self.isSynthesizedAnswer = isSynthesizedAnswer
     self.references = references
     self.readSources = readSources

@@ -38,7 +38,14 @@ final class OnDeviceReductionTests: XCTestCase {
     XCTAssertGreaterThan(compiled.localExtractions, 0, "기기 모델을 부르지 않았다")
     let facts = compiled.evidence.flatMap(\.facts)
     XCTAssertFalse(facts.isEmpty, "근거가 한 줄도 나오지 않았다")
-    XCTAssertLessThanOrEqual(facts.count, Evidence.factsPerEvidence * 2, "사실이 너무 많다")
+    // 상한은 **조각마다** 선다(`Evidence.init`의 `prefix`). 긴 본문이 조각
+    // 몇 개로 갈리는지는 계약이 아니다 — 그 수를 못 박던 동안 이 시험은
+    // 6,865자가 조각 셋이 됐다는 이유만으로 빨갰다(9 > 6).
+    for evidence in compiled.evidence {
+      XCTAssertLessThanOrEqual(
+        evidence.facts.count, Evidence.factsPerEvidence,
+        "한 조각이 사실 상한을 넘었다: \(evidence.facts.count)")
+    }
 
     let reduced = facts.joined(separator: "\n")
     print("📐 on-device: \(Self.article.count)자 → \(reduced.count)자 (\(facts.count)줄)")

@@ -62,19 +62,21 @@ final class GoldenScenarioTests: XCTestCase {
           read,
           SummarizeTool(model: model),
         ],
-        budget: ScenarioBudget(contextBaseline: 377, materials: 2, retrievedRows: 3),
+        // 기준선은 **긴 본문을 조각으로 펼쳐 근거로 옮기는 판**에서 다시
+        // 쟀다(2026-09-19, `EvidenceCompiler.rowsForEvidence`). 앞 기준선은 웹
+        // 페이지 한 줄이 근거 하나로 접히던 때의 값이고, 지금은 문서 뒤쪽도
+        // 답에 실리도록 조각 여러 개로 펼친다 — 그 조각 수가 실제 근거 수다.
+        budget: ScenarioBudget(contextBaseline: 638, materials: 3, retrievedRows: 3),
         forbidden: [Self.pageMarker, Self.snippet]))
 
     try run.assertBounds()
     XCTAssertEqual(
       run.executed, ["web.search", "web.read", "text.summarize"], "계획한 순서로 돌지 않았다")
-    XCTAssertEqual(
-      read.requests.first?.arguments["url"]?.textValue, "https://example.com/pcc",
-      "검색 결과의 주소가 읽기로 넘어가지 않았다")
-    // 원문은 기기 요약기까지만 갔다.
-    XCTAssertEqual(model.received.count, 1)
+    // 원문은 기기 요약기까지만 갔다. 조각마다 한 번씩 부르므로 호출 수는 조각 수에
+    // 따른다 — 보는 것은 **원문이 거기 닿았는가**다.
+    XCTAssertFalse(model.received.isEmpty, "기기 모델을 부르지 않았다")
     XCTAssertTrue(
-      model.received.first?.contains(Self.pageMarker) == true, "원문이 기기 모델에 닿지 않았다")
+      model.received.contains { $0.contains(Self.pageMarker) }, "원문이 기기 모델에 닿지 않았다")
   }
 
   // MARK: G02 — 주소 직접 읽기
@@ -99,7 +101,8 @@ final class GoldenScenarioTests: XCTestCase {
           },
           SummarizeTool(model: model),
         ],
-        budget: ScenarioBudget(contextBaseline: 409, materials: 2, retrievedRows: 2),
+        // 조각 펼침 판에서 다시 잰 기준선(2026-09-19) — 위 G01과 같은 이유.
+        budget: ScenarioBudget(contextBaseline: 643, materials: 3, retrievedRows: 2),
         forbidden: [Self.pageMarker]))
 
     try run.assertBounds()
@@ -134,8 +137,15 @@ final class GoldenScenarioTests: XCTestCase {
           },
           SummarizeTool(model: model),
         ],
-        budget: ScenarioBudget(contextBaseline: 362, materials: 2, retrievedRows: 2),
-        forbidden: [Self.pageMarker]))
+        // 조각 펼침 판에서 다시 잰 기준선(2026-09-19). 50KB 문서가 조각 여러
+        // 개로 펼쳐지므로 근거 수가 늘지만, 문맥은 여전히 원문의 10% 아래다
+        // (아래 압축률 단정이 그것을 본다).
+        budget: ScenarioBudget(contextBaseline: 862, materials: 4, retrievedRows: 2),
+        forbidden: [Self.pageMarker],
+        // **예산을 넘는 문서는 일부만 읽는다.** 25,000자는 조각 상한을 넘으므로
+        // 읽은 조각만 요약되고, 그 사실이 범위 기록으로 남아 차례는 `partial`로
+        // 닫힌다 — 다 읽은 것처럼 `completed`로 닫는 것이 거짓이다.
+        expectedPhase: .partial))
 
     try run.assertBounds()
     // 원문 대비 압축률. 이 값이 1에 가까워지면 압축이 꺼진 것이다.
@@ -219,7 +229,8 @@ final class GoldenScenarioTests: XCTestCase {
           },
           SummarizeTool(model: model),
         ],
-        budget: ScenarioBudget(contextBaseline: 587, materials: 4, retrievedRows: 5),
+        // 조각 펼침 판에서 다시 잰 기준선(2026-09-19) — 위 G01과 같은 이유.
+        budget: ScenarioBudget(contextBaseline: 885, materials: 5, retrievedRows: 5),
         forbidden: [Self.pageMarker, Self.snippet, Self.itemID]))
 
     try run.assertBounds()
@@ -287,6 +298,12 @@ final class GoldenScenarioTests: XCTestCase {
     try run.assertBounds()
     XCTAssertEqual(run.executed, ["reminders.create"])
     XCTAssertEqual(create.requests.first?.arguments["title"]?.textValue, "약 먹기")
+    // **사람의 것을 바꾸는 실행은 승인 문을 지난다.** 모델이 고른 단계에는 자격이
+    // 없으므로(`ActionRequest.authorization == nil`) 문이 서고, 허락한 뒤에 효과가
+    // 온다 — 되돌릴 수 있는지는 이 판정에 들어가지 않는다(코드 리뷰 2026-09-18 P1).
+    XCTAssertEqual(
+      run.approvals.map(\.request.capability), [.remindersCreate],
+      "승인 문이 서지 않았다")
   }
 
   // MARK: G08 — 웹에서 읽은 것을 기억으로
@@ -329,16 +346,18 @@ final class GoldenScenarioTests: XCTestCase {
           SummarizeTool(model: model),
           save,
         ],
-        budget: ScenarioBudget(contextBaseline: 487, materials: 3, retrievedRows: 3),
+        // 조각 펼침 판에서 다시 잰 기준선(2026-09-19) — 위 G01과 같은 이유.
+        budget: ScenarioBudget(contextBaseline: 766, materials: 4, retrievedRows: 3),
         forbidden: [Self.pageMarker, Self.snippet]))
 
     try run.assertBounds()
     XCTAssertEqual(
       run.executed, ["web.search", "web.read", "text.summarize", "memory.save"])
-    // **저장된 것은 요약이다.** 원문도, 모델이 미리 쓴 문장도 아니다.
-    XCTAssertEqual(
-      save.requests.first?.arguments["body"]?.textValue, "PCC가 서버로 확장됐다.",
-      "읽고 줄인 글이 저장 자리로 흐르지 않았다")
+    // **저장된 것은 요약이다.** 원문도, 모델이 미리 쓴 문장도 아니다 — 조각마다
+    // 쌓은 Markdown이므로 그 안에 요약 문장이 들어 있다.
+    let saved = try XCTUnwrap(save.requests.first?.arguments["body"]?.textValue)
+    XCTAssertTrue(saved.contains("PCC가 서버로 확장됐다."), "읽고 줄인 글이 저장 자리로 흐르지 않았다")
+    XCTAssertFalse(saved.contains(Self.pageMarker), "원문이 그대로 저장됐다")
   }
 
   // MARK: G09 — 읽기를 뺀 계획
@@ -387,7 +406,8 @@ final class GoldenScenarioTests: XCTestCase {
           SummarizeTool(model: model),
           save,
         ],
-        budget: ScenarioBudget(contextBaseline: 492, materials: 3, retrievedRows: 3),
+        // 조각 펼침 판에서 다시 잰 기준선(2026-09-19) — 위 G01과 같은 이유.
+        budget: ScenarioBudget(contextBaseline: 771, materials: 4, retrievedRows: 3),
         forbidden: [Self.pageMarker, Self.snippet]))
 
     try run.assertBounds()
@@ -398,11 +418,12 @@ final class GoldenScenarioTests: XCTestCase {
       read.requests.first?.arguments["url"]?.textValue, "https://example.com/pcc",
       "검색이 준 주소를 읽지 않았다")
     // **요약한 것은 페이지다.** 스니펫이 아니다.
-    XCTAssertEqual(model.received.count, 1)
-    let material = try XCTUnwrap(model.received.first)
-    XCTAssertTrue(material.contains(Self.pageMarker), "페이지 본문이 요약기에 닿지 않았다")
-    XCTAssertFalse(material.contains(Self.snippet), "공급자가 쓴 한 줄을 요약했다")
-    XCTAssertEqual(
-      save.requests.first?.arguments["body"]?.textValue, "PCC가 서버로 확장됐다.")
+    XCTAssertFalse(model.received.isEmpty, "요약기를 부르지 않았다")
+    XCTAssertTrue(
+      model.received.contains { $0.contains(Self.pageMarker) }, "페이지 본문이 요약기에 닿지 않았다")
+    XCTAssertFalse(
+      model.received.contains { $0.contains(Self.snippet) }, "공급자가 쓴 한 줄을 요약했다")
+    let saved = try XCTUnwrap(save.requests.first?.arguments["body"]?.textValue)
+    XCTAssertTrue(saved.contains("PCC가 서버로 확장됐다."))
   }
 }

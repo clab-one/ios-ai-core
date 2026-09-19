@@ -9,17 +9,22 @@ SDK도 없다. 의존성은 `Foundation · OSLog · CryptoKit · Security · Fou
 
 ```
 사용자 문장
-  → PCC 1회: 할 일 전부를 순서대로 담은 JSON 계획
-  → 코어: 순차 실행(앞 결과로 다음 인자 채움 · 빠진 읽기 보정 · 쓰기 앞 승인 · 원장 기록)
+  → PCC 1회: 대화 답변 · 되물음 · 실행 계획 중 하나
+  → 대화·되물음이면 같은 호출의 문장으로 닫는다(모델 1회, 도구 0)
+  → 실행이면 코어: 순차 실행(앞 결과로 다음 인자 채움 · 빠진 읽기 보정 · 쓰기 앞 승인 · 원장 기록)
   → PCC 1회: 회수한 사실로 최종 답
   → 화면
 ```
 
-실행 중에 PCC를 다시 부르지 않는다. 값이 모자라면 **계획 단계에서 묻고** 그 답은
-다음 차례가 된다.
+실행 중에 PCC를 다시 부르지 않는다. 값이 모자라면 **첫 결정이 질문을 들고 오고**
+그 답은 다음 차례가 된다. 등록된 툴이 0개인 호스트도 대화는 돈다 — 도구가 없는 것과
+답할 수 없는 것은 다른 사실이다.
 
-실측 비용(아이패드, 실제 PCC, 2026-09-17): **차례당 PCC 2회**, 입력 1,285–1,616
-토큰(문자 2,415–3,087), 그중 한 호출 최대 650–959 토큰. 되물음으로 끝난 차례는 1회.
+실측 비용(아이패드, 실제 PCC, 2026-09-17): 도구를 지난 차례는 **PCC 2회**, 입력
+1,285–1,616 토큰(문자 2,415–3,087), 그중 한 호출 최대 650–959 토큰.
+실측(iPhone Air, 실제 PCC, 2026-09-18): 일상 대화 한 차례는 **PCC 1회**, 입력 857
+토큰(문자 1,809, 캐시 41), 완료 2,947ms. 같은 기기의 `memory.save` 차례는 PCC 2회,
+입력 1,534 토큰(문자 3,551), 완료 5,255ms.
 
 이 문서와 함께 쓰는 템플릿: `Examples/Host/`의 `project.yml` · `App.entitlements` ·
 `AgentHostSetup.swift`. 세 파일은 실제 앱 타깃에서 컴파일을 확인한 판이다.
@@ -109,13 +114,16 @@ let runtime = await AgentRuntime.boot(
     host: AgentHostSetup.identity,
     tools: [MyCalendarTool(), MyMailTool()],
     memoryIndex: MyVectorIndex(),                 // 없으면 memory.* 미등록
-    onDeviceModel: FoundationOnDeviceTextModel(), // 없으면 text.summarize 미등록
+    summaryModel: FoundationSummaryModel(),       // 없으면 text.summarize 미등록
     webSearch: .standard,                         // 없으면 web.search 미등록
     webRead: .standard,                           // 없으면 web.read 미등록
     copy: TurnCopy { key in myStrings[key] ?? key },
     turnRuns: MyTurnRunStore(),                   // 없으면 복구를 포기한다
     actionLedger: MyActionLedger(),               // 없으면 원격 쓰기를 실행하지 않는다
     currentAccountID: { myAccount.id },
+    // 임시 문장(streaming preview) 정책과 수신자. 기본은 꺼짐이고, 정본은 onResult다.
+    responseStreamingEnabled: { UIApplication.shared.applicationState == .active },
+    onResponseSnapshot: { snapshot in myUI.preview(snapshot) },
     onEvent: { envelope in myUI.observe(envelope) },
     onResult: { result in myUI.present(result) }))
 ```
@@ -358,7 +366,7 @@ PCC 비용은 **호출 수 × 입력 크기**다. 그래서 코어는 다음을 
 | 계획 지시 | ~300자 |
 | 답 지시 | ~900자 |
 | 툴 목록 | 이름만. 차례에 필요한 것만 보여 준다(실측: 좁힌 범위 158자 대 전부 651자) |
-| 최근 대화 | 3줄 × 200자 |
+| 최근 대화 | 완전한 turn 단위로 최대 12줄, JSON 인코딩 후 2,400자 |
 | 덜 읽은 곳(coverage) | 300자 상한, 미완료 항목만 |
 | 근거 | 8조각, 조각당 240자 상한 |
 | 계획 스키마 | **346토큰**(실측, 기기 토크나이저) — 문맥 글자 수에는 세어지지 않는다 |

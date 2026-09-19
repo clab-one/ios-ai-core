@@ -1,4 +1,5 @@
 import AgentKernel
+
 import XCTest
 
 @testable import AgentOrchestration
@@ -88,6 +89,51 @@ final class WebReadTests: XCTestCase {
     XCTAssertEqual(receipt.coverage.first?.readCount, 1)
   }
 
+  /// **메뉴는 글이 아니다.** 위키백과 한 쪽을 읽은 차례의 요약 첫 항목이
+  /// `"홈페이지 주소는 /wiki/위키백과:대문"`이었다(실기 2026-09-19) — 사이드바
+  /// 수백 자가 본문 앞에 붙어 첫 조각을 차지했기 때문이다. 저자가 `nav`·`footer`로
+  /// 표시한 자리는 본문으로 올라오지 않는다.
+  func testSiteChromeStaysOutOfTheBody() async throws {
+    let receipt = try await read(
+      "https://example.org/wiki/RAG",
+      document: Self.html(
+        """
+        <nav aria-label="사이트"><ul><li><a href="/wiki/대문">대문으로 가기</a></li>
+        <li><a href="/wiki/임의문서">임의 문서로</a></li></ul></nav>
+        <header><h1>검색 증강 생성</h1></header>
+        <p>검색 증강 생성은 모델이 외부 문서를 찾아 답에 쓰게 한다.</p>
+        <aside><a href="/donate">기부하기</a></aside>
+        <footer><a href="/privacy">개인정보처리방침</a></footer>
+        """))
+
+    let row = try XCTUnwrap(CapabilitySourceRow.rows(in: receipt.details).first)
+    XCTAssertEqual(row.title, "검색 증강 생성", "제목은 남아야 한다")
+    XCTAssertTrue(row.body.contains("외부 문서를 찾아"), "본문이 비었다: \(row.body)")
+    for chrome in ["대문으로 가기", "임의 문서로", "기부하기", "개인정보처리방침"] {
+      XCTAssertFalse(row.body.contains(chrome), "가구가 본문에 섞였다: \(chrome)")
+    }
+  }
+
+  /// **제목은 말이어야 한다.** 페이지의 첫 줄은 흔히 글이 아니다 — 실기
+  /// 2026-09-18(iPhone 15 Pro)에서 읽은 한 장의 제목이 추적 픽셀
+  /// `"![](https://www.facebook.com/tr?id=…)"`이 됐고, 그 값이 근거의 이름으로
+  /// 문맥에 올라가 답 단계는 읽은 페이지를 무관하다고 판정했다(각주는 `[1] !`).
+  func testTitleSkipsMarkupOnlyLines() async throws {
+    let receipt = try await read(
+      "https://quantpro.example/eth",
+      document: Self.html(
+        """
+        <img src="https://www.facebook.com/tr?id=1206117640822563&amp;ev=PageView">
+        <p><a href="#content">컨텐츠로 건너뛰기</a></p>
+        <h1>이더리움 스테이킹의 구조</h1>
+        <p>32 ETH를 예치해야 검증인이 된다.</p>
+        """))
+
+    let row = try XCTUnwrap(CapabilitySourceRow.rows(in: receipt.details).first)
+    XCTAssertEqual(row.title, "이더리움 스테이킹의 구조", "표시만 있는 줄이 제목으로 섰다: \(row.title)")
+    XCTAssertFalse(row.title.contains("facebook.com"), "추적 픽셀이 제목이 됐다")
+  }
+
   /// 줄의 `body`가 다음 단계의 인자가 되는가. 이 줄 모양이 틀리면 읽기는 성공하고
   /// 요약은 되물음으로 끝난다.
   func testBodyFeedsSourceTextSlot() async throws {
@@ -108,6 +154,50 @@ final class WebReadTests: XCTestCase {
 
     let row = try XCTUnwrap(CapabilitySourceRow.rows(in: receipt.details).first)
     XCTAssertEqual(row.identifier, "https://news.example.org/full-article")
+  }
+
+  /// **대표 그림은 페이지가 고른 것부터.** `og:image`가 있으면 그것이고, 상대
+  /// 주소는 문서 주소로 풀린다 — 풀지 않으면 화면에서 열리지 않는다.
+  func testHeroImageComesFromOpenGraph() async throws {
+    let receipt = try await read(
+      "https://news.example.org/a",
+      document: FetchedDocument(
+        url: URL(string: "https://news.example.org/a")!,
+        mimeType: "text/html; charset=utf-8",
+        bytes: Data(
+          """
+          <html><head>
+          <meta property="og:image" content="/img/hero.jpg">
+          <meta name="twitter:image" content="https://cdn.example.org/t.jpg">
+          </head><body><img src="https://cdn.example.org/first.jpg"><p>본문</p></body></html>
+          """.utf8)))
+
+    XCTAssertEqual(
+      receipt.details[WebReadTool.heroDetailKey]?.textValue,
+      "https://news.example.org/img/hero.jpg")
+  }
+
+  /// 대표 그림이 없으면 **첫 그림**이다. `data:`는 그림이 아니라 바이트열이다.
+  func testHeroImageFallsBackToTheFirstRealImage() async throws {
+    let receipt = try await read(
+      "https://news.example.org/b",
+      document: Self.html(
+        """
+        <img src="data:image/png;base64,AAAA">
+        <img src="https://cdn.example.org/real.png"><p>본문</p>
+        """, url: "https://news.example.org/b"))
+
+    XCTAssertEqual(
+      receipt.details[WebReadTool.heroDetailKey]?.textValue,
+      "https://cdn.example.org/real.png")
+  }
+
+  /// 그림이 없는 페이지는 **그 칸을 만들지 않는다.** 빈 값을 넣으면 화면이
+  /// 빈 카드를 세운다.
+  func testPageWithoutAnImageCarriesNoHero() async throws {
+    let receipt = try await read(
+      "https://news.example.org/c", document: Self.html("<p>본문만 있다</p>"))
+    XCTAssertNil(receipt.details[WebReadTool.heroDetailKey])
   }
 
   func testBinaryDocumentIsRefusedInsteadOfRead() async throws {
@@ -155,6 +245,47 @@ final class WebReadTests: XCTestCase {
     XCTAssertEqual(coverage.reason, .truncation)
   }
 
+  // MARK: 청크 정본
+
+  /// **웹도 첨부와 같은 문을 지난다.** `memoryIndex`를 주면 읽은 본문이 정본으로
+  /// 저장되고, 그 식별자가 수령증에 실려 후속 질문·요약·번역이 같은 문서를
+  /// 다시 찾을 수 있다(REMAINING_WORK.ko.md "원칙: 로컬 파싱 청크 정본").
+  func testSuccessfulReadSavesCanonicalChunkWhenMemoryIndexIsProvided() async throws {
+    let memory = RecordingMemory()
+    let tool = WebReadTool(fetch: { _ in Self.html("<p>스테이킹 안내문입니다.</p>") }, memoryIndex: memory)
+    let receipt = try await tool.perform(
+      ActionRequest(
+        capability: .webRead, arguments: ["url": .text("https://example.com/pcc")],
+        origin: .modelPlan, accountID: "acct"))
+
+    XCTAssertEqual(memory.savedBodies.count, 1)
+    XCTAssertTrue(memory.savedBodies[0].contains("스테이킹 안내문입니다"))
+    let itemID = receipt.details[WebReadTool.memoryItemDetailKey]?.textValue
+    XCTAssertEqual(itemID, memory.returnedID)
+  }
+
+  /// **저장 실패가 이번 읽기를 실패시키지 않는다.** 이미 받은 본문은 이번 차례의
+  /// 근거로 그대로 쓴다 — 정본화는 부가 durability이지 읽기의 전제조건이 아니다.
+  func testMemorySaveFailureStillReturnsTheReadReceipt() async throws {
+    let memory = RecordingMemory(shouldThrow: true)
+    let tool = WebReadTool(fetch: { _ in Self.html("<p>본문</p>") }, memoryIndex: memory)
+    let receipt = try await tool.perform(
+      ActionRequest(
+        capability: .webRead, arguments: ["url": .text("https://example.com/pcc")],
+        origin: .modelPlan, accountID: "acct"))
+
+    XCTAssertNil(receipt.details[WebReadTool.memoryItemDetailKey])
+    let rows = CapabilitySourceRow.rows(in: receipt.details)
+    XCTAssertTrue(rows.first?.body.contains("본문") ?? false)
+  }
+
+  /// `memoryIndex`가 없으면(호스트가 주지 않았으면) 저장을 시도하지 않는다 — 조용히
+  /// 색인이 있는 척하지 않는다.
+  func testNoMemoryIndexMeansNoSaveAttemptAndNoDetailKey() async throws {
+    let receipt = try await read("https://example.com/pcc", document: Self.html("<p>본문</p>"))
+    XCTAssertNil(receipt.details[WebReadTool.memoryItemDetailKey])
+  }
+
   /// 헤더가 시킨 charset으로 읽는다. UTF-8로 단정하면 EUC-KR 페이지가 물음표 벽이
   /// 되고, 그 벽에서 기기 모델이 "사실"을 뽑는다.
   func testDeclaredCharsetIsHonored() async throws {
@@ -191,5 +322,30 @@ final class WebReadTests: XCTestCase {
       ActionRequest(
         capability: .webRead, arguments: ["url": .text(url)],
         origin: .modelPlan, accountID: "acct"))
+  }
+
+  /// `save` 호출을 기록하는 대역. 색인의 어휘·점수 로직은 시험하지 않는다 —
+  /// 여기서 볼 것은 WebReadTool이 **호출했는가**와 **실패를 삼키는가**뿐이다.
+  private final class RecordingMemory: SemanticMemoryIndex, @unchecked Sendable {
+    private(set) var savedBodies: [String] = []
+    let returnedID = "doc-web-fixture"
+    private let shouldThrow: Bool
+
+    init(shouldThrow: Bool = false) {
+      self.shouldThrow = shouldThrow
+    }
+
+    func search(_ query: String, accountID: String, limit: Int, cursor: String?) async throws
+      -> [MemoryHit]
+    { [] }
+    func read(id: String, accountID: String) async throws -> MemoryDocument? { nil }
+
+    func save(text: String, title: String?, accountID: String, conversationID: String?)
+      async throws -> String
+    {
+      if shouldThrow { throw ActionError.failed(reason: "save 실패(시험)") }
+      savedBodies.append(text)
+      return returnedID
+    }
   }
 }

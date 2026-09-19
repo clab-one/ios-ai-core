@@ -60,6 +60,14 @@ public struct CapabilityContract: Sendable, Hashable {
   }
 
   public let capability: CapabilityID
+  /// 이 능력이 **무엇을 건드리는가.** 손을 다는 쪽이 선언한다.
+  ///
+  /// 비워 두면 코어의 표를 쓴다(`CapabilityID.declaredAuthority`). 코어가 모르는
+  /// 이름은 **여기서 선언해야** 등록된다 — 선언 없는 능력은 손이 있어도 실행되지
+  /// 않는다(코드 리뷰 2026-09-18 P1: 공용 코어의 확장 경계).
+  public let authority: CapabilityID.Authority?
+  /// 효과 직전에 대상을 다시 볼 것인가. 비워 두면 코어의 표를 쓴다.
+  public let targetConsistency: CapabilityID.TargetConsistency?
   /// 없으면 **실행하지 않는다.**
   public let required: [Argument]
   /// 있으면 쓰고, 없으면 어댑터의 기본값이 쓰인다.
@@ -67,15 +75,26 @@ public struct CapabilityContract: Sendable, Hashable {
   /// 이 능력의 줄이 근거인가 손잡이인가. 적지 않으면 근거다 — 툴 대부분이 그렇고,
   /// 손잡이는 선언해야 성립한다.
   public let rows: RowKind
+  /// 이 능력의 결과를 **어떻게 쓸 것인가**(`ResultEnvelope`). 적지 않으면 답의
+  /// 재료다. 기기가 만들어 화면이 그대로 그리는 산출물(요약·번역·전사)만
+  /// `.deviceArtifact`를 선언한다 — 그 값은 모델 입력에 실리지 않는다.
+  public let result: ResultEnvelope
 
   public init(
-    _ capability: CapabilityID, required: [Argument] = [], optional: [Argument] = [],
-    rows: RowKind = .evidence
+    _ capability: CapabilityID,
+    authority: CapabilityID.Authority? = nil,
+    targetConsistency: CapabilityID.TargetConsistency? = nil,
+    required: [Argument] = [], optional: [Argument] = [],
+    rows: RowKind = .evidence,
+    result: ResultEnvelope = .evidence
   ) {
     self.capability = capability
+    self.authority = authority
+    self.targetConsistency = targetConsistency
     self.required = required
     self.optional = optional
     self.rows = rows
+    self.result = result
   }
 
   /// 계약 위반. 이유를 자리 이름으로 든다 — 화면이 "무엇이 모자란지"를 말할 수
@@ -201,8 +220,16 @@ extension CapabilityContract {
   /// 등록하지 않은 툴은 손(`CapabilityHandler`)이 있어도 실행되지 않는다 —
   /// 계약 없는 인자는 검사할 수 없고, 검사하지 않은 인자를 공급자 API로
   /// 흘리는 것이 이 코어가 막는 일이다.
-  public static func register(_ contracts: [CapabilityContract]) {
-    registry.register(contracts)
+  ///
+  /// 계약은 **권한도 싣는다**(`authority`). 그 선언이 코어의 표와 어긋나면 이
+  /// 계약은 실리지 않는다 — 계약이 없으면 인자 검증에서 거절되므로, 권한을
+  /// 두 값으로 들고 있는 능력은 실행에 이르지 못한다. 돌려주는 값은 그렇게
+  /// 거절된 능력이다.
+  @discardableResult
+  public static func register(_ contracts: [CapabilityContract]) -> Set<CapabilityID> {
+    let refused = CapabilityPolicy.shared.declare(contracts)
+    registry.register(contracts.filter { !refused.contains($0.capability) })
+    return refused
   }
 
   /// 지금 등록된 계약. 호스트가 "손은 있는데 계약이 없는 툴"을 잡는 근거다.

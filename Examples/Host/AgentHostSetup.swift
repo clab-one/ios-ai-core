@@ -78,7 +78,7 @@ enum AgentHostSetup {
         memoryIndex: memoryIndex,
         // 없으면 `text.summarize`가 등록되지 않는다 — 원문을 그대로 보내는
         // 대체 경로는 만들어지지 않는다.
-        onDeviceModel: FoundationOnDeviceTextModel(),
+        summaryModel: FoundationSummaryModel(),
         // **공개 웹은 명시로 켠다.** 검색은 사용자 문장을 웹으로 내보내는 유일한
         // 능력이고, 읽기는 이 기기가 바깥이 고른 주소로 요청을 내는 능력이다.
         // 붙여넣은 주소만 읽는 앱은 `webSearch`를 nil로 두면 된다.
@@ -132,14 +132,17 @@ final class InMemoryActionLedger: ActionLedger, @unchecked Sendable {
   func replay(_ request: ActionRequest) throws -> ActionLedgerReplay? {
     lock.lock()
     defer { lock.unlock() }
-    guard let entry = entries[request.idempotencyKey] else { return nil }
+    guard let entry = entries[request.effectIdentity] else { return nil }
     return entry.state == .completed ? .alreadyCompleted(entry) : .inFlight(entry)
   }
 
   func claim(_ request: ActionRequest, at date: Date) throws -> ActionLedgerClaim {
     lock.lock()
     defer { lock.unlock() }
-    if let entry = entries[request.idempotencyKey] {
+    // **열쇠는 효과의 정체다.** 차례의 id로 적으면 재시작 뒤의 재전송이 다른
+    // 열쇠가 되고, 그 열쇠로는 "이미 나갔는가"를 물을 수 없다.
+    let key = request.effectIdentity
+    if let entry = entries[key] {
       switch entry.state {
       case .completed: return .alreadyCompleted(entry)
       // **결과를 모르는 전송은 자동으로 다시 보내지 않는다.**
@@ -147,10 +150,10 @@ final class InMemoryActionLedger: ActionLedger, @unchecked Sendable {
       case .failed: break
       }
     }
-    entries[request.idempotencyKey] = ActionLedgerEntry(
-      idempotencyKey: request.idempotencyKey, accountID: request.accountID,
+    entries[key] = ActionLedgerEntry(
+      idempotencyKey: key, accountID: request.accountID,
       capability: request.capability, state: .pending, createdAt: date)
-    return .granted(idempotencyKey: request.idempotencyKey)
+    return .granted(idempotencyKey: key)
   }
 
   func settle(
@@ -170,6 +173,12 @@ final class InMemoryActionLedger: ActionLedger, @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return entries[idempotencyKey]
+  }
+
+  func forget(idempotencyKey: String) throws {
+    lock.lock()
+    defer { lock.unlock() }
+    entries[idempotencyKey] = nil
   }
 
   func deleteAll(accountID: String) throws {

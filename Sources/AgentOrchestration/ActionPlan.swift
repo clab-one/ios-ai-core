@@ -5,9 +5,9 @@ import FoundationModels
 
 /// 모델이 채우는 **좁고 typed한 칸**.
 ///
-/// 모델에게 문장을 쓰게 하지 않는다. 능력 이름과 인자 몇 개만 채우게 하고, 그
-/// 값을 코드가 검증해 `ActionRequest`로 옮긴다 — 오판이 저장소·EventKit·Gmail에
-/// 닿기 전에 한 겹의 검사가 있다는 뜻이다.
+/// PCC can answer, ask a contextual question, or propose capability calls.
+/// DialogueResolution validates the output shape before execution validation.
+/// Only ActionDispatcher can turn a valid proposal into an external effect.
 ///
 /// `status`가 이 칸의 새 자리다. 감독자는 매 되돌이마다 **더 할 일이 있는가**를
 /// 함께 말해야 한다(§11·§22) — 그 값이 없으면 loop를 멈출 근거가 "단계가 비었다"
@@ -21,8 +21,8 @@ import FoundationModels
 public struct GeneratedTurnDecision {
   @Guide(
     description:
-      "continue when more capabilities must run, complete when the evidence already answers the request",
-    .anyOf(["continue", "complete"]))
+      "reply for conversation, clarify for a missing user value, continue for tools, complete for an evidence-backed answer",
+    .anyOf(["reply", "clarify", "continue", "complete"]))
   public let status: String
   @Guide(
     description:
@@ -34,10 +34,16 @@ public struct GeneratedTurnDecision {
       "value the user must still provide, empty when nothing is missing")
   public let needs: String
 
-  public init(status: String, steps: [GeneratedActionStep], needs: String) {
+  @Guide(description: "natural reply or one specific question for reply/clarify; empty for continue/complete")
+  public let response: String
+
+  public init(
+    status: String, steps: [GeneratedActionStep], needs: String, response: String = ""
+  ) {
     self.status = status
     self.steps = steps
     self.needs = needs
+    self.response = response
   }
 }
 
@@ -136,10 +142,12 @@ public struct TurnDecision: Sendable, Equatable {
 
   public let status: Status
   public let plan: ActionPlan
+  public let dialogue: DialogueResolution
 
-  public init(status: Status, plan: ActionPlan) {
+  public init(status: Status, plan: ActionPlan, dialogue: DialogueResolution = .none) {
     self.status = status
     self.plan = plan
+    self.dialogue = dialogue
   }
 
   /// 이 되돌이가 실행할 것이 있는가.
@@ -162,6 +170,11 @@ public enum ResolvableArgument: String, Sendable, CaseIterable {
   case itemID
   case eventID
   case reminderID
+  /// 읽을 사진. `photos.search`의 결과에서만 온다 — 보관함 식별자를 모델이
+  /// 채우게 하면 지어내고, 그 값으로는 아무 사진도 열리지 않는다. 이 자리가
+  /// 없던 동안 `"최근 사진 읽어 줘"`는 `photos.read`를 계획해 놓고 `photoID`를
+  /// 되물었다(실기 2026-09-18, iPhone 15 Pro).
+  case photoID
   /// 읽을 주소. `web.search`의 결과에서만 온다 — 검색 뒤 읽기가 감독 되돌이의
   /// 가장 흔한 두 단계이고, 그 주소를 모델이 채우게 하면 지어낸다.
   case url
@@ -193,7 +206,7 @@ public enum ResolvableArgument: String, Sendable, CaseIterable {
   public var isOpaqueHandle: Bool {
     switch self {
     case .messageID, .channelID, .threadTS, .threadID, .messageIDHeader, .itemID,
-      .eventID, .reminderID:
+      .eventID, .reminderID, .photoID:
       return true
     // 주소·주소창·사람이 쓴 글은 사용자가 말했거나 읽은 값이다. 답이 그것을
     // 되읽는 것은 누설이 아니라 §43이 요구하는 일이다.
@@ -220,6 +233,13 @@ public enum ActionPlanValidator {
     accountID: String,
     calendar: Calendar
   ) -> TurnDecision {
+    let dialogue = DialogueResolution.resolve(
+      status: generated.status, response: generated.response, needs: generated.needs,
+      proposedStepCount: generated.steps.count)
+    if dialogue != .none {
+      // Never drop an invalid raw step and then accept the accompanying reply.
+      return TurnDecision(status: .complete, plan: .empty, dialogue: dialogue)
+    }
     let status = TurnDecision.Status(raw: generated.status)
     let allowedSet = Set(allowed.map(\.rawValue))
     var steps: [PlannedStep] = []
@@ -247,7 +267,7 @@ public enum ActionPlanValidator {
         allowedSet.contains(CapabilityID.peopleResolve.rawValue)
       {
         steps.append(
-          PlannedStep(capability: .peopleResolve, arguments: ["name": .text(target)]))
+          PlannedStep(capability: .peopleResolve, arguments: ["query": .text(target)]))
       }
 
       let arguments = Self.arguments(for: capability, step: step, calendar: calendar)
@@ -277,7 +297,39 @@ public enum ActionPlanValidator {
     // 단계를 함께 내는 경우가 있고, 그때 단계를 버리면 사용자가 시킨 일이 반만
     // 일어난다. 실행이 남아 있다는 관찰이 모델의 말보다 앞선다.
     let resolved: TurnDecision.Status = steps.isEmpty ? status : .working
+    Self.trace(generated, steps: steps, needs: needs)
     return TurnDecision(status: resolved, plan: ActionPlan(steps: steps, needs: needs))
+  }
+
+  /// 실기에서 **계획을 볼 유일한 창**. 기기의 `os_log`는 Mac으로 중계되지 않고,
+  /// 수령증은 실행한 것만 말한다 — 모델이 무엇을 골랐고 계약이 무엇을 받았는지는
+  /// 이 줄에서만 보인다. 기본은 꺼짐이고 `MORI_PLAN_TRACE=1`로 켠다(시험 기기).
+  private static let tracesPlans =
+    ProcessInfo.processInfo.environment["MORI_PLAN_TRACE"] == "1"
+
+  private static func trace(
+    _ generated: GeneratedTurnDecision, steps: [PlannedStep], needs: String?
+  ) {
+    guard tracesPlans else { return }
+    func short(_ value: String) -> String {
+      let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.count <= 40 ? trimmed : String(trimmed.prefix(40)) + "…"
+    }
+    print(
+      "MORI-PLAN status=\(generated.status) needs=\(short(generated.needs)) "
+        + "response=\(generated.response.count) rawSteps=\(generated.steps.count)")
+    for step in generated.steps {
+      print(
+        "MORI-PLAN raw \(step.capability) text=\(short(step.text)) "
+          + "target=\(short(step.target)) when=\(short(step.when)) subject=\(short(step.subject))")
+    }
+    for step in steps {
+      let arguments = step.arguments.keys.sorted().joined(separator: ",")
+      print(
+        "MORI-PLAN planned \(step.capability.rawValue) args=\(arguments) "
+          + "unresolved=\(step.unresolved.sorted().joined(separator: ","))")
+    }
+    print("MORI-PLAN resolved needs=\(needs ?? "-") steps=\(steps.count)")
   }
 
   /// 이름만 준 전송인가. 주소(`@`)를 줬다면 조회는 필요 없다.
@@ -336,8 +388,13 @@ public enum ActionPlanValidator {
       if !target.isEmpty { arguments["reminderID"] = .text(target) }
       if !text.isEmpty { arguments["title"] = .text(text) }
     case .peopleResolve, .contactsRead:
-      if !target.isEmpty { arguments["name"] = .text(target) }
-      else if !text.isEmpty { arguments["name"] = .text(text) }
+      // **자리 이름은 계약의 것이다**(`query`). `name`으로 담던 동안 연락처 조회는
+      // 한 번도 돌지 않았다: 정규화가 모르는 이름을 버리고 `query` 없음으로
+      // 거절했고, 차례는 `"어디에서 찾을까요?"`로 닫혔다(실기 2026-09-18,
+      // iPhone 15 Pro: `"김철수 연락처 찾아줘"` → contacts.read 0회, pcc=2/2).
+      if !target.isEmpty { arguments["query"] = .text(target) }
+    case .photosRead:
+      if !target.isEmpty { arguments["photoID"] = .text(target) }
     case .mailRead:
       if !target.isEmpty { arguments["messageID"] = .text(target) }
     case .mailSend, .mailReply:
@@ -369,11 +426,32 @@ public enum ActionPlanValidator {
       // 없는 자리이므로 정규화가 버렸다(`SummarizeTool.contracts`). 요약은 언제나
       // 초점 없이 돌았고, 사용자가 무엇을 물었는지는 요약기에 닿지 않았다.
       if !text.isEmpty { arguments["focus"] = .text(text) }
+    case .textTranslate:
+      // **옮길 원문은 앞 단계에서 온다**(`ResolvableArgument.sourceText`). 그래서
+      // 이 칸에 모델이 쓰는 글은 원문이 아니라 **도착 언어**다. 비우면 툴이
+      // 기기 설정 언어를 쓰고 그 사실을 수령증에 남긴다 — 여기서 언어를 지어내지
+      // 않는다.
+      if !text.isEmpty { arguments["targetLanguage"] = .text(text) }
     case .webSearch:
       if !text.isEmpty { arguments["query"] = .text(text) }
       // **모델이 말한 시각은 창의 아래 끝이다.** 위 끝은 오늘이고 그 값은 기기가
       // 박는다 — `"지난주부터 PCC 소식"`에서 모델이 줄 수 있는 것은 시작점뿐이다.
       if let when { arguments["after"] = .timestamp(when) }
+    case .financeQuote:
+      // **종목은 이름으로 온다.** `"hynix 가격"`의 `hynix`는 티커가 아니고,
+      // 티커로 바꾸는 일은 공급자의 검색이 한다(`StocksTool`) — 모델이 티커를
+      // 지어내면 다른 회사의 시세가 답이 된다.
+      if !target.isEmpty { arguments["symbol"] = .text(target) }
+      else if !text.isEmpty { arguments["symbol"] = .text(text) }
+    case .weatherForecast:
+      // **지역 이름은 `target`이 정석이지만 `text`에도 담긴다**(`.financeQuote`와
+      // 같은 패턴). 이 케이스가 없던 동안 `default`가 `query` 키로 떨어졌고,
+      // `WeatherTool.perform()`은 `place`를 읽으므로 이름이 달라 절대 채워지지
+      // 않았다 — 실기 검증(2026-09-19, iPhone 15 Pro)에서 "서울 날씨 알려줘"가
+      // 기기 GPS(강원)로 떨어지는 것으로 확인됐다. 비워 두면 툴이 기기 위치로
+      // 폴백한다(의도된 동작, `WeatherTool.resolveCoordinate`).
+      if !target.isEmpty { arguments["place"] = .text(target) }
+      else if !text.isEmpty { arguments["place"] = .text(text) }
     default:
       if !text.isEmpty { arguments["query"] = .text(text) }
     }

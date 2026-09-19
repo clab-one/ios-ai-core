@@ -37,6 +37,12 @@ public struct TurnCopy: Sendable {
   /// 일부만 마친 차례의 한 줄. 답이 아니라 **상태**다.
   public func partial() -> String { resolve(Key.progressPartial) }
 
+  /// 모델이 **안전 판정으로 거부한** 차례의 한 줄.
+  ///
+  /// "하지 못했어요"와 다른 문장이어야 한다 — 다시 눌러도 같은 판정이고, 그
+  /// 사이에 기기가 읽어 정리한 것은 그대로 남아 있다(실기 2026-09-17, iPhone).
+  public func refused() -> String { resolve(Key.answerRefused) }
+
   /// 실패 한 줄. **왜 못 했는지가 다르면 문장도 달라야 한다.**
   public func failure(reason: String) -> String {
     if reason == "cancelled" {
@@ -77,6 +83,9 @@ public struct TurnCopy: Sendable {
     public static let answerDone = "conversation.answer.done"
     public static let answerNotConnected = "conversation.answer.notConnected"
     public static let answerFailed = "conversation.answer.failed"
+    /// 모델이 **안전 판정으로** 답을 쓰지 않았다. 실패와 다른 사실이다 — 다시
+    /// 눌러도 같은 판정이고, 기기가 읽어 정리한 것은 그대로 남는다.
+    public static let answerRefused = "conversation.answer.refused"
     /// 이 기기·계정으로는 에이전트를 열 수 없다. **실패가 아니라 환경의 사실**이다.
     public static let answerUnsupported = "conversation.answer.unsupported"
     /// 지시 하나가 문맥 예산을 넘었다. **사용자가 줄일 수 있는 실패**다.
@@ -104,7 +113,7 @@ public struct TurnCopy: Sendable {
       "channelID": "conversation.needs.channel",
       "messageID": "conversation.needs.message",
       "eventID": "conversation.needs.event",
-      "url": "conversation.needs.url",
+      "photoID": "conversation.needs.photo",
       "name": "conversation.needs.person",
     ]
 
@@ -112,7 +121,7 @@ public struct TurnCopy: Sendable {
     public static var all: Set<String> {
       Set(
         [
-          answerFound, answerNone, answerDone, answerNotConnected, answerFailed,
+          answerFound, answerNone, answerDone, answerNotConnected, answerFailed, answerRefused,
           answerUnsupported, answerRequestTooLarge,
           progressCancelled, progressReconciling, progressPartial, needsOther,
         ] + needs.values)

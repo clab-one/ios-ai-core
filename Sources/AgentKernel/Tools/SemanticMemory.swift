@@ -49,12 +49,24 @@ public struct MemoryDocument: Sendable, Equatable {
 /// 보이는 검색 툴은 하나뿐이고(`memory.search`), 색인이 넉넉해져도 그 툴은 그대로다.
 public protocol SemanticMemoryIndex: Sendable {
   /// 질의 하나로 고른 줄들. 순서는 구현이 정한 관련도 순서다.
-  func search(_ query: String, limit: Int, cursor: String?) async throws -> [MemoryHit]
-  /// 정본 하나의 본문. 없으면 nil이다 — 지어내지 않는다.
-  func read(id: String) async throws -> MemoryDocument?
+  ///
+  /// **`accountID`는 필수다, 기본값이 없다.** 이 값이 없어서 전체 계정을 훑던
+  /// 시절에는 계정 B의 검색이 계정 A가 저장한 첨부·웹 읽기·기억을 그대로
+  /// 찾아냈다(코드 리뷰 2026-09-18: `memory_documents`에 계정 칸이 없었다). 대화
+  /// 단위 격리는 두지 않는다 — `memory.save`("여권 만료, 기억해")는 대화를
+  /// 넘어 계정 전체에서 찾아져야 하는 사실이다.
+  func search(_ query: String, accountID: String, limit: Int, cursor: String?) async throws
+    -> [MemoryHit]
+  /// 정본 하나의 본문. 없거나 **다른 계정의 것이면** nil이다 — 지어내지 않는다.
+  func read(id: String, accountID: String) async throws -> MemoryDocument?
   /// 말로만 준 사실을 기록으로 만든다. 같은 글이 두 번 오면 **같은 식별자**를
   /// 돌려주어야 한다(코어도 멱등 열쇠로 막지만, 색인이 정본의 주인이다).
-  func save(text: String, title: String?) async throws -> String
+  ///
+  /// `conversationID`는 출처 기록일 뿐 검색 범위가 아니다 — 이 값으로 걸러
+  /// 저장한 대화 밖에서 못 찾게 만들면 `memory.save`의 존재 이유(대화를 넘는
+  /// 회상)가 사라진다.
+  func save(text: String, title: String?, accountID: String, conversationID: String?)
+    async throws -> String
 }
 
 /// 기억을 읽고 쓰는 툴.
@@ -123,7 +135,8 @@ public struct MemoryTool: CapabilityHandler {
     let requested = request.arguments["limit"]?.numberValue.map { Int($0) } ?? Self.defaultLimit
     let limit = max(1, min(requested, Self.maximumLimit))
     let hits = try await index.search(
-      query, limit: limit, cursor: request.arguments["cursor"]?.textValue)
+      query, accountID: request.accountID, limit: limit,
+      cursor: request.arguments["cursor"]?.textValue)
 
     // 같은 정본이 여러 조각으로 색인되어 있으면 한 줄로 접는다 — 같은 기록이
     // 세 줄로 서면 모델은 그것을 세 건의 사실로 읽는다.
@@ -167,7 +180,7 @@ public struct MemoryTool: CapabilityHandler {
     guard let id = request.arguments["itemID"]?.textValue, !id.isEmpty else {
       throw ActionError.invalidArguments(reason: "itemID")
     }
-    guard let document = try await index.read(id: id) else {
+    guard let document = try await index.read(id: id, accountID: request.accountID) else {
       // 없는 기록을 "빈 기록"으로 돌려주지 않는다. 빈 본문은 모델에게 "내용이
       // 없는 기록"으로 읽히고, 그 차례는 사실이 아닌 답을 쓴다.
       throw ActionError.failed(reason: "notFound")
@@ -200,7 +213,8 @@ public struct MemoryTool: CapabilityHandler {
       throw ActionError.invalidArguments(reason: "body")
     }
     let id = try await index.save(
-      text: body, title: request.arguments["title"]?.textValue)
+      text: body, title: request.arguments["title"]?.textValue,
+      accountID: request.accountID, conversationID: request.conversationID)
     return ActionReceipt(
       requestID: request.id,
       capability: request.capability,

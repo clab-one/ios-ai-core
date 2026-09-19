@@ -43,6 +43,14 @@ public struct EvidenceCompiler: Sendable {
   /// 근거이고, 잘렸다는 사실은 계측에 남는다.
   public static let maxLocalExtractions = 4
 
+  /// 한 차례가 조각으로 펼칠 근거의 총 상한. 문맥의 근거 자리는 8개이고
+  /// (`ConversationContextCompiler.evidenceLimit`) 그중 둘은 "무엇을 했는가"
+  /// 수령증 근거(`action`)에 남겨 둔다 — 조각이 그 자리를 밀어내면 보낸 메일이
+  /// 답의 근거에서 사라진다.
+  public static let chunkEvidenceBudget = 6
+  /// 한 줄(문서 하나)에서 고를 조각 수의 상한.
+  public static let maximumChunksPerRow = 3
+
   /// 이 차례의 질의. 추출이 무엇을 향해야 하는지의 근거다.
   public let query: String
   public let onDeviceModel: SystemLanguageModel
@@ -87,68 +95,150 @@ public struct EvidenceCompiler: Sendable {
       retrievedRows: reduced.readSources.reduce(0) { $0 + $1.count })
 
     let terms = Self.terms(in: query)
+    var chunkBudget = Self.chunkEvidenceBudget
     for selection in reduced.selected {
+      // **기기 산출물은 모델 입력에 실리지 않는다**(`ResultEnvelope.staysOnDevice`).
+      // 요약·번역처럼 이미 답인 값은 화면이 그대로 그리고, 문맥에는 아래
+      // `action(_:)`이 만드는 "무엇을 했는가" 한 줄만 간다. 여기서 막지 않으면
+      // 기기가 만든 글이 PCC를 한 번 더 지나고 문장이 다시 쓰인다.
+      if Self.staysOnDevice(selection.capability) { continue }
       let source = Evidence.Source(domain: selection.capability.domain)
-      let strategy = EvidenceStrategy.resolve(for: selection.row, source: source)
-      switch strategy {
-      case .passthrough, .deterministicExtraction:
-        compiled.evidence.append(
-          Self.deterministic(selection.row, source: source, terms: terms))
-      case .localModelExtraction:
-        let row = selection.row
-        let key = ActionFingerprint.arguments([
-          "source": .text(source.rawValue), "id": .text(row.identifier),
-          "sourceIdentity": .text(selection.sourceReference?.identity ?? ""),
-          "version": .text(row.body), "title": .text(row.title),
-          "subtitle": .text(row.subtitle), "timestamp": .text(row.timestamp),
-          "query": .text(query), "policy": .text("extraction-v1-default-local")])
-        let extracted: Evidence?
-        // 뽑기 한 번의 대기 시간. 상자를 호출 밖에 두어 실패한 뽑기의 대기도
-        // 남는다 — 실패는 상한을 소비하므로 대기 시간도 실제 비용이다.
-        let wait = AdmissionWait()
-        switch await budget.cached(key) {
-        case .finished(let cached): extracted = cached
-        case .absent:
-          extracted = await extract(
-            row, source: source, key: key, budget: budget, wait: wait)
-          compiled.extractionWaitMilliseconds += wait.milliseconds
-        }
-        if let extracted {
-          compiled.evidence.append(extracted)
-        } else {
-          // 상한을 넘었거나 기기 모델이 답하지 못했다. **원문을 그대로 올리지
-          // 않는다** — 자른다. 이 선택이 §17의 기본값이다.
+      let first = compiled.evidence.count
+      for row in Self.rowsForEvidence(selection.row, terms: terms, budget: &chunkBudget) {
+        let strategy = EvidenceStrategy.resolve(for: row)
+        switch strategy {
+        case .passthrough, .deterministicExtraction:
           compiled.evidence.append(
-            Self.deterministic(selection.row, source: source, terms: terms))
+            Self.deterministic(row, source: source, terms: terms))
+        case .localModelExtraction:
+          let key = ActionFingerprint.arguments([
+            "source": .text(source.rawValue), "id": .text(row.identifier),
+            "sourceIdentity": .text(selection.sourceReference?.identity ?? ""),
+            "version": .text(row.body), "title": .text(row.title),
+            "subtitle": .text(row.subtitle), "timestamp": .text(row.timestamp),
+            "query": .text(query), "policy": .text("extraction-v1-default-local")])
+          let extracted: Evidence?
+          // 뽑기 한 번의 대기 시간. 상자를 호출 밖에 두어 실패한 뽑기의 대기도
+          // 남는다 — 실패는 상한을 소비하므로 대기 시간도 실제 비용이다.
+          let wait = AdmissionWait()
+          switch await budget.cached(key) {
+          case .finished(let cached): extracted = cached
+          case .absent:
+            extracted = await extract(
+              row, source: source, key: key, budget: budget, wait: wait)
+            compiled.extractionWaitMilliseconds += wait.milliseconds
+          }
+          if let extracted {
+            compiled.evidence.append(extracted)
+          } else {
+            // 상한을 넘었거나 기기 모델이 답하지 못했다. **원문을 그대로 올리지
+            // 않는다** — 자른다. 이 선택이 §17의 기본값이다.
+            compiled.evidence.append(
+              Self.deterministic(row, source: source, terms: terms))
+          }
         }
       }
-      if let last = compiled.evidence.indices.last {
-        compiled.evidence[last].sourceReference = selection.sourceReference
+      // **한 줄에서 나온 근거 전부**가 같은 출처를 가리킨다. 마지막 하나에만
+      // 붙이던 예전 코드는 조각 펼침에서 나머지 조각의 출처 카드를 잃는다
+      // (`TurnRuntime.matches`).
+      for index in compiled.evidence.indices where index >= first {
+        compiled.evidence[index].sourceReference = selection.sourceReference
       }
     }
 
     // **한 일도 근거다.** 수령증만 남은 차례(일정 생성·전송)에서 최종 답이
     // "무엇을 했는가"를 말할 근거가 이것뿐이다(§43).
-    for receipt in receipts where CapabilitySourceRow.rows(in: receipt.details).isEmpty {
+    //
+    // 기기 산출물(`staysOnDevice`)은 줄을 들고 있어도 이 자리에 온다. 본문은
+    // 위에서 뺐으므로, 여기까지 빼면 그 차례는 자기가 무엇을 했는지도 말하지
+    // 못한다 — 침묵은 감춤이다.
+    for receipt in receipts
+    where CapabilitySourceRow.rows(in: receipt.details).isEmpty
+      || Self.staysOnDevice(receipt.capability)
+    {
       compiled.evidence.append(Self.action(receipt))
     }
     compiled.localExtractions = await budget.snapshot().started
     return compiled
   }
 
+  /// 이 능력의 결과가 기기에 남는가. 계약이 말한다(`CapabilityContract.result`).
+  /// 계약이 없으면 답의 재료로 본다 — 모르는 능력을 조용히 감추지 않는다.
+  public static func staysOnDevice(_ capability: CapabilityID) -> Bool {
+    CapabilityContract.contract(for: capability)?.result.staysOnDevice ?? false
+  }
+
+  // MARK: 조각 선택
+
+  /// 질문과 겹치는 조각부터. 겹치는 조각이 하나도 없으면(순수 "요약해줘"류
+  /// 지시) 문서에 **고르게 걸치도록** 처음·중간·끝을 든다 — 앞에서 N개를
+  /// 고르면 메뉴·머리말만 읽는 실패(`window`의 실측 주석)를 조각 단위로 되풀이한다.
+  public static func selectedSlices(
+    _ slices: [TextChunker.Slice], terms: [String], limit: Int
+  ) -> [TextChunker.Slice] {
+    let limit = max(1, min(limit, maximumChunksPerRow))
+    guard slices.count > 1 else { return slices }
+    let scored = slices.map { ($0, Self.overlap($0.body, terms: terms)) }
+    guard !terms.isEmpty, scored.contains(where: { $0.1 > 0 }) else {
+      // 겹치는 조각이 없다(또는 질의 낱말이 없다) — 처음·중간·끝에서 고르게 든다.
+      var picked: [Int] = []
+      for index in [0, slices.count / 2, slices.count - 1] where !picked.contains(index) {
+        picked.append(index)
+      }
+      return picked.prefix(limit).map { slices[$0] }
+    }
+    let ranked = scored.sorted { lhs, rhs in
+      if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+      return lhs.0.sequence < rhs.0.sequence
+    }
+    return ranked.prefix(limit).map(\.0).sorted { $0.sequence < $1.sequence }
+  }
+
+  /// 한 줄을 근거로 옮길 **줄들.** 조각이 둘 이상 걸리는 긴 본문만 펼친다 —
+  /// 한 줄에서 사실 셋만 뽑으면(`Evidence.factsPerEvidence`) 문서 뒤쪽은 답에
+  /// 한 번도 오지 않는다(388,754자 문서 실측, `EvidenceStrategy` 주석).
+  private static func rowsForEvidence(
+    _ row: CapabilitySourceRow, terms: [String], budget: inout Int
+  ) -> [CapabilitySourceRow] {
+    guard budget > 0, row.body.count > TextChunker.defaultBudget else { return [row] }
+    let all = TextChunker.slices(row.body)
+    let picked = selectedSlices(all, terms: terms, limit: min(budget, maximumChunksPerRow))
+    guard picked.count > 1 else { return [row] }
+    budget -= picked.count
+    return picked.map { slice in
+      CapabilitySourceRow(
+        title: chunkTitle(row.title, slice: slice, of: all.count),
+        subtitle: row.subtitle, body: slice.body, identifier: row.identifier,
+        timestamp: row.timestamp)
+    }
+  }
+
+  private static func chunkTitle(_ title: String, slice: TextChunker.Slice, of total: Int) -> String {
+    title.isEmpty ? "\(slice.sequence + 1)/\(total)" : "\(title) · \(slice.sequence + 1)/\(total)"
+  }
+
   // MARK: 결정론 추출
 
   /// 줄 하나를 근거로. **자르되 지어내지 않는다.**
   ///
-  /// 본문이 있으면 질의 낱말이 든 문장을 먼저 고른다 — 본문 앞쪽을 무조건 자르면
-  /// 사용자가 물은 문장이 잘려 나가는 일이 흔하다.
+  /// 본문이 이미 한 사실 상한(`Evidence.factLimit`) 안에 다 들어가면 **그대로
+  /// 쓴다** — 나눠 고르지 않는다. 대화 스크린샷 OCR처럼 짧은 본문을 문장으로
+  /// 쪼개 상위 3개만 고르면(`relevantSentences`), 이미 상한 안에 들어가는
+  /// 대화조차 뒤쪽 발화가 통째로 사라진다(번역 요청 실측: OCR 240자 미만 대화가
+  /// 앞 세 문장만 남아 뒤 대화가 답에서 빠짐). 상한을 넘는 본문만 질의 낱말이
+  /// 든 문장을 먼저 고른다 — 본문 앞쪽을 무조건 자르면 사용자가 물은 문장이
+  /// 잘려 나가는 일이 흔하다.
   public static func deterministic(
     _ row: CapabilitySourceRow, source: Evidence.Source, terms: [String]
   ) -> Evidence {
     var facts: [String] = []
     if !row.subtitle.isEmpty { facts.append("from: \(row.subtitle)") }
     if !row.body.isEmpty {
-      facts.append(contentsOf: Self.relevantSentences(in: row.body, terms: terms))
+      if row.body.count <= Evidence.factLimit {
+        facts.append(row.body)
+      } else {
+        facts.append(contentsOf: Self.relevantSentences(in: row.body, terms: terms))
+      }
     }
     return Evidence(
       source: source,
@@ -158,14 +248,14 @@ public struct EvidenceCompiler: Sendable {
       timestamp: row.timestamp)
   }
 
-  /// 질의와 겹치는 문장부터. 겹치는 것이 없으면 앞에서부터 든다.
+  /// 질의와 겹치는 문장부터. 겹치는 것이 없으면 앞과 문서 1/3 지점을 섞어 든다.
   public static func relevantSentences(in body: String, terms: [String]) -> [String] {
     let sentences = body
       .split(whereSeparator: { ".!?\n。".contains($0) })
       .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
       .filter { !$0.isEmpty }
     guard !sentences.isEmpty else { return [] }
-    guard !terms.isEmpty else { return Array(sentences.prefix(2)) }
+    guard !terms.isEmpty else { return Self.spreadSample(sentences) }
     let scored = sentences.enumerated().sorted { lhs, rhs in
       let left = Self.overlap(lhs.element, terms: terms)
       let right = Self.overlap(rhs.element, terms: terms)
@@ -176,12 +266,29 @@ public struct EvidenceCompiler: Sendable {
     // 서로 다른 줄에 있다. 상한은 `Evidence`가 지킨다(`factsPerEvidence`).
     let picked = scored.prefix(Evidence.factsPerEvidence)
     guard picked.contains(where: { Self.overlap($0.element, terms: terms) > 0 }) else {
-      // 겹치는 것이 하나도 없으면 순서를 지킨다 — 점수가 같은 정렬은 의미가 없다.
-      return Array(sentences.prefix(2))
+      // 겹치는 것이 하나도 없다 — 순서로 앞줄만 골랐다. 웹 읽기 실측
+      // (2026-09-17 Yahoo Finance)에서 이 자리의 앞 문장은 메뉴·안내문뿐이고
+      // 기사는 한 줄도 없었다. 앞 하나로 걸지 않고 문서 1/3 지점을 함께 본다.
+      return Self.spreadSample(sentences)
     }
     // 고른 줄은 **문서에 적힌 순서로** 되돌린다. 점수 순으로 늘어놓으면 답이
     // 문맥에서 거꾸로 읽힌다.
     return picked.sorted { $0.offset < $1.offset }.map(\.element)
+  }
+
+  /// 질의 낱말이 하나도 없을 때(순수 "요약해줘"류 지시, 본문에 닻을 내릴 말이
+  /// 없음)의 대체 표본. 앞 문장만 고르지 않는다 — 메뉴·티커·추천글이 문서
+  /// 앞부분을 채우는 페이지에서는 앞줄만으로 산문이 한 줄도 안 걸린다. 앞과
+  /// 문서 1/3 지점의 문장을 하나씩 섞는다. 이것도 **구조를 판별하는 것이
+  /// 아니라 표본을 늘리는 것**이다 - 블록을 "본문"으로 골라내는 판은 이미
+  /// 시도했고 되돌렸다(`WebReadTool.text(in:)` 주석): 신뢰할 수 있는 품질
+  /// 신호 없이 블록을 고르면 기사 전체를 놓치는 페이지가 나왔다.
+  private static func spreadSample(_ sentences: [String]) -> [String] {
+    guard sentences.count > 2 else { return Array(sentences.prefix(2)) }
+    let midIndex = sentences.count / 3
+    var picked = [sentences[0]]
+    if midIndex != 0 { picked.append(sentences[midIndex]) }
+    return picked
   }
 
   /// 질문과 문장이 **얼마나 겹치는가**.
@@ -234,7 +341,13 @@ public struct EvidenceCompiler: Sendable {
   /// 수령증 하나를 근거로. 담는 것은 **관찰된 결과**뿐이다.
   public static func action(_ receipt: ActionReceipt) -> Evidence {
     var facts = [receipt.summary]
-    for key in receipt.details.keys.sorted() where Self.tellable(key, of: receipt.capability) {
+    // 기기 산출물은 **한 일 한 줄**만 남긴다. 딸린 값에 산출물 본문이 들어 있어도
+    // (`SummarizeTool.textDetailKey`) 그것은 화면의 것이지 모델의 것이 아니다.
+    // 지금은 `tellable`의 계약 검사가 그 열쇠를 걸러 내지만, 어떤 툴이 그 자리를
+    // 계약 인자로 선언하는 순간 길이 열린다 — 정책으로 먼저 막는다.
+    let onDevice = Self.staysOnDevice(receipt.capability)
+    for key in receipt.details.keys.sorted()
+    where !onDevice && Self.tellable(key, of: receipt.capability) {
       switch receipt.details[key] {
       case .text(let value): facts.append("\(key): \(value)")
       case .number(let value): facts.append("\(key): \(Int(value))")
@@ -310,6 +423,45 @@ public struct EvidenceCompiler: Sendable {
     return earliest
   }
 
+  /// 질의가 겹치는 자리를 **품는** 창 하나(자리를 모르면 두 조각).
+  ///
+  /// 답이 문서 뒤쪽에 있으면 앞에서 잘라 보낸 글에는 그 자리가 없다. 자리를 알면
+  /// 그 자리를 담은 창을 보낸다 — 자리를 앞 1/3 지점에 두어 답 앞의 문맥도 함께
+  /// 싣는다.
+  ///
+  /// **자리를 모를 때(순수 "요약해줘"류 지시, 질의에 본문 낱말이 없음)는 맨 앞만
+  /// 보내지 않는다.** 실측(2026-09-17 Yahoo Finance, `WebReadTool` 문서 주석)에서
+  /// 맨 앞 4,000자가 전부 메뉴·추천글이고 기사 산문은 한 줄도 없었다. 그렇다고
+  /// "본문 블록"을 구조로 골라내지도 않는다 — 그 방식은 이미 시도했고
+  /// 되돌렸다(같은 문서: 블록별 링크 밀도 같은 신뢰할 수 있는 신호가 없어 기사를
+  /// 통째로 잃는 페이지가 나왔다). 대신 예산을 앞과 문서 1/3 지점 이후로 나눠
+  /// **두 자리를 함께** 보낸다 — 추측 하나에 전부를 걸지 않는다. 두 조각은
+  /// 이어진 글이 아니므로 구분자로 가른다 — 붙이면 모델이 없는 연결을 지어낼
+  /// 수 있다.
+  ///
+  /// 요약처럼 **전체를 훑는** 일은 이 자리가 아니라 조각 순회가 한다
+  /// (`SummarizeTool`). 여기는 한 줄을 근거로 바꾸는 자리이고, 한 번의 호출로
+  /// 끝난다(`maxLocalExtractions`).
+  static func window(in text: String, around offset: Int?, limit: Int) -> String {
+    guard limit > 0 else { return "" }
+    guard text.count > limit else { return text }
+    if let offset, offset > 0 {
+      let lead = limit / 3
+      let start = min(max(0, offset - lead), text.count - limit)
+      let from = text.index(text.startIndex, offsetBy: start)
+      let to = text.index(from, offsetBy: limit)
+      return String(text[from..<to])
+    }
+    let separator = "\n…\n"
+    let each = (limit - separator.count) / 2
+    guard each > 0 else { return String(text.prefix(limit)) }
+    let head = String(text.prefix(each))
+    let laterStartOffset = min(text.count / 3, max(0, text.count - each))
+    let laterStart = text.index(text.startIndex, offsetBy: laterStartOffset)
+    let later = String(text[laterStart...].prefix(each))
+    return head + separator + later
+  }
+
   /// 긴 바깥 글 한 줄을 기기에서 뽑는다. 실패하면 nil — 그때는 결정론이 자른다.
   ///
   /// **PCC를 부르지 않는다.** 이 단계의 입력이 곧 공급자 원문이고, 그 원문은
@@ -337,21 +489,26 @@ public struct EvidenceCompiler: Sendable {
       """
     // **모델이 무엇을 읽는지 적는다.** 긴 본문에서 앞쪽만 보내는 구조는 지표에
     // 나타나지 않는다: 추출은 성공하고, 사실은 나오고, 그 사실이 문서의 답이
-    // 아닐 뿐이다. 그래서 크기와 **질의가 처음 겹치는 자리**를 함께 남긴다 —
-    // 그 값이 상한보다 크면 모델은 답이 있는 자리를 보지 못했다.
+    // 아닐 뿐이다. 그래서 크기와 **질의가 처음 겹치는 자리**를 함께 남긴다.
+    //
+    // 그리고 그 자리를 **쓴다**: 겹치는 자리가 상한 뒤에 있으면 그 자리를 담은
+    // 창을 보낸다(`window(in:around:limit:)`). 자리를 알면서 앞쪽을 보내는 것은
+    // 답이 있는 곳을 보지 않겠다는 선택이다.
     let relevantOffset = Self.firstRelevantOffset(in: row.body, terms: Self.terms(in: query))
+    let window = Self.window(
+      in: row.body, around: relevantOffset, limit: Self.extractionInputLimit)
     Self.log.info(
       """
       extraction source=\(source.rawValue, privacy: .public) \
       body=\(row.body.count, privacy: .public) \
-      sent=\(min(row.body.count, Self.extractionInputLimit), privacy: .public) \
+      sent=\(window.count, privacy: .public) \
       firstRelevant=\(relevantOffset.map(String.init) ?? "none", privacy: .public)
       """)
     let prompt = """
       <<<request>>>
       \(query)
       <<<end>>>
-      \(UntrustedText(origin: source.contextOrigin, row.body)
+      \(UntrustedText(origin: source.contextOrigin, window)
         .forModelContext(limit: Self.extractionInputLimit))
       """
     do {

@@ -45,5 +45,12 @@ let package = Package(
       dependencies: ["AgentOrchestration"],
       swiftSettings: [.swiftLanguageMode(.v5)]
     ),
+    // **커널만.** 부작용의 문·권한 표·주소 정책이 여기 있고, 그 셋은 오케스트레이션
+    // 없이도 지켜져야 한다 — 웹 주소를 거르는 문은 차례가 없어도 문이다.
+    .testTarget(
+      name: "AgentKernelTests",
+      dependencies: ["AgentKernel"],
+      swiftSettings: [.swiftLanguageMode(.v5)]
+    ),
   ]
 )

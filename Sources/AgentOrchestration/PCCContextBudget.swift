@@ -49,7 +49,7 @@ public struct PCCContextBudget: Sendable, Equatable {
   static let sectionMarkerCharacters = 24
   /// 조립이 세울 수 있는 구획의 최대 수(tools·now·recent·completed·coverage·
   /// anchors·evidence). `request`는 이 수에 들지 않는다.
-  static let maximumSections = 8
+  static let maximumSections = 10
   /// `<<<request>>>` 구획의 표시 비용과 줄바꿈.
   static let requestFramingCharacters = 32
   /// 최근 차례 한 줄에 붙는 역할 낱말과 줄임표.
@@ -78,15 +78,20 @@ public struct PCCContextBudget: Sendable, Equatable {
 
   static var assembled: Int {
     let tools = toolLines * toolLineCharacters
-    let recent =
-      ConversationContextCompiler.recentTurnLimit
-      * (ConversationContextCompiler.recentTurnCharacterLimit + recentTurnOverhead)
+    let recent = ConversationContextCompiler.recentCharacterBudget + recentTurnOverhead
     let coverage = ConversationContextCompiler.coverageCharacterLimit + dataSectionCharacters
     let anchors = ResolvableArgument.allCases.count * anchorLineCharacters
     let evidence =
       ConversationContextCompiler.evidenceLimit
       * (Evidence.contextCharacterLimit + dataSectionCharacters + evidenceNumberCharacters)
-    return tools + clockCharacters + recent
+    // 사용자가 전에 말한 사실. 개수와 길이를 둘 다 묶은 값이다.
+    let known =
+      ConversationContextCompiler.knownFactLimit
+      * (ConversationContextCompiler.knownFactCharacterLimit + recentTurnOverhead)
+      + dataSectionCharacters
+    // 창을 넘어간 앞 차례의 요약. 한 덩이이므로 길이만 묶는다.
+    let earlier = ConversationContextCompiler.earlierSummaryCharacterLimit + recentTurnOverhead
+    return tools + clockCharacters + recent + known + earlier
       + ConversationContextCompiler.completedCharacterLimit + coverage + anchors + evidence
       + maximumSections * sectionMarkerCharacters
   }

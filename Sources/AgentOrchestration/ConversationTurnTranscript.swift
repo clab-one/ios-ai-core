@@ -26,7 +26,7 @@ public enum ConversationTurnTranscript {
 
   /// 조수 줄의 본문. 결론 한 줄과 항목이 줄바꿈으로 이어진다.
   public static func answer(_ result: ConversationTurnResult) -> String {
-    ([result.headline] + result.points)
+    ([result.headline] + result.points.map(\.text))
       .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
       .joined(separator: "\n")
   }

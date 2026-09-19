@@ -49,6 +49,12 @@ struct GoldenScenario {
   let budget: ScenarioBudget
   /// 문맥에 있으면 **실패**인 글자들. 원문 표식·불투명 식별자·공급자 스니펫.
   var forbidden: [String] = []
+  /// 이 차례가 닫혀야 하는 단계.
+  ///
+  /// 대개 `completed`다. **예산을 넘는 문서는 `partial`이 맞는 답이다** — 조각
+  /// 상한(`SummarizeTool.maximumChunkCalls`)을 넘는 문서는 읽은 만큼만 읽고, 그
+  /// 사실이 범위 기록으로 남아 차례를 "일부만 마쳤다"로 닫는다.
+  var expectedPhase: ConversationTurnResult.Phase = .completed
 
   /// 코어가 이름을 가진 능력 전부. 범위 밖 능력이 문맥에 새는지 보는 데 쓴다.
   ///
@@ -108,7 +114,8 @@ struct ScenarioRun {
       """)
 
     XCTAssertEqual(
-      result.phase, .completed, "\(scenario.name): 차례가 닫히지 않았다", file: file, line: line)
+      result.phase, scenario.expectedPhase, "\(scenario.name): 차례가 닫히지 않았다",
+      file: file, line: line)
     XCTAssertLessThanOrEqual(
       telemetry.pccCalls, budget.pccCalls,
       "\(scenario.name): PCC 호출이 예산을 넘었다", file: file, line: line)
@@ -185,11 +192,24 @@ struct ScenarioRun {
 enum ScenarioRunner {
   static let now = Date(timeIntervalSince1970: 1_789_610_400)
 
-  static func run(_ scenario: GoldenScenario) async -> ScenarioRun {
+  /// - Parameters:
+  ///   - ledger: 기본은 시나리오마다 새 `ScenarioLedger()`다. **재시도**를 보는
+  ///     시험은 같은 원장을 두 번째 `run(_:ledger:)` 호출에 넘겨 "이미 확정된
+  ///     효과가 다시 실행되지 않는가"를 결정적으로 본다(원장이 갈리면 재시도가
+  ///     아니라 새 세션이다).
+  ///   - finalizingOverride: 답 단계 대역의 기본 동작(항상 성공)을 바꾼다.
+  ///     최종 응답 생성 실패를 보는 시험이 쓴다 — 계획·툴 실행은 그대로 두고
+  ///     답 자리만 실패시킨다.
+  static func run(
+    _ scenario: GoldenScenario,
+    ledger: (any ActionLedger)? = nil,
+    finalizingOverride: (@Sendable (CompiledConversationContext, DynamicTurnProfile) ->
+      FinalizationStep)? = nil
+  ) async -> ScenarioRun {
     AgentHost.configure(AgentHostIdentity(bundleIdentifier: "dev.example.agenttests"))
 
     let dispatcher = ActionDispatcher(
-      ledger: ScenarioLedger(), currentAccountID: { "acct" })
+      ledger: ledger ?? ScenarioLedger(), currentAccountID: { "acct" })
     for tool in scenario.tools { await dispatcher.register(tool) }
 
     let box = RunBox(scenario: scenario)
@@ -211,8 +231,9 @@ enum ScenarioRunner {
             plan: ActionPlan(steps: scenario.plan, needs: nil)),
           ModelInvocationTrail(outcome: Self.receipt(.planning)))
       },
-      finalizing: { context, _ in
+      finalizing: { context, profile in
         box.run.finalizingContexts.append(context.prompt)
+        if let finalizingOverride { return finalizingOverride(context, profile) }
         return FinalizationStep(
           answer: .written(
             headline: "답", points: [], relevant: [], backend: .privateCloud),
@@ -224,6 +245,16 @@ enum ScenarioRunner {
         requestID: UUID(), accountID: "acct", conversationID: "conv",
         input: scenario.input, recentMessages: [], submittedAt: now,
         registeredCapabilities: Set(scenario.scope)))
+
+    // **승인 문이 서면 눌러 준다.** 사람의 것을 바꾸는 실행은 모델의 판단만으로
+    // 지나가지 않으므로(`CapabilityID.requiresAuthorization`), 시나리오가 보는
+    // 것은 둘이다: 문이 섰는가(`approvals`), 그리고 허락 뒤에 효과가 왔는가.
+    var pressed: Set<UUID> = []
+    while let pending = box.run.approvals.first(where: { !pressed.contains($0.id) }) {
+      pressed.insert(pending.id)
+      let outcome = await dispatcher.approve(pending.id)
+      await runtime.resume(pending, outcome: outcome)
+    }
     return box.run
   }
 
@@ -313,6 +344,13 @@ final class FixtureTool: CapabilityHandler, @unchecked Sendable {
 }
 
 /// 원장. 원격 쓰기는 원장 없이 실행되지 않으므로 시험에도 하나가 필요하다.
+///
+/// **열쇠는 효과의 정체다**(`ActionRequest.effectIdentity`), `idempotencyKey`가
+/// 아니다 — 생산 `SQLiteActionLedger`와 같은 계약이다. `idempotencyKey`는
+/// `"<차례 id>#<호출>"`이라 차례에 묶여 있어서, 그 값을 열쇠로 쓰면 **다른
+/// requestID로 같은 내용을 다시 보낸 재시도**를 원장이 "처음 보는 요청"으로
+/// 오인한다 — 코드 리뷰 2026-09-18 P1이 실제 프로덕션에서 고친 바로 그 버그를
+/// 시험 대역이 다시 재현하는 셈이다(리뷰 2026-09-18: ScenarioLedger 키 불일치).
 final class ScenarioLedger: ActionLedger, @unchecked Sendable {
   private let lock = NSLock()
   private var entries: [String: ActionLedgerEntry] = [:]
@@ -320,24 +358,25 @@ final class ScenarioLedger: ActionLedger, @unchecked Sendable {
   func replay(_ request: ActionRequest) throws -> ActionLedgerReplay? {
     lock.lock()
     defer { lock.unlock() }
-    guard let entry = entries[request.idempotencyKey] else { return nil }
+    guard let entry = entries[request.effectIdentity] else { return nil }
     return entry.state == .completed ? .alreadyCompleted(entry) : .inFlight(entry)
   }
 
   func claim(_ request: ActionRequest, at date: Date) throws -> ActionLedgerClaim {
     lock.lock()
     defer { lock.unlock() }
-    if let entry = entries[request.idempotencyKey] {
+    let key = request.effectIdentity
+    if let entry = entries[key] {
       switch entry.state {
       case .completed: return .alreadyCompleted(entry)
       case .pending: return .inFlight(entry)
       case .failed: break
       }
     }
-    entries[request.idempotencyKey] = ActionLedgerEntry(
-      idempotencyKey: request.idempotencyKey, accountID: request.accountID,
+    entries[key] = ActionLedgerEntry(
+      idempotencyKey: key, accountID: request.accountID,
       capability: request.capability, state: .pending, createdAt: date)
-    return .granted(idempotencyKey: request.idempotencyKey)
+    return .granted(idempotencyKey: key)
   }
 
   func settle(
@@ -359,6 +398,12 @@ final class ScenarioLedger: ActionLedger, @unchecked Sendable {
     return entries[idempotencyKey]
   }
 
+  func forget(idempotencyKey: String) throws {
+    lock.lock()
+    entries[idempotencyKey] = nil
+    lock.unlock()
+  }
+
   func deleteAll(accountID: String) throws {
     lock.lock()
     entries = entries.filter { $0.value.accountID != accountID }
@@ -366,8 +411,25 @@ final class ScenarioLedger: ActionLedger, @unchecked Sendable {
   }
 }
 
+/// 시험용 **구조화 산출** 한 벌.
+///
+/// 요약은 guided generation을 지나므로(`SummaryModel`) 대역도 JSON을 내야 한다.
+/// 판정(`SummaryJudgment`)을 통과해야 그 산출이 요약으로 승격되므로, 원문을
+/// 베끼지 않고 되풀이하지 않는 두 줄을 만든다.
+enum ScriptedSummaryPayload {
+  static func data(
+    schema: SummarySchema, headline: String, point: String = "덧붙일 사실 한 줄."
+  ) -> Data {
+    let object: [String: Any] =
+      schema == .summaryTitle
+      ? ["title": headline]
+      : ["headline": headline, "points": [point]]
+    return (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
+  }
+}
+
 /// 기기 모델의 대역. 받은 원문을 적어 둔다 — 원문이 여기까지 왔는지가 관찰 지점이다.
-final class ScenarioOnDeviceModel: OnDeviceTextModel, @unchecked Sendable {
+final class ScenarioOnDeviceModel: OnDeviceTextModel, SummaryModel, @unchecked Sendable {
   private let lock = NSLock()
   private let reply: String
   private var seen: [String] = []
@@ -391,5 +453,14 @@ final class ScenarioOnDeviceModel: OnDeviceTextModel, @unchecked Sendable {
     seen.append(prompt)
     lock.unlock()
     return reply
+  }
+
+  func answer(
+    schema: SummarySchema, instructions: String, prompt: String, maximumResponseTokens: Int
+  ) async throws -> Data {
+    lock.lock()
+    seen.append(prompt)
+    lock.unlock()
+    return ScriptedSummaryPayload.data(schema: schema, headline: reply)
   }
 }

@@ -12,6 +12,11 @@ import Foundation
 /// 차례가 7ms에 실패했다), 그때 기기 모델이 답한다. 한 칸으로 들면 계측이
 /// "PCC가 답했다"고 거짓을 말한다.
 public struct ModelInvocationReceipt: Sendable, Equatable {
+  /// Logical model identity, immutable checkpoint, and policy snapshot.
+  /// Empty only for legacy receipts written before the hybrid migration.
+  public let modelID: String
+  public let modelRevision: String
+  public let policyVersion: String
   public let phase: TurnPhase
   /// 어느 **목적**으로 부른 호출인가(`FoundationModelRuntime.AdmissionJob`).
   ///
@@ -65,8 +70,12 @@ public struct ModelInvocationReceipt: Sendable, Equatable {
     inputCharacters: Int,
     latencyMilliseconds: Int,
     waitedMilliseconds: Int = 0,
-    usage: ModelTokenUsage? = nil
+    usage: ModelTokenUsage? = nil,
+    modelID: String = "", modelRevision: String = "", policyVersion: String = ""
   ) {
+    self.modelID = modelID
+    self.modelRevision = modelRevision
+    self.policyVersion = policyVersion
     self.phase = phase
     self.purpose = purpose
     self.requestedBackend = requestedBackend
@@ -144,6 +153,14 @@ public struct ModelUsageLog: Sendable, Equatable {
   /// **실제로 나간** 물리 호출들. 부르기 전에 막힌 영수증은 호출이 아니다(§36).
   private var attempted: [ModelInvocationReceipt] { receipts.filter(\.pccAttempted) }
 
+  /// All attempts, independent of the legacy PCC-only totals below.
+  public var localAttempts: Int { receipts.filter(\.onDeviceAttempted).count }
+  public var modelIdentities: Set<String> {
+    Set(receipts.filter { $0.pccAttempted || $0.onDeviceAttempted }
+      .filter { !$0.modelID.isEmpty }.map { "\($0.modelID)@\($0.modelRevision)" })
+  }
+  public var hadAnyCloudAttempt: Bool { receipts.contains(where: \.pccAttempted) }
+  public var hadAnyLocalAttempt: Bool { receipts.contains(where: \.onDeviceAttempted) }
   public var pccAttempts: Int { attempted.count }
   public var pccCompletions: Int { receipts.filter(\.pccCompleted).count }
   /// 그중 사용량을 **받은** 호출 수. `pccAttempts`와 다르면 총량은 알 수 없다.
@@ -219,7 +236,7 @@ public struct ModelUsageLog: Sendable, Equatable {
     for receipt in receipts {
       Self.log.info(
         """
-        model stage=\(receipt.phase.rawValue, privacy: .public) \
+        model id=\(receipt.modelID, privacy: .public) revision=\(receipt.modelRevision, privacy: .public) policy=\(receipt.policyVersion, privacy: .public) stage=\(receipt.phase.rawValue, privacy: .public) \
         purpose=\(receipt.purpose, privacy: .public) \
         requested=\(receipt.requestedBackend.rawValue, privacy: .public) \
         resolved=\(receipt.resolvedBackend.rawValue, privacy: .public) \
