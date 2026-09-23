@@ -55,9 +55,10 @@ AgentOrchestration  차례 한 번의 기계: 단계 · 범위 · 계획 스키�
 **둘 다 넣는다.** Kernel만으로는 차례가 돌지 않고, Orchestration만으로는 능력·
 계약·수령증 타입이 없다.
 
-이 패키지는 **iOS 전용**이다(`platforms: [.iOS("26.0")]`). 그래서 `swift build`·
-`swift test`는 macOS에서 서지 않는다 — 검증은 `xcodebuild ... -destination`으로 한다
-(§11).
+이 패키지는 **iOS 26+ · macOS 27+** 다(`platforms: [.iOS("26.0"), .macOS("27.0")]`).
+macOS에서는 `swift build`·`swift test`가 선다. 다만 `swift test`는 층을 가르지 않는다 —
+L1(기기 모델)·L3(살아 있는 웹)까지 돈다. 싼 층만 원하면 `--skip`으로 그 클래스를 뺀다
+(`Scripts/test.sh`의 층 목록). iOS 검증은 `xcodebuild ... -destination`으로 한다(§11).
 
 ---
 

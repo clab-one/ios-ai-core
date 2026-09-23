@@ -1,7 +1,7 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-/// iOS AI 오케스트레이션 코어.
+/// Apple 플랫폼 AI 오케스트레이션 코어(iOS 26+, macOS 27+).
 ///
 /// 앱이 아니라 **실행 평면**이다. 여기에는 화면도, 저장 스키마도, 공급자 SDK도
 /// 없다 — 능력의 이름과 계약, 그 계약을 지나는 단 하나의 실행 문, 그리고 모델이
@@ -12,7 +12,7 @@ import PackageDescription
 /// (같은 방식을 쓰는 선례: `JustSendContentCore/Package.swift`)
 let package = Package(
   name: "ios-ai-core",
-  platforms: [.iOS("26.0")],
+  platforms: [.iOS("26.0"), .macOS("27.0")],
   products: [
     .library(name: "AgentKernel", targets: ["AgentKernel"]),
     .library(name: "AgentOrchestration", targets: ["AgentOrchestration"]),

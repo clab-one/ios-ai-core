@@ -28,7 +28,8 @@ Examples/Host/AgentHostSetup.swift 호스트 배선 한 파일(신원 · 문구 
 
 ## 검증
 
-iOS 전용 패키지다 — `swift test`는 서지 않는다. 층을 골라 돌린다.
+iOS 26+ · macOS 27+ 패키지다. 층을 골라 돌린다(iOS 시뮬레이터). macOS에서는 `swift test`도
+서지만 층을 가르지 않는다 — 안내서 §1.
 
 ```
 ./Scripts/test.sh          L0   PCC 0 · 기기 모델 0 · 네트워크 0
